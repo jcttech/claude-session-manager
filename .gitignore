@@ -1,0 +1,17 @@
+# Build artifacts
+/target/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Environment
+.env
+.env.local
+
+# Secrets (never commit these)
+*.pem
+*.key
+id_*
