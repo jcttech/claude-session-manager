@@ -81,14 +81,13 @@ impl Mattermost {
             let Ok(Message::Text(text)) = msg else { continue };
             let Ok(data) = serde_json::from_str::<serde_json::Value>(&text) else { continue };
 
-            if data.get("event").and_then(|e| e.as_str()) == Some("posted") {
-                if let Some(post_str) = data["data"]["post"].as_str() {
-                    if let Ok(post) = serde_json::from_str::<Post>(post_str) {
-                        if post.user_id != self.bot_user_id {
-                            let _ = tx.send(post).await;
-                        }
-                    }
-                }
+            if data.get("event").and_then(|e| e.as_str()) != Some("posted") {
+                continue;
+            }
+            let Some(post_str) = data["data"]["post"].as_str() else { continue };
+            let Ok(post) = serde_json::from_str::<Post>(post_str) else { continue };
+            if post.user_id != self.bot_user_id {
+                let _ = tx.send(post).await;
             }
         }
 

@@ -94,8 +94,7 @@ where
             return Box::pin(async move { Ok(response) });
         }
 
-        let future = self.inner.call(req);
-        Box::pin(async move { future.await })
+        Box::pin(self.inner.call(req))
     }
 }
 
@@ -128,29 +127,19 @@ impl<S> RateLimitService<S> {
 
 fn extract_client_ip(req: &Request<Body>) -> Option<IpAddr> {
     // Try X-Forwarded-For header first (for reverse proxy setups)
-    if let Some(forwarded) = req.headers().get("x-forwarded-for") {
-        if let Ok(value) = forwarded.to_str() {
-            // Take the first IP in the chain (original client)
-            if let Some(first_ip) = value.split(',').next() {
-                if let Ok(ip) = first_ip.trim().parse::<IpAddr>() {
-                    return Some(ip);
-                }
-            }
-        }
-    }
-
-    // Try X-Real-IP header
-    if let Some(real_ip) = req.headers().get("x-real-ip") {
-        if let Ok(value) = real_ip.to_str() {
-            if let Ok(ip) = value.trim().parse::<IpAddr>() {
-                return Some(ip);
-            }
-        }
-    }
-
-    // Fall back to connection info (would need to be passed differently in production)
-    // For now, return None if headers aren't present
-    None
+    // Take the first IP in the chain (original client)
+    req.headers()
+        .get("x-forwarded-for")
+        .and_then(|h| h.to_str().ok())
+        .and_then(|v| v.split(',').next())
+        .and_then(|first_ip| first_ip.trim().parse::<IpAddr>().ok())
+        .or_else(|| {
+            // Try X-Real-IP header
+            req.headers()
+                .get("x-real-ip")
+                .and_then(|h| h.to_str().ok())
+                .and_then(|v| v.trim().parse::<IpAddr>().ok())
+        })
 }
 
 /// Periodically clean up old rate limit buckets to prevent memory leaks
