@@ -2,9 +2,11 @@ mod config;
 mod container;
 mod crypto;
 mod database;
+mod git;
 mod mattermost;
 mod opnsense;
 mod rate_limit;
+mod ssh;
 
 use anyhow::Result;
 use axum::{
@@ -21,6 +23,7 @@ use uuid::Uuid;
 use crate::container::ContainerManager;
 use crate::crypto::{sign_request, verify_signature};
 use crate::database::Database;
+use crate::git::{GitManager, RepoRef};
 use crate::mattermost::{Mattermost, Post};
 use crate::opnsense::OPNsense;
 use crate::rate_limit::RateLimitLayer;
@@ -28,6 +31,7 @@ use crate::rate_limit::RateLimitLayer;
 struct AppState {
     mm: Mattermost,
     containers: ContainerManager,
+    git: GitManager,
     opnsense: OPNsense,
     db: Database,
 }
@@ -58,9 +62,13 @@ struct CallbackResponse {
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
 
+    // Initialize SSH key (writes to temp file if SM_VM_SSH_KEY is set)
+    ssh::init_ssh_key()?;
+
     let mm = Mattermost::new().await?;
     let opnsense = OPNsense::new()?;
     let containers = ContainerManager::new();
+    let git = GitManager::new();
     let db = Database::new().await?;
 
     // Recover sessions from database on startup
@@ -70,6 +78,7 @@ async fn main() -> Result<()> {
     let state = Arc::new(AppState {
         mm,
         containers,
+        git,
         opnsense,
         db,
     });
@@ -160,24 +169,115 @@ async fn handle_messages(state: Arc<AppState>, mut rx: mpsc::Receiver<Post>) {
             let text = text.trim_start_matches(bot_trigger).trim();
 
             // Start session
-            if let Some(project) = text.strip_prefix("start ").map(|s| s.trim()) {
-                let s = config::settings();
-                let Some(project_path) = s.projects.get(project) else {
-                    let _ = state.mm.post(channel_id, &format!(
-                        "Unknown project. Available: {}",
-                        s.projects.keys().cloned().collect::<Vec<_>>().join(", ")
-                    )).await;
-                    continue;
+            if let Some(project_input) = text.strip_prefix("start ").map(|s| s.trim()) {
+                use std::path::PathBuf;
+                let session_id = Uuid::new_v4().to_string();
+
+                // Track worktree path if created (for reference, not auto-cleanup)
+                let mut worktree_path: Option<PathBuf> = None;
+
+                // Try to parse as GitHub repo first (org/repo format)
+                let project_path = if RepoRef::looks_like_repo(project_input) {
+                    match RepoRef::parse(project_input) {
+                        Some(repo_ref) => {
+                            // Check if using worktree mode
+                            if repo_ref.worktree.is_some() {
+                                // Create worktree for isolation
+                                let _ = state.mm.post(channel_id, &format!(
+                                    "Creating worktree for **{}**...",
+                                    repo_ref.full_name()
+                                )).await;
+
+                                match state.git.create_worktree(&repo_ref, &session_id).await {
+                                    Ok(path) => {
+                                        worktree_path = Some(path.clone());
+                                        path.to_string_lossy().to_string()
+                                    }
+                                    Err(e) => {
+                                        let _ = state.mm.post(channel_id, &format!(
+                                            "Failed to create worktree: {}",
+                                            e
+                                        )).await;
+                                        continue;
+                                    }
+                                }
+                            } else {
+                                // Using main clone - check if already in use
+                                if let Some(existing_session) = state.git.is_repo_in_use(&repo_ref) {
+                                    let _ = state.mm.post(channel_id, &format!(
+                                        "Repository **{}** is already in use by session `{}`.\n\
+                                        Use `--worktree` for an isolated working directory:\n\
+                                        `@claude start {} --worktree`",
+                                        repo_ref.full_name(),
+                                        &existing_session[..8],
+                                        project_input
+                                    )).await;
+                                    continue;
+                                }
+
+                                // Ensure repo is cloned
+                                let _ = state.mm.post(channel_id, &format!(
+                                    "Preparing **{}**...",
+                                    repo_ref.full_name()
+                                )).await;
+
+                                match state.git.ensure_repo(&repo_ref).await {
+                                    Ok(path) => {
+                                        // Mark repo as in use
+                                        state.git.mark_repo_in_use(&repo_ref, &session_id);
+                                        path.to_string_lossy().to_string()
+                                    }
+                                    Err(e) => {
+                                        let _ = state.mm.post(channel_id, &format!(
+                                            "Failed to prepare repository: {}",
+                                            e
+                                        )).await;
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
+                        None => {
+                            let _ = state.mm.post(channel_id,
+                                "Invalid repository format. Use: `org/repo`, `org/repo@branch`, or `org/repo --worktree`"
+                            ).await;
+                            continue;
+                        }
+                    }
+                } else {
+                    // Fall back to static projects mapping
+                    let s = config::settings();
+                    match s.projects.get(project_input) {
+                        Some(path) => path.clone(),
+                        None => {
+                            let available = if s.projects.is_empty() {
+                                "none configured".to_string()
+                            } else {
+                                s.projects.keys().cloned().collect::<Vec<_>>().join(", ")
+                            };
+                            let _ = state.mm.post(channel_id, &format!(
+                                "Unknown project `{}`. Available: {}\n\n\
+                                Or use GitHub repo format: `org/repo`",
+                                project_input,
+                                available
+                            )).await;
+                            continue;
+                        }
+                    }
                 };
 
-                let session_id = Uuid::new_v4().to_string();
-                let _ = state.mm.post(channel_id, &format!("Starting **{}**...", project)).await;
+                let _ = state.mm.post(channel_id, "Starting session...").await;
 
                 let (output_tx, output_rx) = mpsc::channel::<String>(100);
-                match state.containers.start(&session_id, project_path, output_tx).await {
+                match state.containers.start(&session_id, &project_path, output_tx).await {
                     Ok(name) => {
+                        // Track worktree path in session (for reference, not auto-cleanup)
+                        if let Some(wt_path) = worktree_path {
+                            state.containers.set_worktree_path(&session_id, wt_path);
+                        }
+
                         // Persist session to database
-                        if let Err(e) = state.db.create_session(&session_id, channel_id, project, &name).await {
+                        if let Err(e) = state.db.create_session(&session_id, channel_id, project_input, &name).await {
                             tracing::error!("Failed to persist session: {}", e);
                         }
 
@@ -193,6 +293,8 @@ async fn handle_messages(state: Arc<AppState>, mut rx: mpsc::Receiver<Post>) {
                         });
                     }
                     Err(e) => {
+                        // Release repo if we marked it in use
+                        state.git.release_repo_by_session(&session_id);
                         let _ = state.mm.post(channel_id, &format!("Failed to start: {}", e)).await;
                     }
                 }
@@ -203,6 +305,8 @@ async fn handle_messages(state: Arc<AppState>, mut rx: mpsc::Receiver<Post>) {
             if text == "stop" {
                 if let Ok(Some(session)) = state.db.get_session_by_channel(channel_id).await {
                     let _ = state.containers.stop(&session.session_id).await;
+                    // Release repo tracking (if using main clone)
+                    state.git.release_repo_by_session(&session.session_id);
                     let _ = state.db.delete_session(&session.session_id).await;
                 }
                 let _ = state.mm.post(channel_id, "Stopped.").await;
@@ -234,6 +338,8 @@ async fn stream_output(
     }
 
     // Clean up session from database when stream ends
+    // Also release repo tracking (if using main clone)
+    state.git.release_repo_by_session(&session_id);
     let _ = state.db.delete_session(&session_id).await;
     let _ = state.mm.post(&channel_id, "Session ended.").await;
 }

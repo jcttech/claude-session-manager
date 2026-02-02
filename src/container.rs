@@ -2,11 +2,12 @@ use anyhow::Result;
 use dashmap::DashMap;
 use shell_escape::escape;
 use std::borrow::Cow;
+use std::path::PathBuf;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::Command;
 use tokio::sync::mpsc;
 
 use crate::config::settings;
+use crate::ssh;
 
 /// Escape a string for safe use in shell commands
 fn shell_escape(s: &str) -> Cow<'_, str> {
@@ -20,6 +21,9 @@ pub struct ContainerManager {
 struct Session {
     name: String,
     stdin_tx: mpsc::Sender<String>,
+    /// Path to worktree if session is using one (for reference/cleanup)
+    #[allow(dead_code)]
+    worktree_path: Option<PathBuf>,
 }
 
 impl ContainerManager {
@@ -61,10 +65,7 @@ impl ContainerManager {
             escaped_image
         );
 
-        Command::new("ssh")
-            .arg("-o").arg("StrictHostKeyChecking=accept-new")
-            .arg("-i").arg(&s.vm_ssh_key_path)
-            .arg(format!("{}@{}", &s.vm_user, &s.vm_host))
+        ssh::command()?
             .arg(&container_cmd)
             .output()
             .await?;
@@ -78,11 +79,7 @@ impl ContainerManager {
             &s.claude_command  // claude_command is from config, trusted
         );
 
-        let mut child = Command::new("ssh")
-            .arg("-tt")
-            .arg("-o").arg("StrictHostKeyChecking=accept-new")
-            .arg("-i").arg(&s.vm_ssh_key_path)
-            .arg(format!("{}@{}", &s.vm_user, &s.vm_host))
+        let mut child = ssh::command_with_tty()?
             .arg(&exec_container_cmd)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
@@ -120,6 +117,7 @@ impl ContainerManager {
             Session {
                 name: name.clone(),
                 stdin_tx,
+                worktree_path: None,
             },
         );
 
@@ -133,6 +131,19 @@ impl ContainerManager {
         Ok(())
     }
 
+    /// Set the worktree path for a session (for tracking purposes)
+    pub fn set_worktree_path(&self, session_id: &str, worktree_path: PathBuf) {
+        if let Some(mut session) = self.sessions.get_mut(session_id) {
+            session.worktree_path = Some(worktree_path);
+        }
+    }
+
+    /// Get the worktree path for a session, if any
+    #[allow(dead_code)]
+    pub fn get_worktree_path(&self, session_id: &str) -> Option<PathBuf> {
+        self.sessions.get(session_id).and_then(|s| s.worktree_path.clone())
+    }
+
     pub async fn stop(&self, session_id: &str) -> Result<()> {
         if let Some((_, session)) = self.sessions.remove(session_id) {
             let s = settings();
@@ -143,10 +154,7 @@ impl ContainerManager {
                 escaped_name
             );
 
-            Command::new("ssh")
-                .arg("-o").arg("StrictHostKeyChecking=accept-new")
-                .arg("-i").arg(&s.vm_ssh_key_path)
-                .arg(format!("{}@{}", &s.vm_user, &s.vm_host))
+            ssh::command()?
                 .arg(&container_cmd)
                 .output()
                 .await?;

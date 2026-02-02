@@ -56,7 +56,8 @@ This system lets you interact with Claude Code through Mattermost while maintain
 
 1. **Container runtime**: podman or docker installed
 2. **SSH access**: User with key-based authentication
-3. **Environment**: `ANTHROPIC_API_KEY` set
+3. **Environment**: `ANTHROPIC_API_KEY` set for Claude Code
+4. **Environment**: `GH_TOKEN` set for private GitHub repos (optional)
 
 ### Container Image
 
@@ -98,10 +99,14 @@ export SM_OPNSENSE_SECRET=your-api-secret
 
 # Optional (with defaults)
 export SM_VM_USER=claude
-export SM_VM_SSH_KEY_PATH=/secrets/ssh/id_ed25519
+export SM_VM_SSH_KEY="$(cat ~/.ssh/id_ed25519)"  # Preferred for Kubernetes
+# OR: export SM_VM_SSH_KEY_PATH=/secrets/ssh/id_ed25519  # Fallback: file path
 export SM_CONTAINER_RUNTIME=podman
 export SM_CONTAINER_IMAGE=claude-code:latest
-export SM_PROJECTS='{"myproject":"/home/claude/projects/myproject"}'
+export SM_REPOS_BASE_PATH=/home/claude/repos
+export SM_WORKTREES_PATH=/home/claude/worktrees
+export SM_AUTO_PULL=false
+export SM_PROJECTS='{"myproject":"/home/claude/projects/myproject"}'  # Legacy
 ```
 
 ### 3. Deploy to Kubernetes
@@ -115,6 +120,10 @@ stringData:
   SM_MATTERMOST_TOKEN: "your-bot-token"
   SM_OPNSENSE_KEY: "your-api-key"
   SM_OPNSENSE_SECRET: "your-api-secret"
+  SM_VM_SSH_KEY: |
+    -----BEGIN OPENSSH PRIVATE KEY-----
+    ...your-private-key...
+    -----END OPENSSH PRIVATE KEY-----
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -142,25 +151,24 @@ spec:
           value: "192.168.12.10"
         - name: SM_OPNSENSE_URL
           value: "https://opnsense.example.com"
-        volumeMounts:
-        - name: ssh-key
-          mountPath: /secrets/ssh
-          readOnly: true
-      volumes:
-      - name: ssh-key
-        secret:
-          secretName: session-manager-ssh-key
 ```
 
 ## Usage
 
 ### Start a Session
 
-In Mattermost, mention the bot with a project name:
+In Mattermost, mention the bot with a GitHub repository or project name:
 
 ```
-@claude start myproject
+@claude start org/repo                    # Clone and use main repo
+@claude start org/repo@branch             # Checkout specific branch
+@claude start org/repo --worktree         # Create isolated worktree (auto-named)
+@claude start org/repo --worktree=feature # Create named worktree
+@claude start org/repo@branch --worktree  # Worktree from specific branch
+@claude start myproject                   # Use static project mapping (legacy)
 ```
+
+**Concurrency:** If the main clone is already in use by another session, you'll be prompted to use `--worktree` for an isolated working directory.
 
 ### Chat with Claude
 
@@ -185,13 +193,56 @@ When Claude needs network access (e.g., `pip install`):
 @claude stop
 ```
 
+## GitHub Repository Integration
+
+The session manager can clone GitHub repositories on-demand and optionally create isolated git worktrees for concurrent sessions.
+
+### Directory Structure on VM
+
+```
+/home/claude/repos/
+└── github.com/
+    └── org/
+        └── repo/              # Main clone (shared)
+
+/home/claude/worktrees/
+├── repo-abc12345/             # Session worktree (isolated)
+└── repo-def67890/             # Another session worktree
+```
+
+### Authentication
+
+Private repositories require `GH_TOKEN` to be set on the LANLLM VM. The token is used for HTTPS cloning:
+
+```bash
+export GH_TOKEN=ghp_xxxxxxxxxxxx
+```
+
+### Worktrees
+
+Git worktrees allow multiple sessions to work on the same repository simultaneously without conflicts:
+
+- **Main clone**: Single shared copy, blocks if another session is active
+- **Worktree**: Isolated working directory, shares `.git` with main clone
+
+Worktrees persist after session stop (not auto-deleted), allowing you to resume work or manually clean up.
+
+### Backward Compatibility
+
+The `org/repo` syntax takes precedence. If input doesn't match that pattern, it falls back to `SM_PROJECTS` static mappings:
+
+```bash
+export SM_PROJECTS='{"myproject":"/home/claude/projects/myproject"}'
+```
+
 ## Example Conversation
 
 ```
 #claude-project
 
-@james: @claude start client-a
-🚀 Starting **client-a**...
+@james: @claude start acme/webapp
+📦 Preparing **acme/webapp**...
+🚀 Starting session...
 ✅ Ready. Container: `claude-abc12345`
 
 @james: add pytest to the project
@@ -221,6 +272,22 @@ Successfully installed pytest-8.0.0
 ✅ Stopped.
 ```
 
+### Concurrent Sessions with Worktrees
+
+```
+#claude-project
+
+@sarah: @claude start acme/webapp
+⚠️ Repository **acme/webapp** is already in use by session `abc12345`.
+Use `--worktree` for an isolated working directory:
+`@claude start acme/webapp --worktree`
+
+@sarah: @claude start acme/webapp --worktree
+🌿 Creating worktree for **acme/webapp**...
+🚀 Starting session...
+✅ Ready. Container: `claude-def67890`
+```
+
 ## Configuration Reference
 
 | Variable | Required | Default | Description |
@@ -229,7 +296,8 @@ Successfully installed pytest-8.0.0
 | `SM_MATTERMOST_TOKEN` | Yes | - | Bot token |
 | `SM_VM_HOST` | Yes | - | SSH host for container VM |
 | `SM_VM_USER` | No | `claude` | SSH user |
-| `SM_VM_SSH_KEY_PATH` | No | `/secrets/ssh/id_ed25519` | Path to SSH key |
+| `SM_VM_SSH_KEY` | No | - | SSH private key content (preferred for K8s) |
+| `SM_VM_SSH_KEY_PATH` | No | `/secrets/ssh/id_ed25519` | Path to SSH key file (fallback) |
 | `SM_CONTAINER_RUNTIME` | No | `podman` | `podman` or `docker` |
 | `SM_CONTAINER_NETWORK` | No | `isolated` | Container network name |
 | `SM_CONTAINER_IMAGE` | No | `claude-code:latest` | Container image |
@@ -237,7 +305,10 @@ Successfully installed pytest-8.0.0
 | `SM_OPNSENSE_KEY` | Yes | - | API key |
 | `SM_OPNSENSE_SECRET` | Yes | - | API secret |
 | `SM_OPNSENSE_ALIAS` | No | `llm_approved_domains` | Firewall alias name |
-| `SM_PROJECTS` | No | `{}` | JSON map of project name to path |
+| `SM_REPOS_BASE_PATH` | No | `/home/claude/repos` | Where GitHub repos are cloned |
+| `SM_WORKTREES_PATH` | No | `/home/claude/worktrees` | Where worktrees are created |
+| `SM_AUTO_PULL` | No | `false` | Pull repos before starting sessions |
+| `SM_PROJECTS` | No | `{}` | JSON map of project name to path (legacy) |
 | `SM_CALLBACK_URL` | No | `http://session-manager:8000/callback` | Mattermost callback URL |
 | `SM_LISTEN_ADDR` | No | `0.0.0.0:8000` | Server bind address |
 

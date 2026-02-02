@@ -10,6 +10,11 @@ pub struct Settings {
     pub vm_host: String,
     #[serde(default = "default_vm_user")]
     pub vm_user: String,
+    /// SSH private key content (preferred for Kubernetes)
+    /// If set, takes priority over vm_ssh_key_path
+    #[serde(default)]
+    pub vm_ssh_key: Option<String>,
+    /// Path to SSH private key file (fallback if vm_ssh_key not set)
     #[serde(default = "default_ssh_key_path")]
     pub vm_ssh_key_path: String,
 
@@ -42,6 +47,17 @@ pub struct Settings {
 
     #[serde(default)]
     pub projects: HashMap<String, String>,
+
+    /// Base path on VM where GitHub repos are cloned
+    #[serde(default = "default_repos_base_path")]
+    pub repos_base_path: String,
+    /// Base path on VM where worktrees are created
+    #[serde(default = "default_worktrees_path")]
+    pub worktrees_path: String,
+    /// Whether to auto-pull repos before starting sessions
+    #[serde(default)]
+    pub auto_pull: bool,
+
     #[serde(default = "default_callback_url")]
     pub callback_url: String,
     #[serde(default = "default_listen_addr")]
@@ -80,6 +96,8 @@ fn default_listen_addr() -> String { "0.0.0.0:8000".into() }
 fn default_bot_trigger() -> String { "@claude".into() }
 fn default_rate_limit_rps() -> u64 { 10 }
 fn default_rate_limit_burst() -> u32 { 20 }
+fn default_repos_base_path() -> String { "/home/claude/repos".into() }
+fn default_worktrees_path() -> String { "/home/claude/worktrees".into() }
 
 static SETTINGS: OnceLock<Settings> = OnceLock::new();
 
