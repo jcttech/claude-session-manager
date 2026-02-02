@@ -7,15 +7,13 @@
 
 | ID | Time | T | Title | Read |
 |----|------|---|-------|------|
-| #91 | 4:11 PM | 🟣 | Shared Claude Configuration Volume for Authentication Persistence | ~424 |
-| #90 | " | 🟣 | Added Claude Config Volume Support for Shared Authentication | ~380 |
-| #89 | 4:10 PM | 🟣 | Shared Claude Config Volume Support Added | ~417 |
-| #87 | " | 🔵 | Container Manager SSH Implementation with Environment Variable Passthrough | ~556 |
+| #90 | 4:11 PM | 🟣 | Added Claude Config Volume Support for Shared Authentication | ~380 |
 | #70 | 3:51 PM | 🟣 | PostgreSQL Schema Namespace Added for Table Isolation | ~335 |
-| #35 | 3:38 PM | 🟣 | SQLite Database Layer Implemented for State Persistence and Audit Logging | ~566 |
+| #23 | 3:35 PM | 🔵 | Comprehensive Security Audit Completed with Critical Vulnerabilities Identified | ~803 |
+| #22 | 3:34 PM | 🔵 | Error Handling Using Panic-Inducing Methods | ~421 |
+| #18 | " | 🔵 | TLS Certificate Verification Disabled by Default | ~336 |
 | #17 | 3:33 PM | 🔵 | HTTP Server Configuration Without TLS | ~276 |
 | #16 | " | 🔵 | Anthropic API Key Environment Variable Exposure | ~357 |
-| #8 | 3:31 PM | 🔵 | Critical Command Injection Vulnerabilities in Container Management | ~589 |
-| #7 | " | 🔵 | Insecure Default Configuration Settings | ~456 |
+| #7 | 3:31 PM | 🔵 | Insecure Default Configuration Settings | ~456 |
 | #5 | " | 🔵 | Critical Security Vulnerabilities in Main Application Logic | ~512 |
 </claude-mem-context>

@@ -1,7 +1,6 @@
 {
     "name": "Rust + Python + Claude Code",
     "image": "ghcr.io/jcttech/devcontainer-rust:latest",
-
     "customizations": {
         "vscode": {
             "extensions": [
@@ -35,26 +34,21 @@
             }
         }
     },
-
     "remoteUser": "vscode",
-
     "mounts": [
         "source=devcontainer-bashhistory-${devcontainerId},target=/commandhistory,type=volume",
         "source=claude-config-shared,target=/home/vscode/.claude,type=volume",
         "source=claude-mem-shared,target=/home/vscode/.claude-mem,type=volume",
         "source=devcontainer-cargo-${devcontainerId},target=/home/vscode/.cargo/registry,type=volume"
     ],
-
     "containerEnv": {
         "CLAUDE_CONFIG_DIR": "/home/vscode/.claude",
         "POWERLEVEL9K_DISABLE_GITSTATUS": "true"
     },
-
     "remoteEnv": {
         "ANTHROPIC_API_KEY": "${localEnv:ANTHROPIC_API_KEY}",
-        "GITHUB_PERSONAL_ACCESS_TOKEN": "${localEnv:GITHUB_PERSONAL_ACCESS_TOKEN}"
+        "GH_TOKEN": "${localEnv:GH_TOKEN}"
     },
-
     "workspaceMount": "source=${localWorkspaceFolder},target=/workspaces/${localWorkspaceFolderBasename},type=bind,consistency=delegated",
     "workspaceFolder": "/workspaces/${localWorkspaceFolderBasename}"
 }

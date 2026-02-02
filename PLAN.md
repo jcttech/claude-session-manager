@@ -6,10 +6,10 @@ Chat with Claude Code through Mattermost. Network controlled via OPNsense firewa
 
 ## Deployment Checklist
 
-### LANLLM VM
-- [ ] Container runtime (podman/docker)
-- [ ] SSH access configured (user + key)
-- [ ] ANTHROPIC_API_KEY environment variable set
+### LANLLM VM (Completed)
+- [x] Container runtime (podman/docker)
+- [x] SSH access configured (user + key)
+- [x] ANTHROPIC_API_KEY environment variable set
 
 ### Kubernetes
 - [ ] Secrets: Mattermost token, SSH key, OPNsense API credentials
