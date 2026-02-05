@@ -2,6 +2,7 @@ use anyhow::Result;
 use futures_util::{SinkExt, StreamExt};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
@@ -62,10 +63,32 @@ impl Mattermost {
         })
     }
 
+    /// Listen for messages with automatic reconnection on disconnect
     pub async fn listen(&self, tx: mpsc::Sender<Post>) -> Result<()> {
+        loop {
+            match self.connect_and_listen(&tx).await {
+                Ok(()) => {
+                    // Clean exit - shouldn't normally happen
+                    tracing::info!("WebSocket connection closed normally");
+                    break Ok(());
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "WebSocket disconnected, reconnecting in 5 seconds"
+                    );
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                }
+            }
+        }
+    }
+
+    /// Internal method to connect and process WebSocket messages
+    async fn connect_and_listen(&self, tx: &mpsc::Sender<Post>) -> Result<()> {
         let s = settings();
         let ws_url = s.mattermost_url.replace("http", "ws") + "/api/v4/websocket";
 
+        tracing::info!("Connecting to Mattermost WebSocket");
         let (ws, _) = connect_async(&ws_url).await?;
         let (mut write, mut read) = ws.split();
 
@@ -76,6 +99,7 @@ impl Mattermost {
             "data": { "token": s.mattermost_token }
         });
         write.send(Message::Text(auth.to_string().into())).await?;
+        tracing::info!("WebSocket connected and authenticated");
 
         while let Some(msg) = read.next().await {
             let Ok(Message::Text(text)) = msg else { continue };

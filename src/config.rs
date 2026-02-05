@@ -78,6 +78,11 @@ pub struct Settings {
     /// Rate limit: burst size
     #[serde(default = "default_rate_limit_burst")]
     pub rate_limit_burst: u32,
+
+    /// Optional list of Mattermost usernames allowed to approve/deny requests
+    /// If empty, any user can approve/deny (default behavior)
+    #[serde(default)]
+    pub allowed_approvers: Vec<String>,
 }
 
 fn default_vm_user() -> String { "claude".into() }

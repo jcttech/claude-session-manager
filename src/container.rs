@@ -161,4 +161,40 @@ impl ContainerManager {
         }
         Ok(())
     }
+
+    /// Check if a container with the given name is running on the VM
+    pub async fn is_container_running(&self, container_name: &str) -> bool {
+        let s = settings();
+        let escaped_name = shell_escape(container_name);
+        let check_cmd = format!(
+            "{} inspect --format='{{{{.State.Running}}}}' {} 2>/dev/null",
+            shell_escape(&s.container_runtime),
+            escaped_name
+        );
+
+        match ssh::run_command(&check_cmd).await {
+            Ok(output) => output.trim() == "true",
+            Err(_) => false,
+        }
+    }
+
+    /// Remove a container by name (for cleanup of stale containers)
+    pub async fn remove_container(&self, container_name: &str) -> Result<()> {
+        let s = settings();
+        let escaped_name = shell_escape(container_name);
+        let rm_cmd = format!(
+            "{} rm -f {}",
+            shell_escape(&s.container_runtime),
+            escaped_name
+        );
+
+        ssh::run_command(&rm_cmd).await?;
+        Ok(())
+    }
+
+    /// Get count of active sessions (for metrics)
+    #[allow(dead_code)]
+    pub fn session_count(&self) -> usize {
+        self.sessions.len()
+    }
 }

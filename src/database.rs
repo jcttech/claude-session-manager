@@ -233,6 +233,25 @@ impl Database {
         Ok(())
     }
 
+    /// Check if there's already a pending request for a domain in a session
+    /// Returns the existing request if found
+    pub async fn get_pending_request_by_domain_and_session(
+        &self,
+        domain: &str,
+        session_id: &str,
+    ) -> Result<Option<StoredPendingRequest>> {
+        let request = sqlx::query_as::<_, StoredPendingRequest>(&format!(
+            "SELECT request_id, channel_id, session_id, domain, post_id, created_at \
+             FROM {}.pending_requests WHERE domain = $1 AND session_id = $2",
+            SCHEMA
+        ))
+        .bind(domain)
+        .bind(session_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(request)
+    }
+
     // Audit log operations
     pub async fn log_approval(
         &self,

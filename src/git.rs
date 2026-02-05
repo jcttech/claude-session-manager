@@ -1,4 +1,5 @@
 use anyhow::{anyhow, Result};
+use dashmap::mapref::entry::Entry;
 use dashmap::DashMap;
 use shell_escape::escape;
 use std::borrow::Cow;
@@ -224,13 +225,28 @@ impl GitManager {
     }
 
     /// Check if the main clone of a repo has an active session
+    #[allow(dead_code)]
     pub fn is_repo_in_use(&self, repo_ref: &RepoRef) -> Option<String> {
         self.active_repos.get(&repo_ref.full_name()).map(|r| r.clone())
     }
 
     /// Mark a repo's main clone as in use by a session
+    #[allow(dead_code)]
     pub fn mark_repo_in_use(&self, repo_ref: &RepoRef, session_id: &str) {
         self.active_repos.insert(repo_ref.full_name(), session_id.to_string());
+    }
+
+    /// Atomically try to acquire a repo for a session
+    /// Returns true if acquired, false if already in use
+    /// This prevents race conditions between is_repo_in_use and mark_repo_in_use
+    pub fn try_acquire_repo(&self, repo_ref: &RepoRef, session_id: &str) -> Result<(), String> {
+        match self.active_repos.entry(repo_ref.full_name()) {
+            Entry::Occupied(e) => Err(e.get().clone()),
+            Entry::Vacant(v) => {
+                v.insert(session_id.to_string());
+                Ok(())
+            }
+        }
     }
 
     /// Release a repo's main clone

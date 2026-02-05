@@ -22,8 +22,12 @@ fn create_ssh_key_path() -> Result<PathBuf> {
     let s = settings();
 
     if let Some(key_content) = &s.vm_ssh_key {
-        // Write key to a secure temp file
-        let key_path = std::env::temp_dir().join("session-manager-ssh-key");
+        // Write key to a secure runtime directory (XDG_RUNTIME_DIR preferred for security)
+        // Falls back to temp_dir for container compatibility
+        let key_path = std::env::var("XDG_RUNTIME_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| std::env::temp_dir())
+            .join("session-manager-ssh-key");
 
         // Write with restricted permissions
         #[cfg(unix)]

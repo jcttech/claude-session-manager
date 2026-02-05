@@ -33,5 +33,9 @@ tower = { version = "0.5", features = ["limit"] }
 sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "chrono"] }
 chrono = { version = "0.4", features = ["serde"] }
 
+# Observability
+metrics = "0.24"
+metrics-exporter-prometheus = "0.16"
+
 [dev-dependencies]
 tokio-test = "0.4"

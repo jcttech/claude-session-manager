@@ -11,9 +11,11 @@ mod ssh;
 use anyhow::Result;
 use axum::{
     extract::State,
-    routing::post,
+    routing::{get, post},
     Json, Router,
 };
+use metrics::{counter, gauge};
+use metrics_exporter_prometheus::PrometheusBuilder;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -61,6 +63,11 @@ struct CallbackResponse {
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
+
+    // Initialize Prometheus metrics recorder
+    let prometheus_handle = PrometheusBuilder::new()
+        .install_recorder()
+        .expect("failed to install Prometheus recorder");
 
     // Initialize SSH key (writes to temp file if SM_VM_SSH_KEY is set)
     ssh::init_ssh_key()?;
@@ -112,29 +119,100 @@ async fn main() -> Result<()> {
     // Build router with rate limiting middleware
     let app = Router::new()
         .route("/callback", post(handle_callback))
+        .route("/health", get(health_check))
+        .route("/metrics", get(move || {
+            let handle = prometheus_handle.clone();
+            async move { handle.render() }
+        }))
         .layer(rate_limiter)
         .with_state(state);
 
     let listen_addr = &config::settings().listen_addr;
     let listener = tokio::net::TcpListener::bind(listen_addr).await?;
     tracing::info!("Listening on {}", listen_addr);
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
 
     Ok(())
 }
 
+/// Health check endpoint for Kubernetes probes
+async fn health_check() -> &'static str {
+    "OK"
+}
+
+/// Graceful shutdown signal handler
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to listen for ctrl+c");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
+
+    tracing::info!("Shutdown signal received, starting graceful shutdown");
+}
+
 /// Recover active sessions from the database on startup
-async fn recover_sessions(db: &Database, _containers: &ContainerManager) -> usize {
+/// Checks if containers are still running and cleans up stale sessions
+async fn recover_sessions(db: &Database, containers: &ContainerManager) -> usize {
     match db.get_all_sessions().await {
         Ok(sessions) => {
-            // Note: We log recovered sessions but don't reconnect to running containers
-            // as this would require complex state reconciliation. The sessions table
-            // is primarily for audit/reference. Active session state is rebuilt on restart.
-            tracing::info!("Found {} sessions in database (not reconnecting)", sessions.len());
-            sessions.len()
+            let mut cleaned = 0;
+
+            for session in &sessions {
+                // Check if container still exists
+                if containers.is_container_running(&session.container_name).await {
+                    // Container is running but we can't reconnect to it
+                    // (would need complex stdin/stdout reconnection)
+                    // So we stop the orphaned container and clean up
+                    tracing::info!(
+                        session_id = %session.session_id,
+                        container = %session.container_name,
+                        "Stopping orphaned container from previous run"
+                    );
+                    let _ = containers.remove_container(&session.container_name).await;
+                    let _ = db.delete_session(&session.session_id).await;
+                    cleaned += 1;
+                } else {
+                    // Container not running, just clean up the database entry
+                    tracing::debug!(
+                        session_id = %session.session_id,
+                        container = %session.container_name,
+                        "Cleaning up stale session record"
+                    );
+                    let _ = db.delete_session(&session.session_id).await;
+                    cleaned += 1;
+                }
+            }
+
+            if cleaned > 0 {
+                tracing::info!(
+                    cleaned = cleaned,
+                    "Cleaned up stale sessions from previous run"
+                );
+            }
+
+            0 // No sessions were actually recovered (we clean up, not reconnect)
         }
         Err(e) => {
-            tracing::warn!("Failed to recover sessions: {}", e);
+            tracing::warn!(error = %e, "Failed to recover sessions");
             0
         }
     }
@@ -202,14 +280,14 @@ async fn handle_messages(state: Arc<AppState>, mut rx: mpsc::Receiver<Post>) {
                                     }
                                 }
                             } else {
-                                // Using main clone - check if already in use
-                                if let Some(existing_session) = state.git.is_repo_in_use(&repo_ref) {
+                                // Using main clone - atomically try to acquire
+                                if let Err(existing_session) = state.git.try_acquire_repo(&repo_ref, &session_id) {
                                     let _ = state.mm.post(channel_id, &format!(
                                         "Repository **{}** is already in use by session `{}`.\n\
                                         Use `--worktree` for an isolated working directory:\n\
                                         `@claude start {} --worktree`",
                                         repo_ref.full_name(),
-                                        &existing_session[..8],
+                                        &existing_session[..8.min(existing_session.len())],
                                         project_input
                                     )).await;
                                     continue;
@@ -223,11 +301,11 @@ async fn handle_messages(state: Arc<AppState>, mut rx: mpsc::Receiver<Post>) {
 
                                 match state.git.ensure_repo(&repo_ref).await {
                                     Ok(path) => {
-                                        // Mark repo as in use
-                                        state.git.mark_repo_in_use(&repo_ref, &session_id);
                                         path.to_string_lossy().to_string()
                                     }
                                     Err(e) => {
+                                        // Release the repo since we failed
+                                        state.git.release_repo_by_session(&session_id);
                                         let _ = state.mm.post(channel_id, &format!(
                                             "Failed to prepare repository: {}",
                                             e
@@ -271,6 +349,10 @@ async fn handle_messages(state: Arc<AppState>, mut rx: mpsc::Receiver<Post>) {
                 let (output_tx, output_rx) = mpsc::channel::<String>(100);
                 match state.containers.start(&session_id, &project_path, output_tx).await {
                     Ok(name) => {
+                        // Track metrics
+                        counter!("sessions_started_total").increment(1);
+                        gauge!("active_sessions").increment(1.0);
+
                         // Track worktree path in session (for reference, not auto-cleanup)
                         if let Some(wt_path) = worktree_path {
                             state.containers.set_worktree_path(&session_id, wt_path);
@@ -278,8 +360,19 @@ async fn handle_messages(state: Arc<AppState>, mut rx: mpsc::Receiver<Post>) {
 
                         // Persist session to database
                         if let Err(e) = state.db.create_session(&session_id, channel_id, project_input, &name).await {
-                            tracing::error!("Failed to persist session: {}", e);
+                            tracing::error!(
+                                session_id = %session_id,
+                                error = %e,
+                                "Failed to persist session"
+                            );
                         }
+
+                        tracing::info!(
+                            session_id = %session_id,
+                            container = %name,
+                            project = %project_input,
+                            "Session started"
+                        );
 
                         let _ = state.mm.post(channel_id, &format!("Ready. Container: `{}`", name)).await;
 
@@ -308,6 +401,11 @@ async fn handle_messages(state: Arc<AppState>, mut rx: mpsc::Receiver<Post>) {
                     // Release repo tracking (if using main clone)
                     state.git.release_repo_by_session(&session.session_id);
                     let _ = state.db.delete_session(&session.session_id).await;
+                    gauge!("active_sessions").decrement(1.0);
+                    tracing::info!(
+                        session_id = %session.session_id,
+                        "Session stopped by user"
+                    );
                 }
                 let _ = state.mm.post(channel_id, "Stopped.").await;
                 continue;
@@ -341,12 +439,52 @@ async fn stream_output(
     // Also release repo tracking (if using main clone)
     state.git.release_repo_by_session(&session_id);
     let _ = state.db.delete_session(&session_id).await;
+    gauge!("active_sessions").decrement(1.0);
+    tracing::info!(
+        session_id = %session_id,
+        channel_id = %channel_id,
+        "Session stream ended"
+    );
     let _ = state.mm.post(&channel_id, "Session ended.").await;
 }
 
 async fn handle_network_request(state: &AppState, channel_id: &str, session_id: &str, domain: &str) {
+    // Check if there's already a pending request for this domain in this session
+    // This prevents duplicate approval cards for the same domain
+    match state.db.get_pending_request_by_domain_and_session(domain, session_id).await {
+        Ok(Some(existing)) => {
+            tracing::debug!(
+                domain = %domain,
+                session_id = %session_id,
+                existing_request_id = %existing.request_id,
+                "Skipping duplicate network request - already pending"
+            );
+            counter!("network_requests_deduplicated_total").increment(1);
+            return;
+        }
+        Err(e) => {
+            tracing::warn!(
+                domain = %domain,
+                session_id = %session_id,
+                error = %e,
+                "Failed to check for duplicate request, proceeding anyway"
+            );
+        }
+        Ok(None) => {
+            // No existing request, proceed normally
+        }
+    }
+
     let request_id = Uuid::new_v4().to_string();
     let s = config::settings();
+
+    counter!("network_requests_total").increment(1);
+    tracing::info!(
+        request_id = %request_id,
+        session_id = %session_id,
+        domain = %domain,
+        "Network request received, awaiting approval"
+    );
 
     // Generate HMAC signatures for both approve and deny actions
     let approve_sig = sign_request(&s.callback_secret, &request_id, "approve");
@@ -379,6 +517,19 @@ async fn handle_callback(
     let action = &payload.context.action;
     let signature = &payload.context.signature;
     let s = config::settings();
+
+    // Check if user is authorized to approve/deny requests
+    if !s.allowed_approvers.is_empty() && !s.allowed_approvers.contains(&payload.user_name) {
+        tracing::warn!(
+            user = %payload.user_name,
+            request_id = %request_id,
+            "Unauthorized user attempted to process request"
+        );
+        return Json(CallbackResponse {
+            ephemeral_text: Some("You are not authorized to approve or deny requests.".into()),
+            update: None,
+        });
+    }
 
     // Verify HMAC signature to ensure request came from our approval buttons
     if !verify_signature(&s.callback_secret, request_id, action, signature) {
@@ -424,11 +575,25 @@ async fn handle_callback(
         let _ = state.opnsense.add_domain(&req.domain).await;
         let _ = state.mm.update_post(&req.post_id, &format!("`{}` approved by @{}", req.domain, payload.user_name)).await;
         let _ = state.containers.send(&req.session_id, &format!("[NETWORK_APPROVED: {}]", req.domain)).await;
-        tracing::info!("Domain {} approved by {}", req.domain, payload.user_name);
+        counter!("approvals_total", "action" => "approve").increment(1);
+        tracing::info!(
+            request_id = %request_id,
+            domain = %req.domain,
+            user = %payload.user_name,
+            session_id = %req.session_id,
+            "Domain approved"
+        );
     } else {
         let _ = state.mm.update_post(&req.post_id, &format!("`{}` denied by @{}", req.domain, payload.user_name)).await;
         let _ = state.containers.send(&req.session_id, &format!("[NETWORK_DENIED: {}]", req.domain)).await;
-        tracing::info!("Domain {} denied by {}", req.domain, payload.user_name);
+        counter!("approvals_total", "action" => "deny").increment(1);
+        tracing::info!(
+            request_id = %request_id,
+            domain = %req.domain,
+            user = %payload.user_name,
+            session_id = %req.session_id,
+            "Domain denied"
+        );
     }
 
     Json(CallbackResponse {
