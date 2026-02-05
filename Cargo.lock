@@ -3231,6 +3231,7 @@ dependencies = [
  "tokio",
  "tokio-test",
  "tokio-tungstenite",
+ "tokio-util",
  "tower",
  "tracing",
  "tracing-subscriber",

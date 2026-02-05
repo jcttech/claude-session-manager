@@ -47,9 +47,14 @@ impl Database {
         let s = settings();
 
         let pool = PgPoolOptions::new()
-            .max_connections(5)
+            .max_connections(s.database_pool_size)
             .connect(&s.database_url)
             .await?;
+
+        tracing::info!(
+            pool_size = s.database_pool_size,
+            "Database connection pool initialized"
+        );
 
         // Create schema if it doesn't exist
         sqlx::query(&format!("CREATE SCHEMA IF NOT EXISTS {}", SCHEMA))

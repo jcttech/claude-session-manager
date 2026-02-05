@@ -4,8 +4,16 @@ use sha2::Sha256;
 type HmacSha256 = Hmac<Sha256>;
 
 /// Generate an HMAC-SHA256 signature for a request
+/// Uses length-prefixed format to prevent collision when request_id contains ':'
+/// Format: "{len_request_id}:{request_id}:{len_action}:{action}"
 pub fn sign_request(secret: &str, request_id: &str, action: &str) -> String {
-    let message = format!("{}:{}", request_id, action);
+    let message = format!(
+        "{}:{}:{}:{}",
+        request_id.len(),
+        request_id,
+        action.len(),
+        action
+    );
     let mut mac = HmacSha256::new_from_slice(secret.as_bytes())
         .expect("HMAC can take key of any size");
     mac.update(message.as_bytes());
@@ -134,5 +142,19 @@ mod tests {
     #[test]
     fn test_constant_time_eq_empty() {
         assert!(constant_time_eq(b"", b""));
+    }
+
+    #[test]
+    fn test_no_collision_with_colon_in_request_id() {
+        // This test verifies that "a:b" with action "c" produces a different
+        // signature than "a" with action "b:c" - which was a vulnerability
+        // with the old simple concatenation format
+        let secret = "test-secret";
+
+        let sig1 = sign_request(secret, "a:b", "c");
+        let sig2 = sign_request(secret, "a", "b:c");
+
+        // With length-prefixed format, these should produce different signatures
+        assert_ne!(sig1, sig2, "Signatures should differ to prevent collision attack");
     }
 }

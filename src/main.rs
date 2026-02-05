@@ -14,12 +14,13 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use metrics::{counter, gauge};
+use metrics::{counter, gauge, histogram};
 use metrics_exporter_prometheus::PrometheusBuilder;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::container::ContainerManager;
@@ -29,6 +30,15 @@ use crate::git::{GitManager, RepoRef};
 use crate::mattermost::{Mattermost, Post};
 use crate::opnsense::OPNsense;
 use crate::rate_limit::RateLimitLayer;
+
+/// Cached regex for network request detection (compiled once on first use)
+static NETWORK_REQUEST_RE: OnceLock<Regex> = OnceLock::new();
+
+fn network_request_regex() -> &'static Regex {
+    NETWORK_REQUEST_RE.get_or_init(|| {
+        Regex::new(r"\[NETWORK_REQUEST:\s*([^\]]+)\]").expect("Invalid regex pattern")
+    })
+}
 
 struct AppState {
     mm: Mattermost,
@@ -90,31 +100,47 @@ async fn main() -> Result<()> {
         db,
     });
 
+    // Create cancellation token for graceful shutdown of background tasks
+    let cancel_token = CancellationToken::new();
+
     // Start message listener
     let (post_tx, post_rx) = mpsc::channel::<Post>(100);
     let state_clone = state.clone();
-    tokio::spawn(async move {
-        let _ = state_clone.mm.listen(post_tx).await;
+    let cancel_clone = cancel_token.clone();
+    let listener_handle = tokio::spawn(async move {
+        tokio::select! {
+            result = state_clone.mm.listen(post_tx) => {
+                if let Err(e) = result {
+                    tracing::error!(error = %e, "Message listener error");
+                }
+            }
+            _ = cancel_clone.cancelled() => {
+                tracing::info!("Message listener cancelled");
+            }
+        }
     });
 
     // Start message handler
     let state_clone = state.clone();
-    tokio::spawn(async move {
-        handle_messages(state_clone, post_rx).await;
+    let cancel_clone = cancel_token.clone();
+    let handler_handle = tokio::spawn(async move {
+        handle_messages(state_clone, post_rx, cancel_clone).await;
     });
 
     // Start periodic cleanup of stale pending requests
     let state_clone = state.clone();
-    tokio::spawn(async move {
-        cleanup_stale_requests(state_clone).await;
+    let cancel_clone = cancel_token.clone();
+    let cleanup_handle = tokio::spawn(async move {
+        cleanup_stale_requests(state_clone, cancel_clone).await;
     });
 
     // Configure rate limiting
     let s = config::settings();
     let rate_limiter = RateLimitLayer::new(s.rate_limit_rps, s.rate_limit_burst);
 
-    // Spawn cleanup task for rate limiter
-    rate_limit::spawn_cleanup_task(rate_limiter.clone());
+    // Spawn cleanup task for rate limiter (also uses cancellation token)
+    let cancel_clone = cancel_token.clone();
+    let rate_limit_handle = rate_limit::spawn_cleanup_task(rate_limiter.clone(), cancel_clone);
 
     // Build router with rate limiting middleware
     let app = Router::new()
@@ -131,9 +157,24 @@ async fn main() -> Result<()> {
     let listener = tokio::net::TcpListener::bind(listen_addr).await?;
     tracing::info!("Listening on {}", listen_addr);
     axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(shutdown_signal(cancel_token.clone()))
         .await?;
 
+    // Cancel background tasks and wait for them to complete
+    tracing::info!("Cancelling background tasks...");
+    cancel_token.cancel();
+
+    // Wait for all background tasks to finish (with timeout)
+    let shutdown_timeout = std::time::Duration::from_secs(10);
+    let _ = tokio::time::timeout(shutdown_timeout, async {
+        let _ = listener_handle.await;
+        let _ = handler_handle.await;
+        let _ = cleanup_handle.await;
+        let _ = rate_limit_handle.await;
+    })
+    .await;
+
+    tracing::info!("Shutdown complete");
     Ok(())
 }
 
@@ -143,7 +184,7 @@ async fn health_check() -> &'static str {
 }
 
 /// Graceful shutdown signal handler
-async fn shutdown_signal() {
+async fn shutdown_signal(cancel_token: CancellationToken) {
     let ctrl_c = async {
         tokio::signal::ctrl_c()
             .await
@@ -164,6 +205,7 @@ async fn shutdown_signal() {
     tokio::select! {
         _ = ctrl_c => {},
         _ = terminate => {},
+        _ = cancel_token.cancelled() => {},
     }
 
     tracing::info!("Shutdown signal received, starting graceful shutdown");
@@ -187,8 +229,20 @@ async fn recover_sessions(db: &Database, containers: &ContainerManager) -> usize
                         container = %session.container_name,
                         "Stopping orphaned container from previous run"
                     );
-                    let _ = containers.remove_container(&session.container_name).await;
-                    let _ = db.delete_session(&session.session_id).await;
+                    if let Err(e) = containers.remove_container(&session.container_name).await {
+                        tracing::warn!(
+                            session_id = %session.session_id,
+                            error = %e,
+                            "Failed to remove orphaned container"
+                        );
+                    }
+                    if let Err(e) = db.delete_session(&session.session_id).await {
+                        tracing::warn!(
+                            session_id = %session.session_id,
+                            error = %e,
+                            "Failed to delete stale session from database"
+                        );
+                    }
                     cleaned += 1;
                 } else {
                     // Container not running, just clean up the database entry
@@ -197,7 +251,13 @@ async fn recover_sessions(db: &Database, containers: &ContainerManager) -> usize
                         container = %session.container_name,
                         "Cleaning up stale session record"
                     );
-                    let _ = db.delete_session(&session.session_id).await;
+                    if let Err(e) = db.delete_session(&session.session_id).await {
+                        tracing::warn!(
+                            session_id = %session.session_id,
+                            error = %e,
+                            "Failed to delete stale session from database"
+                        );
+                    }
                     cleaned += 1;
                 }
             }
@@ -219,27 +279,45 @@ async fn recover_sessions(db: &Database, containers: &ContainerManager) -> usize
 }
 
 /// Periodically clean up stale pending requests
-async fn cleanup_stale_requests(state: Arc<AppState>) {
+async fn cleanup_stale_requests(state: Arc<AppState>, cancel_token: CancellationToken) {
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600)); // Every hour
     loop {
-        interval.tick().await;
-        match state.db.cleanup_stale_requests(24).await {
-            Ok(count) if count > 0 => {
-                tracing::info!("Cleaned up {} stale pending requests", count);
+        tokio::select! {
+            _ = interval.tick() => {
+                match state.db.cleanup_stale_requests(24).await {
+                    Ok(count) if count > 0 => {
+                        tracing::info!("Cleaned up {} stale pending requests", count);
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to cleanup stale requests: {}", e);
+                    }
+                    _ => {}
+                }
             }
-            Err(e) => {
-                tracing::warn!("Failed to cleanup stale requests: {}", e);
+            _ = cancel_token.cancelled() => {
+                tracing::info!("Cleanup task cancelled");
+                break;
             }
-            _ => {}
         }
     }
 }
 
-async fn handle_messages(state: Arc<AppState>, mut rx: mpsc::Receiver<Post>) {
-    let network_re = Regex::new(r"\[NETWORK_REQUEST:\s*([^\]]+)\]").unwrap();
+async fn handle_messages(state: Arc<AppState>, mut rx: mpsc::Receiver<Post>, cancel_token: CancellationToken) {
     let bot_trigger = &config::settings().bot_trigger;
 
-    while let Some(post) = rx.recv().await {
+    loop {
+        let post = tokio::select! {
+            post = rx.recv() => {
+                match post {
+                    Some(p) => p,
+                    None => break, // Channel closed
+                }
+            }
+            _ = cancel_token.cancelled() => {
+                tracing::info!("Message handler cancelled");
+                break;
+            }
+        };
         let text = post.message.trim();
         let channel_id = &post.channel_id;
 
@@ -345,10 +423,15 @@ async fn handle_messages(state: Arc<AppState>, mut rx: mpsc::Receiver<Post>) {
                 };
 
                 let _ = state.mm.post(channel_id, "Starting session...").await;
+                let session_start_time = std::time::Instant::now();
 
                 let (output_tx, output_rx) = mpsc::channel::<String>(100);
                 match state.containers.start(&session_id, &project_path, output_tx).await {
                     Ok(name) => {
+                        // Record session start latency
+                        let session_duration = session_start_time.elapsed();
+                        histogram!("session_start_duration_seconds").record(session_duration.as_secs_f64());
+
                         // Track metrics
                         counter!("sessions_started_total").increment(1);
                         gauge!("active_sessions").increment(1.0);
@@ -380,9 +463,8 @@ async fn handle_messages(state: Arc<AppState>, mut rx: mpsc::Receiver<Post>) {
                         let state_clone = state.clone();
                         let channel_id_clone = channel_id.clone();
                         let session_id_clone = session_id.clone();
-                        let network_re_clone = network_re.clone();
                         tokio::spawn(async move {
-                            stream_output(state_clone, channel_id_clone, session_id_clone, output_rx, network_re_clone).await;
+                            stream_output(state_clone, channel_id_clone, session_id_clone, output_rx).await;
                         });
                     }
                     Err(e) => {
@@ -397,24 +479,44 @@ async fn handle_messages(state: Arc<AppState>, mut rx: mpsc::Receiver<Post>) {
             // Stop session
             if text == "stop" {
                 if let Ok(Some(session)) = state.db.get_session_by_channel(channel_id).await {
-                    let _ = state.containers.stop(&session.session_id).await;
+                    if let Err(e) = state.containers.stop(&session.session_id).await {
+                        tracing::warn!(
+                            session_id = %session.session_id,
+                            error = %e,
+                            "Failed to stop container"
+                        );
+                    }
                     // Release repo tracking (if using main clone)
                     state.git.release_repo_by_session(&session.session_id);
-                    let _ = state.db.delete_session(&session.session_id).await;
+                    if let Err(e) = state.db.delete_session(&session.session_id).await {
+                        tracing::warn!(
+                            session_id = %session.session_id,
+                            error = %e,
+                            "Failed to delete session from database"
+                        );
+                    }
                     gauge!("active_sessions").decrement(1.0);
                     tracing::info!(
                         session_id = %session.session_id,
                         "Session stopped by user"
                     );
                 }
-                let _ = state.mm.post(channel_id, "Stopped.").await;
+                if let Err(e) = state.mm.post(channel_id, "Stopped.").await {
+                    tracing::warn!(error = %e, "Failed to post stop message");
+                }
                 continue;
             }
         }
 
         // Forward to Claude
-        if let Ok(Some(session)) = state.db.get_session_by_channel(channel_id).await {
-            let _ = state.containers.send(&session.session_id, text).await;
+        if let Ok(Some(session)) = state.db.get_session_by_channel(channel_id).await
+            && let Err(e) = state.containers.send(&session.session_id, text).await
+        {
+            tracing::warn!(
+                session_id = %session.session_id,
+                error = %e,
+                "Failed to forward message to container"
+            );
         }
     }
 }
@@ -424,31 +526,45 @@ async fn stream_output(
     channel_id: String,
     session_id: String,
     mut rx: mpsc::Receiver<String>,
-    network_re: Regex,
 ) {
+    let network_re = network_request_regex();
     while let Some(line) = rx.recv().await {
         if let Some(caps) = network_re.captures(&line) {
             let domain = caps[1].trim();
             handle_network_request(&state, &channel_id, &session_id, domain).await;
-        } else {
-            let _ = state.mm.post(&channel_id, &format!("```\n{}\n```", line)).await;
+        } else if let Err(e) = state.mm.post(&channel_id, &format!("```\n{}\n```", line)).await {
+            tracing::warn!(
+                session_id = %session_id,
+                error = %e,
+                "Failed to post output to Mattermost"
+            );
         }
     }
 
     // Clean up session from database when stream ends
     // Also release repo tracking (if using main clone)
     state.git.release_repo_by_session(&session_id);
-    let _ = state.db.delete_session(&session_id).await;
+    if let Err(e) = state.db.delete_session(&session_id).await {
+        tracing::warn!(
+            session_id = %session_id,
+            error = %e,
+            "Failed to delete session from database on stream end"
+        );
+    }
     gauge!("active_sessions").decrement(1.0);
     tracing::info!(
         session_id = %session_id,
         channel_id = %channel_id,
         "Session stream ended"
     );
-    let _ = state.mm.post(&channel_id, "Session ended.").await;
+    if let Err(e) = state.mm.post(&channel_id, "Session ended.").await {
+        tracing::warn!(error = %e, "Failed to post session end message");
+    }
 }
 
 async fn handle_network_request(state: &AppState, channel_id: &str, session_id: &str, domain: &str) {
+    let start_time = std::time::Instant::now();
+
     // Check if there's already a pending request for this domain in this session
     // This prevents duplicate approval cards for the same domain
     match state.db.get_pending_request_by_domain_and_session(domain, session_id).await {
@@ -507,12 +623,17 @@ async fn handle_network_request(state: &AppState, channel_id: &str, session_id: 
             tracing::error!("Failed to post approval: {}", e);
         }
     }
+
+    // Record network request handling latency
+    let duration = start_time.elapsed();
+    histogram!("network_request_duration_seconds").record(duration.as_secs_f64());
 }
 
 async fn handle_callback(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<CallbackPayload>,
 ) -> Json<CallbackResponse> {
+    let start_time = std::time::Instant::now();
     let request_id = &payload.context.request_id;
     let action = &payload.context.action;
     let signature = &payload.context.signature;
@@ -561,31 +682,67 @@ async fn handle_callback(
         }
     };
 
-    // Delete the pending request
-    if let Err(e) = state.db.delete_pending_request(request_id).await {
-        tracing::error!("Failed to delete pending request: {}", e);
-    }
-
-    // Log the action for audit
-    if let Err(e) = state.db.log_approval(request_id, &req.domain, action, &payload.user_name).await {
-        tracing::error!("Failed to log approval: {}", e);
-    }
-
     if action == "approve" {
-        let _ = state.opnsense.add_domain(&req.domain).await;
-        let _ = state.mm.update_post(&req.post_id, &format!("`{}` approved by @{}", req.domain, payload.user_name)).await;
-        let _ = state.containers.send(&req.session_id, &format!("[NETWORK_APPROVED: {}]", req.domain)).await;
-        counter!("approvals_total", "action" => "approve").increment(1);
-        tracing::info!(
-            request_id = %request_id,
-            domain = %req.domain,
-            user = %payload.user_name,
-            session_id = %req.session_id,
-            "Domain approved"
-        );
+        // For approvals, try OPNsense first - this is the critical operation
+        // Only delete the pending request and log if OPNsense succeeds
+        match state.opnsense.add_domain(&req.domain).await {
+            Ok(_added) => {
+                // OPNsense succeeded, now we can delete the pending request
+                if let Err(e) = state.db.delete_pending_request(request_id).await {
+                    tracing::error!("Failed to delete pending request: {}", e);
+                }
+
+                // Log the action for audit
+                if let Err(e) = state.db.log_approval(request_id, &req.domain, action, &payload.user_name).await {
+                    tracing::error!("Failed to log approval: {}", e);
+                }
+
+                if let Err(e) = state.mm.update_post(&req.post_id, &format!("`{}` approved by @{}", req.domain, payload.user_name)).await {
+                    tracing::warn!(error = %e, "Failed to update Mattermost post");
+                }
+                if let Err(e) = state.containers.send(&req.session_id, &format!("[NETWORK_APPROVED: {}]", req.domain)).await {
+                    tracing::warn!(error = %e, "Failed to notify container");
+                }
+                counter!("approvals_total", "action" => "approve").increment(1);
+                tracing::info!(
+                    request_id = %request_id,
+                    domain = %req.domain,
+                    user = %payload.user_name,
+                    session_id = %req.session_id,
+                    "Domain approved"
+                );
+            }
+            Err(e) => {
+                // OPNsense failed - don't mark as approved, keep the pending request
+                tracing::error!(
+                    request_id = %request_id,
+                    domain = %req.domain,
+                    error = %e,
+                    "Failed to add domain to OPNsense - request NOT approved"
+                );
+                return Json(CallbackResponse {
+                    ephemeral_text: Some(format!("Failed to add domain to firewall: {}. Please try again.", e)),
+                    update: None,
+                });
+            }
+        }
     } else {
-        let _ = state.mm.update_post(&req.post_id, &format!("`{}` denied by @{}", req.domain, payload.user_name)).await;
-        let _ = state.containers.send(&req.session_id, &format!("[NETWORK_DENIED: {}]", req.domain)).await;
+        // For denials, delete the pending request first (no external dependency)
+        if let Err(e) = state.db.delete_pending_request(request_id).await {
+            tracing::error!("Failed to delete pending request: {}", e);
+        }
+
+        // Log the action for audit
+        if let Err(e) = state.db.log_approval(request_id, &req.domain, action, &payload.user_name).await {
+            tracing::error!("Failed to log denial: {}", e);
+        }
+
+        if let Err(e) = state.mm.update_post(&req.post_id, &format!("`{}` denied by @{}", req.domain, payload.user_name)).await {
+            tracing::warn!(error = %e, "Failed to update Mattermost post");
+        }
+        if let Err(e) = state.containers.send(&req.session_id, &format!("[NETWORK_DENIED: {}]", req.domain)).await {
+            tracing::warn!(error = %e, "Failed to notify container");
+        }
         counter!("approvals_total", "action" => "deny").increment(1);
         tracing::info!(
             request_id = %request_id,
@@ -595,6 +752,10 @@ async fn handle_callback(
             "Domain denied"
         );
     }
+
+    // Record callback processing latency
+    let duration = start_time.elapsed();
+    histogram!("callback_duration_seconds").record(duration.as_secs_f64());
 
     Json(CallbackResponse {
         ephemeral_text: None,

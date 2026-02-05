@@ -1,6 +1,7 @@
 use anyhow::{anyhow, Result};
 use std::path::PathBuf;
 use std::sync::OnceLock;
+use std::time::Duration;
 use tokio::process::Command;
 
 use crate::config::settings;
@@ -68,19 +69,24 @@ pub fn ssh_key_path() -> Result<&'static PathBuf> {
 }
 
 /// Run an SSH command on the VM and return the output
+/// Uses configurable timeout (SM_SSH_TIMEOUT_SECS, default 30s)
 pub async fn run_command(cmd: &str) -> Result<String> {
     let s = settings();
     let key_path = ssh_key_path()?;
+    let timeout = Duration::from_secs(s.ssh_timeout_secs);
 
-    let output = Command::new("ssh")
+    let ssh_future = Command::new("ssh")
         .arg("-o")
         .arg("StrictHostKeyChecking=accept-new")
         .arg("-i")
         .arg(key_path)
         .arg(format!("{}@{}", &s.vm_user, &s.vm_host))
         .arg(cmd)
-        .output()
-        .await?;
+        .output();
+
+    let output = tokio::time::timeout(timeout, ssh_future)
+        .await
+        .map_err(|_| anyhow!("SSH command timed out after {} seconds", s.ssh_timeout_secs))??;
 
     if output.status.success() {
         Ok(String::from_utf8_lossy(&output.stdout).to_string())

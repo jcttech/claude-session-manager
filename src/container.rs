@@ -95,9 +95,18 @@ impl ContainerManager {
         let mut stdin = stdin;
         tokio::spawn(async move {
             while let Some(text) = stdin_rx.recv().await {
-                let _ = stdin.write_all(text.as_bytes()).await;
-                let _ = stdin.write_all(b"\n").await;
-                let _ = stdin.flush().await;
+                if let Err(e) = stdin.write_all(text.as_bytes()).await {
+                    tracing::warn!(error = %e, "Failed to write to container stdin");
+                    break;
+                }
+                if let Err(e) = stdin.write_all(b"\n").await {
+                    tracing::warn!(error = %e, "Failed to write newline to container stdin");
+                    break;
+                }
+                if let Err(e) = stdin.flush().await {
+                    tracing::warn!(error = %e, "Failed to flush container stdin");
+                    break;
+                }
             }
         });
 

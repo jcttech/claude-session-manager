@@ -6,6 +6,11 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
+/// Exponential backoff configuration
+const INITIAL_BACKOFF_SECS: u64 = 1;
+const MAX_BACKOFF_SECS: u64 = 60;
+const BACKOFF_MULTIPLIER: u64 = 2;
+
 use crate::config::settings;
 
 #[derive(Clone)]
@@ -64,27 +69,68 @@ impl Mattermost {
     }
 
     /// Listen for messages with automatic reconnection on disconnect
+    /// Uses exponential backoff with jitter to prevent thundering herd
     pub async fn listen(&self, tx: mpsc::Sender<Post>) -> Result<()> {
+        let mut backoff_secs = INITIAL_BACKOFF_SECS;
+        let mut consecutive_failures = 0u32;
+
         loop {
+            // connect_and_listen returns Ok(true) if it connected successfully before failing
+            // This allows us to reset backoff after a successful connection
             match self.connect_and_listen(&tx).await {
-                Ok(()) => {
-                    // Clean exit - shouldn't normally happen
-                    tracing::info!("WebSocket connection closed normally");
-                    break Ok(());
+                Ok(connected_successfully) => {
+                    if connected_successfully {
+                        // Connection was working, reset backoff
+                        backoff_secs = INITIAL_BACKOFF_SECS;
+                        consecutive_failures = 0;
+                        tracing::info!("WebSocket connection closed, reconnecting immediately");
+                        continue;
+                    } else {
+                        // Clean exit without successful connection - shouldn't normally happen
+                        tracing::info!("WebSocket connection closed normally");
+                        break Ok(());
+                    }
                 }
                 Err(e) => {
+                    consecutive_failures += 1;
+
+                    // Add jitter (0-25% of backoff time) to prevent thundering herd
+                    let jitter_ms = backoff_secs * 250; // 25% max jitter
+                    let jitter = if jitter_ms > 0 {
+                        // Simple deterministic jitter based on current time
+                        (std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis() as u64)
+                            % jitter_ms
+                    } else {
+                        0
+                    };
+
+                    let delay = Duration::from_secs(backoff_secs) + Duration::from_millis(jitter);
+
                     tracing::warn!(
                         error = %e,
-                        "WebSocket disconnected, reconnecting in 5 seconds"
+                        backoff_secs = backoff_secs,
+                        jitter_ms = jitter,
+                        consecutive_failures = consecutive_failures,
+                        "WebSocket disconnected, reconnecting after backoff"
                     );
-                    tokio::time::sleep(Duration::from_secs(5)).await;
+
+                    tokio::time::sleep(delay).await;
+
+                    // Increase backoff for next failure (exponential)
+                    backoff_secs = (backoff_secs * BACKOFF_MULTIPLIER).min(MAX_BACKOFF_SECS);
                 }
             }
         }
     }
 
     /// Internal method to connect and process WebSocket messages
-    async fn connect_and_listen(&self, tx: &mpsc::Sender<Post>) -> Result<()> {
+    /// Returns Ok(true) if we successfully connected and processed messages before disconnecting
+    /// Returns Ok(false) for clean shutdown without ever connecting
+    /// Returns Err for connection failures
+    async fn connect_and_listen(&self, tx: &mpsc::Sender<Post>) -> Result<bool> {
         let s = settings();
         let ws_url = s.mattermost_url.replace("http", "ws") + "/api/v4/websocket";
 
@@ -101,7 +147,11 @@ impl Mattermost {
         write.send(Message::Text(auth.to_string().into())).await?;
         tracing::info!("WebSocket connected and authenticated");
 
+        // Track that we successfully connected
+        let mut received_any_message = false;
+
         while let Some(msg) = read.next().await {
+            received_any_message = true;
             let Ok(Message::Text(text)) = msg else { continue };
             let Ok(data) = serde_json::from_str::<serde_json::Value>(&text) else { continue };
 
@@ -110,12 +160,15 @@ impl Mattermost {
             }
             let Some(post_str) = data["data"]["post"].as_str() else { continue };
             let Ok(post) = serde_json::from_str::<Post>(post_str) else { continue };
-            if post.user_id != self.bot_user_id {
-                let _ = tx.send(post).await;
+            if post.user_id != self.bot_user_id
+                && let Err(e) = tx.send(post).await
+            {
+                tracing::warn!(error = %e, "Failed to send post to handler channel");
             }
         }
 
-        Ok(())
+        // Return true if we were connected and processing messages
+        Ok(received_any_message)
     }
 
     pub async fn post(&self, channel_id: &str, message: &str) -> Result<()> {

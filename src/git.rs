@@ -144,7 +144,13 @@ impl GitManager {
                     "cd {} && git pull --ff-only 2>/dev/null || true",
                     shell_escape(&repo_path_str)
                 );
-                let _ = self.ssh_command(&pull_cmd).await;
+                if let Err(e) = self.ssh_command(&pull_cmd).await {
+                    tracing::warn!(
+                        repo = %repo_ref.full_name(),
+                        error = %e,
+                        "Auto-pull failed, continuing with existing state"
+                    );
+                }
             }
         } else {
             // Clone the repo

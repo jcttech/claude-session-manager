@@ -11,6 +11,8 @@ use std::{
     task::{Context, Poll},
     time::{Duration, Instant},
 };
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 use tower::{Layer, Service};
 
 /// Simple token bucket rate limiter
@@ -74,15 +76,15 @@ where
 
     fn call(&mut self, req: Request<Body>) -> Self::Future {
         // Extract client IP from headers or connection info
-        let client_ip = extract_client_ip(&req);
+        // Use fallback IP (127.0.0.1) if extraction fails to prevent bypass
+        let client_ip = extract_client_ip(&req).unwrap_or_else(|| {
+            tracing::warn!(
+                "Could not determine client IP for rate limiting, using fallback 127.0.0.1"
+            );
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1))
+        });
 
-        let allowed = if let Some(ip) = client_ip {
-            self.check_rate_limit(ip)
-        } else {
-            // If we can't determine IP, allow the request but log it
-            tracing::warn!("Could not determine client IP for rate limiting");
-            true
-        };
+        let allowed = self.check_rate_limit(client_ip);
 
         if !allowed {
             let response = Response::builder()
@@ -143,21 +145,28 @@ fn extract_client_ip(req: &Request<Body>) -> Option<IpAddr> {
 }
 
 /// Periodically clean up old rate limit buckets to prevent memory leaks
-pub fn spawn_cleanup_task(layer: RateLimitLayer) {
+pub fn spawn_cleanup_task(layer: RateLimitLayer, cancel_token: CancellationToken) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(300)); // Every 5 minutes
         loop {
-            interval.tick().await;
-            let now = Instant::now();
-            let stale_threshold = Duration::from_secs(600); // 10 minutes
+            tokio::select! {
+                _ = interval.tick() => {
+                    let now = Instant::now();
+                    let stale_threshold = Duration::from_secs(600); // 10 minutes
 
-            layer.state.buckets.retain(|_, bucket| {
-                now.duration_since(bucket.last_update) < stale_threshold
-            });
+                    layer.state.buckets.retain(|_, bucket| {
+                        now.duration_since(bucket.last_update) < stale_threshold
+                    });
 
-            tracing::debug!("Rate limit cleanup: {} active buckets", layer.state.buckets.len());
+                    tracing::debug!("Rate limit cleanup: {} active buckets", layer.state.buckets.len());
+                }
+                _ = cancel_token.cancelled() => {
+                    tracing::info!("Rate limit cleanup task cancelled");
+                    break;
+                }
+            }
         }
-    });
+    })
 }
 
 #[cfg(test)]

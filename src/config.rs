@@ -71,6 +71,14 @@ pub struct Settings {
     /// PostgreSQL connection URL
     pub database_url: String,
 
+    /// Database connection pool size
+    #[serde(default = "default_database_pool_size")]
+    pub database_pool_size: u32,
+
+    /// SSH command timeout in seconds
+    #[serde(default = "default_ssh_timeout_secs")]
+    pub ssh_timeout_secs: u64,
+
     /// Rate limit: requests per second per IP
     #[serde(default = "default_rate_limit_rps")]
     pub rate_limit_rps: u64,
@@ -101,6 +109,8 @@ fn default_listen_addr() -> String { "0.0.0.0:8000".into() }
 fn default_bot_trigger() -> String { "@claude".into() }
 fn default_rate_limit_rps() -> u64 { 10 }
 fn default_rate_limit_burst() -> u32 { 20 }
+fn default_database_pool_size() -> u32 { 5 }
+fn default_ssh_timeout_secs() -> u64 { 30 }
 fn default_repos_base_path() -> String { "/home/claude/repos".into() }
 fn default_worktrees_path() -> String { "/home/claude/worktrees".into() }
 
