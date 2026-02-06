@@ -10,4 +10,6 @@ jobs:
     uses: jcttech/.github/.github/workflows/cleanup-docker.yml@v1
     with:
       image-name: claude-session-manager
+    permissions:
+      packages: write
     secrets: inherit

@@ -16,10 +16,10 @@ jobs:
       packages: write
     with:
       code-paths: |
-        - 'src/**'
-        - 'Cargo.toml'
-        - 'Cargo.lock'
-        - 'Dockerfile'
-        - '.dockerignore'
-        - 'tests/**'
+        src/**
+        Cargo.toml
+        Cargo.lock
+        Dockerfile
+        .dockerignore
+        tests/**
     secrets: inherit
