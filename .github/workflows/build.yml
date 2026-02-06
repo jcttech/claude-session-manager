@@ -9,12 +9,20 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    outputs:
+      sha_short: ${{ steps.vars.outputs.sha_short }}
     steps:
       - uses: actions/checkout@v4
+
+      - name: Set outputs
+        id: vars
+        run: echo "sha_short=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -54,34 +62,52 @@ jobs:
     permissions:
       contents: read
       packages: write
+    outputs:
+      image_exists: ${{ steps.check.outputs.exists }}
     steps:
       - uses: actions/checkout@v4
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
 
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@v3
         with:
-          registry: ghcr.io
+          registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check if image already exists for this SHA
+        id: check
+        run: |
+          SHA_SHORT=${{ needs.build.outputs.sha_short }}
+          # Try to pull the manifest - if it exists, image was already built
+          if docker manifest inspect ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${SHA_SHORT} > /dev/null 2>&1; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+            echo "Image already exists for SHA ${SHA_SHORT}"
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+            echo "Image does not exist for SHA ${SHA_SHORT}, will build"
+          fi
+
+      - name: Set up Docker Buildx
+        if: steps.check.outputs.exists != 'true'
+        uses: docker/setup-buildx-action@v3
 
       - name: Extract metadata
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ghcr.io/${{ github.repository }}
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
-            # For main branch: latest + sha
+            # Always tag with SHA
+            type=sha,prefix=
+            # For main branch: also tag as latest
             type=raw,value=latest,enable={{is_default_branch}}
-            type=sha,prefix=,enable={{is_default_branch}}
             # For version tags: semver variants (1.0.0, 1.0, 1)
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=semver,pattern={{major}},enable=${{ !startsWith(github.ref, 'refs/tags/v0.') }}
 
       - name: Build and push Docker image
+        if: steps.check.outputs.exists != 'true'
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -90,6 +116,28 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Retag existing image (skip rebuild)
+        if: steps.check.outputs.exists == 'true'
+        run: |
+          SHA_SHORT=${{ needs.build.outputs.sha_short }}
+          SOURCE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${SHA_SHORT}"
+
+          echo "Retagging existing image ${SOURCE}"
+
+          # Parse the tags from metadata action and apply them
+          TAGS="${{ steps.meta.outputs.tags }}"
+
+          # Create a comma-separated list for imagetools
+          TAG_ARGS=""
+          for tag in $TAGS; do
+            TAG_ARGS="${TAG_ARGS} -t ${tag}"
+          done
+
+          # Use imagetools to create new tags pointing to existing image
+          docker buildx imagetools create ${TAG_ARGS} ${SOURCE}
+
+          echo "Successfully retagged image with: $TAGS"
 
   release:
     runs-on: ubuntu-latest
