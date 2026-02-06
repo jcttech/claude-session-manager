@@ -11,6 +11,9 @@ on:
 jobs:
   ci:
     uses: jcttech/.github/.github/workflows/rust-pipeline.yml@v1
+    permissions:
+      contents: write
+      packages: write
     with:
       code-paths: |
         - 'src/**'
