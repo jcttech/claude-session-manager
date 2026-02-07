@@ -198,6 +198,7 @@ impl Database {
 
     // --- Session operations ---
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn create_session(
         &self,
         session_id: &str,

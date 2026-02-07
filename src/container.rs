@@ -34,11 +34,17 @@ struct Session {
     worktree_path: Option<PathBuf>,
 }
 
-impl ContainerManager {
-    pub fn new() -> Self {
+impl Default for ContainerManager {
+    fn default() -> Self {
         Self {
             sessions: DashMap::new(),
         }
+    }
+}
+
+impl ContainerManager {
+    pub fn new() -> Self {
+        Self::default()
     }
 
     pub async fn start(

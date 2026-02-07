@@ -137,11 +137,17 @@ pub struct GitManager {
     active_repos: std::sync::Arc<DashMap<String, String>>,
 }
 
-impl GitManager {
-    pub fn new() -> Self {
+impl Default for GitManager {
+    fn default() -> Self {
         Self {
             active_repos: std::sync::Arc::new(DashMap::new()),
         }
+    }
+}
+
+impl GitManager {
+    pub fn new() -> Self {
+        Self::default()
     }
 
     /// Run an SSH command on the VM
