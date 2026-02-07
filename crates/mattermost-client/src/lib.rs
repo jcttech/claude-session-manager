@@ -11,12 +11,12 @@ const INITIAL_BACKOFF_SECS: u64 = 1;
 const MAX_BACKOFF_SECS: u64 = 60;
 const BACKOFF_MULTIPLIER: u64 = 2;
 
-use crate::config::settings;
-
 #[derive(Clone)]
 pub struct Mattermost {
     client: Client,
     base_url: String,
+    token: String,
+    ws_url: String,
     pub bot_user_id: String,
 }
 
@@ -75,14 +75,14 @@ struct SidebarCategoriesResponse {
 }
 
 impl Mattermost {
-    pub async fn new() -> Result<Self> {
-        let s = settings();
+    pub async fn new(url: &str, token: &str) -> Result<Self> {
         let client = Client::builder().build()?;
-        let base_url = format!("{}/api/v4", s.mattermost_url);
+        let base_url = format!("{}/api/v4", url);
+        let ws_url = url.replace("http", "ws") + "/api/v4/websocket";
 
         let resp: UserResponse = client
             .get(format!("{}/users/me", base_url))
-            .header("Authorization", format!("Bearer {}", s.mattermost_token))
+            .header("Authorization", format!("Bearer {}", token))
             .send()
             .await?
             .json()
@@ -91,6 +91,8 @@ impl Mattermost {
         Ok(Self {
             client,
             base_url,
+            token: token.to_string(),
+            ws_url,
             bot_user_id: resp.id,
         })
     }
@@ -158,18 +160,15 @@ impl Mattermost {
     /// Returns Ok(false) for clean shutdown without ever connecting
     /// Returns Err for connection failures
     async fn connect_and_listen(&self, tx: &mpsc::Sender<Post>) -> Result<bool> {
-        let s = settings();
-        let ws_url = s.mattermost_url.replace("http", "ws") + "/api/v4/websocket";
-
         tracing::info!("Connecting to Mattermost WebSocket");
-        let (ws, _) = connect_async(&ws_url).await?;
+        let (ws, _) = connect_async(&self.ws_url).await?;
         let (mut write, mut read) = ws.split();
 
         // Authenticate
         let auth = serde_json::json!({
             "seq": 1,
             "action": "authentication_challenge",
-            "data": { "token": s.mattermost_token }
+            "data": { "token": self.token }
         });
         write.send(Message::Text(auth.to_string().into())).await?;
         tracing::info!("WebSocket connected and authenticated");
@@ -205,14 +204,16 @@ impl Mattermost {
         Ok(received_any_message)
     }
 
+    fn auth_header(&self) -> String {
+        format!("Bearer {}", self.token)
+    }
+
     /// Post a message to a channel, returns the post ID
     pub async fn post(&self, channel_id: &str, message: &str) -> Result<String> {
-        let s = settings();
-
         let resp: PostResponse = self
             .client
             .post(format!("{}/posts", self.base_url))
-            .header("Authorization", format!("Bearer {}", s.mattermost_token))
+            .header("Authorization", self.auth_header())
             .json(&PostRequest {
                 channel_id,
                 message,
@@ -239,12 +240,10 @@ impl Mattermost {
         root_id: &str,
         message: &str,
     ) -> Result<String> {
-        let s = settings();
-
         let resp: PostResponse = self
             .client
             .post(format!("{}/posts", self.base_url))
-            .header("Authorization", format!("Bearer {}", s.mattermost_token))
+            .header("Authorization", self.auth_header())
             .json(&PostRequest {
                 channel_id,
                 message,
@@ -259,59 +258,22 @@ impl Mattermost {
         Ok(resp.id)
     }
 
-    /// Post an approval card as a thread reply
-    pub async fn post_approval_in_thread(
+    /// Post a message with custom props (e.g. interactive attachments) as a thread reply
+    pub async fn post_with_props(
         &self,
         channel_id: &str,
         root_id: &str,
-        request_id: &str,
-        domain: &str,
-        approve_signature: &str,
-        deny_signature: &str,
+        message: &str,
+        props: serde_json::Value,
     ) -> Result<String> {
-        let s = settings();
-
-        let props = serde_json::json!({
-            "attachments": [{
-                "color": "#FFA500",
-                "text": format!("**Network Request:** `{}`", domain),
-                "actions": [
-                    {
-                        "id": "approve",
-                        "name": "Approve",
-                        "integration": {
-                            "url": s.callback_url,
-                            "context": {
-                                "action": "approve",
-                                "request_id": request_id,
-                                "signature": approve_signature
-                            }
-                        }
-                    },
-                    {
-                        "id": "deny",
-                        "name": "Deny",
-                        "integration": {
-                            "url": s.callback_url,
-                            "context": {
-                                "action": "deny",
-                                "request_id": request_id,
-                                "signature": deny_signature
-                            }
-                        }
-                    }
-                ]
-            }]
-        });
-
         let resp: PostResponse = self
             .client
             .post(format!("{}/posts", self.base_url))
-            .header("Authorization", format!("Bearer {}", s.mattermost_token))
+            .header("Authorization", self.auth_header())
             .json(&serde_json::json!({
                 "channel_id": channel_id,
                 "root_id": root_id,
-                "message": "",
+                "message": message,
                 "props": props
             }))
             .send()
@@ -323,11 +285,9 @@ impl Mattermost {
     }
 
     pub async fn update_post(&self, post_id: &str, message: &str) -> Result<()> {
-        let s = settings();
-
         self.client
             .put(format!("{}/posts/{}", self.base_url, post_id))
-            .header("Authorization", format!("Bearer {}", s.mattermost_token))
+            .header("Authorization", self.auth_header())
             .json(&serde_json::json!({
                 "id": post_id,
                 "message": message,
@@ -349,12 +309,10 @@ impl Mattermost {
         display_name: &str,
         purpose: &str,
     ) -> Result<String> {
-        let s = settings();
-
         let resp = self
             .client
             .post(format!("{}/channels", self.base_url))
-            .header("Authorization", format!("Bearer {}", s.mattermost_token))
+            .header("Authorization", self.auth_header())
             .json(&serde_json::json!({
                 "team_id": team_id,
                 "name": name,
@@ -381,15 +339,13 @@ impl Mattermost {
         team_id: &str,
         name: &str,
     ) -> Result<Option<String>> {
-        let s = settings();
-
         let resp = self
             .client
             .get(format!(
                 "{}/teams/{}/channels/name/{}",
                 self.base_url, team_id, name
             ))
-            .header("Authorization", format!("Bearer {}", s.mattermost_token))
+            .header("Authorization", self.auth_header())
             .send()
             .await?;
 
@@ -411,7 +367,6 @@ impl Mattermost {
 
     /// Get all user IDs for a team (paginates automatically)
     pub async fn get_team_member_ids(&self, team_id: &str) -> Result<Vec<String>> {
-        let s = settings();
         let mut user_ids = Vec::new();
         let mut page = 0;
         let per_page = 200;
@@ -423,7 +378,7 @@ impl Mattermost {
                     "{}/teams/{}/members?page={}&per_page={}",
                     self.base_url, team_id, page, per_page
                 ))
-                .header("Authorization", format!("Bearer {}", s.mattermost_token))
+                .header("Authorization", self.auth_header())
                 .send()
                 .await?;
 
@@ -455,8 +410,6 @@ impl Mattermost {
         team_id: &str,
         category_name: &str,
     ) -> Result<String> {
-        let s = settings();
-
         // Get existing categories
         let resp = self
             .client
@@ -464,7 +417,7 @@ impl Mattermost {
                 "{}/users/{}/teams/{}/channels/categories",
                 self.base_url, user_id, team_id
             ))
-            .header("Authorization", format!("Bearer {}", s.mattermost_token))
+            .header("Authorization", self.auth_header())
             .send()
             .await?;
 
@@ -488,7 +441,7 @@ impl Mattermost {
                 "{}/users/{}/teams/{}/channels/categories",
                 self.base_url, user_id, team_id
             ))
-            .header("Authorization", format!("Bearer {}", s.mattermost_token))
+            .header("Authorization", self.auth_header())
             .json(&serde_json::json!({
                 "user_id": user_id,
                 "team_id": team_id,
@@ -522,8 +475,6 @@ impl Mattermost {
         category_id: &str,
         channel_id: &str,
     ) -> Result<()> {
-        let s = settings();
-
         // First get current category to preserve existing channels
         let resp = self
             .client
@@ -531,7 +482,7 @@ impl Mattermost {
                 "{}/users/{}/teams/{}/channels/categories/{}",
                 self.base_url, user_id, team_id, category_id
             ))
-            .header("Authorization", format!("Bearer {}", s.mattermost_token))
+            .header("Authorization", self.auth_header())
             .send()
             .await?;
 
@@ -555,7 +506,7 @@ impl Mattermost {
                 "{}/users/{}/teams/{}/channels/categories/{}",
                 self.base_url, user_id, team_id, category_id
             ))
-            .header("Authorization", format!("Bearer {}", s.mattermost_token))
+            .header("Authorization", self.auth_header())
             .json(&serde_json::json!({
                 "id": category_id,
                 "channel_ids": channel_ids

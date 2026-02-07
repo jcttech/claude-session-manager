@@ -280,6 +280,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "common"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "dashmap",
+ "hex",
+ "hmac",
+ "sha2",
+ "tokio",
+ "tokio-util",
+ "tower",
+ "tracing",
+]
+
+[[package]]
 name = "concurrent-queue"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -739,6 +755,10 @@ dependencies = [
  "wasip2",
  "wasm-bindgen",
 ]
+
+[[package]]
+name = "graph-client"
+version = "0.1.0"
 
 [[package]]
 name = "h2"
@@ -1222,6 +1242,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
 
 [[package]]
+name = "mail-bridge"
+version = "0.1.0"
+
+[[package]]
 name = "matchers"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1235,6 +1259,20 @@ name = "matchit"
 version = "0.8.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
+
+[[package]]
+name = "mattermost-client"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "futures-util",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-tungstenite",
+ "tracing",
+]
 
 [[package]]
 name = "md-5"
@@ -2100,24 +2138,20 @@ dependencies = [
  "anyhow",
  "axum",
  "chrono",
+ "common",
  "config",
  "dashmap",
- "futures-util",
- "hex",
- "hmac",
+ "mattermost-client",
  "metrics",
  "metrics-exporter-prometheus",
  "regex",
  "reqwest",
  "serde",
  "serde_json",
- "sha2",
  "shell-escape",
  "sqlx",
  "tokio",
- "tokio-tungstenite",
  "tokio-util",
- "tower",
  "tracing",
  "tracing-subscriber",
  "uuid",

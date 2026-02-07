@@ -1,8 +1,8 @@
-name: Build
+name: session-manager
 
 on:
   push:
-    tags: ['v*']
+    tags: ['session-manager/v*']
   pull_request:
     branches: [main]
   workflow_dispatch:
@@ -14,12 +14,13 @@ jobs:
       contents: write
       packages: write
     with:
+      tag-prefix: 'session-manager/'
+      image-name: 'session-manager'
+      dockerfile: 'Dockerfile.session-manager'
       code-paths: |
-        src/**
+        crates/**
         Cargo.toml
         Cargo.lock
-        Dockerfile
-        .dockerignore
-        tests/**
+        Dockerfile.session-manager
       enable-database-tests: true
     secrets: inherit

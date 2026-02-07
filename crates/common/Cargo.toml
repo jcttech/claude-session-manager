@@ -1,0 +1,16 @@
+[package]
+name = "common"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+hmac = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+axum = { workspace = true }
+dashmap = { workspace = true }
+tower = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = "0.1"
+anyhow = { workspace = true }

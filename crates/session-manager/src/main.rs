@@ -13,12 +13,12 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+use mattermost_client::{sanitize_channel_name, Mattermost, Post};
 use session_manager::config;
 use session_manager::container::ContainerManager;
 use session_manager::crypto::{sign_request, verify_signature};
 use session_manager::database::{self, Database};
 use session_manager::git::{GitManager, RepoRef};
-use session_manager::mattermost::{sanitize_channel_name, Mattermost, Post};
 use session_manager::opnsense::OPNsense;
 use session_manager::rate_limit::{self, RateLimitLayer};
 use session_manager::ssh;
@@ -109,7 +109,8 @@ async fn main() -> Result<()> {
     // Initialize SSH key (writes to temp file if SM_VM_SSH_KEY is set)
     ssh::init_ssh_key()?;
 
-    let mm = Mattermost::new().await?;
+    let s = config::settings();
+    let mm = Mattermost::new(&s.mattermost_url, &s.mattermost_token).await?;
     let opnsense = OPNsense::new()?;
     let containers = ContainerManager::new();
     let git = GitManager::new();
@@ -1006,9 +1007,40 @@ async fn handle_network_request(
     let approve_sig = sign_request(&s.callback_secret, &request_id, "approve");
     let deny_sig = sign_request(&s.callback_secret, &request_id, "deny");
 
-    match state.mm.post_approval_in_thread(
-        channel_id, thread_id, &request_id, domain, &approve_sig, &deny_sig,
-    ).await {
+    let props = serde_json::json!({
+        "attachments": [{
+            "color": "#FFA500",
+            "text": format!("**Network Request:** `{}`", domain),
+            "actions": [
+                {
+                    "id": "approve",
+                    "name": "Approve",
+                    "integration": {
+                        "url": s.callback_url,
+                        "context": {
+                            "action": "approve",
+                            "request_id": request_id,
+                            "signature": approve_sig
+                        }
+                    }
+                },
+                {
+                    "id": "deny",
+                    "name": "Deny",
+                    "integration": {
+                        "url": s.callback_url,
+                        "context": {
+                            "action": "deny",
+                            "request_id": request_id,
+                            "signature": deny_sig
+                        }
+                    }
+                }
+            ]
+        }]
+    });
+
+    match state.mm.post_with_props(channel_id, thread_id, "", props).await {
         Ok(post_id) => {
             if let Err(e) = state.db.create_pending_request(
                 &request_id,

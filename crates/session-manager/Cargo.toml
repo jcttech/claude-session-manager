@@ -1,0 +1,40 @@
+[package]
+name = "session-manager"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "session_manager"
+path = "src/lib.rs"
+
+[[bin]]
+name = "session-manager"
+path = "src/main.rs"
+
+[dependencies]
+common = { path = "../common" }
+mattermost-client = { path = "../mattermost-client" }
+
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+axum = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+tracing = "0.1"
+chrono = { workspace = true }
+sqlx = { workspace = true }
+dashmap = { workspace = true }
+
+uuid = { version = "1", features = ["v4"] }
+regex = "1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+config = "0.15"
+shell-escape = "0.1"
+
+# Observability
+metrics = "0.24"
+metrics-exporter-prometheus = "0.16"
+
+[dev-dependencies]

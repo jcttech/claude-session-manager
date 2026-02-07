@@ -6,10 +6,10 @@ on:
   workflow_dispatch:
 
 jobs:
-  cleanup:
+  cleanup-session-manager:
     uses: jcttech/.github/.github/workflows/cleanup-docker.yml@v1
     with:
-      image-name: claude-session-manager
+      image-name: session-manager
     permissions:
       packages: write
     secrets: inherit

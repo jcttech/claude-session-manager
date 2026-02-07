@@ -9,7 +9,7 @@ use std::borrow::Cow;
 use session_manager::crypto::{sign_request, verify_signature};
 use session_manager::devcontainer::{DevcontainerConfig, generate_default_config};
 use session_manager::git::{RepoRef, WorktreeMode};
-use session_manager::mattermost::sanitize_channel_name;
+use mattermost_client::sanitize_channel_name;
 use session_manager::opnsense::validate_domain;
 
 /// Test shell escaping for container commands
