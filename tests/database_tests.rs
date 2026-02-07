@@ -6,49 +6,39 @@
 //! Example:
 //!   DATABASE_URL=postgres://user:pass@localhost/test_db cargo test --test database_tests
 //!
-//! Schema and tables are created once via the shared `create_schema` function;
-//! each test runs in a transaction that auto-rolls back for isolation.
+//! Each test creates its own pool and transaction. Schema setup is idempotent
+//! (IF NOT EXISTS) so concurrent tests are safe. Transactions auto-roll back
+//! on drop, providing isolation.
 
 use session_manager::database::create_schema;
 use sqlx::{postgres::PgPoolOptions, PgPool};
 use std::env;
-use tokio::sync::OnceCell;
 
 const TEST_SCHEMA: &str = "session_manager_test";
 
-static TEST_DB: OnceCell<PgPool> = OnceCell::const_new();
+async fn get_test_db() -> Option<PgPool> {
+    let url = match env::var("DATABASE_URL") {
+        Ok(url) => url,
+        Err(_) => {
+            eprintln!("Skipping database tests: DATABASE_URL not set");
+            return None;
+        }
+    };
 
-async fn get_test_db() -> Option<&'static PgPool> {
-    if env::var("DATABASE_URL").is_err() {
-        eprintln!("Skipping database tests: DATABASE_URL not set");
-        return None;
-    }
+    let pool = match PgPoolOptions::new().max_connections(2).connect(&url).await {
+        Ok(pool) => pool,
+        Err(e) => {
+            eprintln!("Skipping database tests: Could not connect to database: {}", e);
+            return None;
+        }
+    };
 
-    Some(
-        TEST_DB
-            .get_or_init(|| async {
-                let url = env::var("DATABASE_URL").expect("DATABASE_URL must be set");
+    // Idempotent — safe to call from every test concurrently
+    create_schema(&pool, TEST_SCHEMA)
+        .await
+        .expect("Failed to create test schema");
 
-                let pool = PgPoolOptions::new()
-                    .max_connections(5)
-                    .connect(&url)
-                    .await
-                    .expect("Failed to connect to database");
-
-                // Fresh schema for test isolation
-                sqlx::query(&format!("DROP SCHEMA IF EXISTS {} CASCADE", TEST_SCHEMA))
-                    .execute(&pool)
-                    .await
-                    .expect("Failed to drop schema");
-
-                create_schema(&pool, TEST_SCHEMA)
-                    .await
-                    .expect("Failed to create test schema");
-
-                pool
-            })
-            .await,
-    )
+    Some(pool)
 }
 
 #[tokio::test]
