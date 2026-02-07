@@ -327,24 +327,26 @@ async fn resolve_project_channel(
     Ok((channel_id, channel_name, repo_ref))
 }
 
-/// Setup sidebar category for bot and requesting user (best-effort)
+/// Setup sidebar category for all team members (best-effort per user)
 async fn setup_sidebar_category(
     state: &AppState,
     channel_id: &str,
-    user_id: &str,
+    _user_id: &str,
 ) -> Result<()> {
     let s = config::settings();
     let team_id = &s.mattermost_team_id;
     let category_name = &s.channel_category;
 
-    // Ensure category exists for bot
-    let bot_cat_id = state.mm.ensure_sidebar_category("me", team_id, category_name).await?;
-    state.mm.add_channel_to_category("me", team_id, &bot_cat_id, channel_id).await?;
+    let member_ids = state.mm.get_team_member_ids(team_id).await?;
 
-    // Ensure category exists for requesting user
-    if user_id != state.mm.bot_user_id {
-        let user_cat_id = state.mm.ensure_sidebar_category(user_id, team_id, category_name).await?;
-        state.mm.add_channel_to_category(user_id, team_id, &user_cat_id, channel_id).await?;
+    for member_id in &member_ids {
+        if let Err(e) = async {
+            let cat_id = state.mm.ensure_sidebar_category(member_id, team_id, category_name).await?;
+            state.mm.add_channel_to_category(member_id, team_id, &cat_id, channel_id).await?;
+            Ok::<(), anyhow::Error>(())
+        }.await {
+            tracing::debug!(user_id = %member_id, error = %e, "Failed to setup sidebar category for user");
+        }
     }
 
     Ok(())

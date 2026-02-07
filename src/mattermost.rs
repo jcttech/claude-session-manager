@@ -57,6 +57,11 @@ struct ChannelResponse {
 }
 
 #[derive(Deserialize)]
+struct TeamMember {
+    user_id: String,
+}
+
+#[derive(Deserialize)]
 struct SidebarCategory {
     id: String,
     display_name: String,
@@ -402,6 +407,45 @@ impl Mattermost {
         Ok(Some(channel.id))
     }
 
+    // --- Team member management ---
+
+    /// Get all user IDs for a team (paginates automatically)
+    pub async fn get_team_member_ids(&self, team_id: &str) -> Result<Vec<String>> {
+        let s = settings();
+        let mut user_ids = Vec::new();
+        let mut page = 0;
+        let per_page = 200;
+
+        loop {
+            let resp = self
+                .client
+                .get(format!(
+                    "{}/teams/{}/members?page={}&per_page={}",
+                    self.base_url, team_id, page, per_page
+                ))
+                .header("Authorization", format!("Bearer {}", s.mattermost_token))
+                .send()
+                .await?;
+
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                return Err(anyhow!("Failed to get team members: {} {}", status, body));
+            }
+
+            let members: Vec<TeamMember> = resp.json().await?;
+            let count = members.len();
+            user_ids.extend(members.into_iter().map(|m| m.user_id));
+
+            if count < per_page {
+                break;
+            }
+            page += 1;
+        }
+
+        Ok(user_ids)
+    }
+
     // --- Sidebar category management ---
 
     /// Ensure a sidebar category exists for a user, returns category_id
@@ -446,6 +490,8 @@ impl Mattermost {
             ))
             .header("Authorization", format!("Bearer {}", s.mattermost_token))
             .json(&serde_json::json!({
+                "user_id": user_id,
+                "team_id": team_id,
                 "display_name": category_name,
                 "type": "custom",
                 "channel_ids": []

@@ -113,7 +113,7 @@ fn default_container_network() -> String { "isolated".into() }
 fn default_claude_command() -> String { "claude --dangerously-skip-permissions".into() }
 fn default_devcontainer_timeout_secs() -> u64 { 120 }
 fn default_orchestrator_compact_threshold() -> i32 { 50 }
-fn default_channel_category() -> String { "Claude Sessions".into() }
+fn default_channel_category() -> String { "CLAUDE-SESSIONS".into() }
 fn default_opnsense_alias() -> String { "llm_approved_domains".into() }
 fn default_opnsense_verify_tls() -> bool { true }
 fn default_opnsense_timeout() -> u64 { 30 }
