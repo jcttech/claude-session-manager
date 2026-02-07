@@ -9,7 +9,7 @@ COPY src ./src
 
 RUN cargo build --release
 
-FROM debian:bookworm-slim
+FROM debian:trixie-slim
 
 RUN apt-get update && apt-get install -y ca-certificates openssh-client curl && rm -rf /var/lib/apt/lists/*
 
