@@ -6,15 +6,17 @@
 //! Example:
 //!   DATABASE_URL=postgres://user:pass@localhost/test_db cargo test --test database_tests
 //!
-//! Each test creates its own pool and transaction. Schema setup is idempotent
-//! (IF NOT EXISTS) so concurrent tests are safe. Transactions auto-roll back
-//! on drop, providing isolation.
+//! Schema is created once via OnceLock (on a separate thread to avoid tokio
+//! nesting). Each test gets its own pool and transaction that auto-rolls back.
 
 use session_manager::database::create_schema;
 use sqlx::{postgres::PgPoolOptions, PgPool};
 use std::env;
+use std::sync::OnceLock;
 
 const TEST_SCHEMA: &str = "session_manager_test";
+
+static SCHEMA_INIT: OnceLock<()> = OnceLock::new();
 
 async fn get_test_db() -> Option<PgPool> {
     let url = match env::var("DATABASE_URL") {
@@ -25,6 +27,29 @@ async fn get_test_db() -> Option<PgPool> {
         }
     };
 
+    // One-time schema init on a separate thread (avoids tokio runtime nesting)
+    let init_url = url.clone();
+    SCHEMA_INIT.get_or_init(|| {
+        std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    let pool = PgPoolOptions::new()
+                        .max_connections(1)
+                        .connect(&init_url)
+                        .await
+                        .expect("Failed to connect for schema init");
+                    create_schema(&pool, TEST_SCHEMA)
+                        .await
+                        .expect("Failed to create test schema");
+                });
+        })
+        .join()
+        .unwrap()
+    });
+
     let pool = match PgPoolOptions::new().max_connections(2).connect(&url).await {
         Ok(pool) => pool,
         Err(e) => {
@@ -32,11 +57,6 @@ async fn get_test_db() -> Option<PgPool> {
             return None;
         }
     };
-
-    // Idempotent — safe to call from every test concurrently
-    create_schema(&pool, TEST_SCHEMA)
-        .await
-        .expect("Failed to create test schema");
 
     Some(pool)
 }
