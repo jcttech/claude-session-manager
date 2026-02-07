@@ -58,6 +58,119 @@ pub struct AuditLogEntry {
 
 const SCHEMA: &str = "session_manager";
 
+/// Create schema and all tables/indexes for the given schema name.
+/// Used by both production initialization and integration tests.
+pub async fn create_schema(pool: &PgPool, schema: &str) -> Result<()> {
+    sqlx::query(&format!("CREATE SCHEMA IF NOT EXISTS {}", schema))
+        .execute(pool)
+        .await?;
+
+    sqlx::query(&format!(
+        r#"
+        CREATE TABLE IF NOT EXISTS {}.sessions (
+            session_id TEXT PRIMARY KEY,
+            channel_id TEXT NOT NULL,
+            thread_id TEXT NOT NULL,
+            project TEXT NOT NULL,
+            container_name TEXT NOT NULL,
+            session_type TEXT NOT NULL DEFAULT 'standard',
+            parent_session_id TEXT,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            last_activity_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            message_count INTEGER NOT NULL DEFAULT 0,
+            compaction_count INTEGER NOT NULL DEFAULT 0
+        )
+        "#,
+        schema
+    ))
+    .execute(pool)
+    .await?;
+
+    sqlx::query(&format!(
+        r#"
+        CREATE TABLE IF NOT EXISTS {}.project_channels (
+            project TEXT PRIMARY KEY,
+            channel_id TEXT NOT NULL,
+            channel_name TEXT NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+        "#,
+        schema
+    ))
+    .execute(pool)
+    .await?;
+
+    sqlx::query(&format!(
+        r#"
+        CREATE TABLE IF NOT EXISTS {}.pending_requests (
+            request_id TEXT PRIMARY KEY,
+            channel_id TEXT NOT NULL,
+            thread_id TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            domain TEXT NOT NULL,
+            post_id TEXT NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+        "#,
+        schema
+    ))
+    .execute(pool)
+    .await?;
+
+    sqlx::query(&format!(
+        r#"
+        CREATE TABLE IF NOT EXISTS {}.audit_log (
+            id BIGSERIAL PRIMARY KEY,
+            request_id TEXT NOT NULL,
+            domain TEXT NOT NULL,
+            action TEXT NOT NULL,
+            approved_by TEXT NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+        "#,
+        schema
+    ))
+    .execute(pool)
+    .await?;
+
+    sqlx::query(&format!(
+        "CREATE INDEX IF NOT EXISTS idx_sessions_thread ON {}.sessions(channel_id, thread_id)",
+        schema
+    ))
+    .execute(pool)
+    .await?;
+
+    sqlx::query(&format!(
+        "CREATE INDEX IF NOT EXISTS idx_sessions_parent ON {}.sessions(parent_session_id)",
+        schema
+    ))
+    .execute(pool)
+    .await?;
+
+    sqlx::query(&format!(
+        "CREATE INDEX IF NOT EXISTS idx_pending_session ON {}.pending_requests(session_id)",
+        schema
+    ))
+    .execute(pool)
+    .await?;
+
+    sqlx::query(&format!(
+        "CREATE INDEX IF NOT EXISTS idx_audit_domain ON {}.audit_log(domain)",
+        schema
+    ))
+    .execute(pool)
+    .await?;
+
+    sqlx::query(&format!(
+        "CREATE INDEX IF NOT EXISTS idx_audit_created ON {}.audit_log(created_at DESC)",
+        schema
+    ))
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
 impl Database {
     pub async fn new() -> Result<Self> {
         let s = settings();
@@ -72,11 +185,6 @@ impl Database {
             "Database connection pool initialized"
         );
 
-        // Create schema if it doesn't exist
-        sqlx::query(&format!("CREATE SCHEMA IF NOT EXISTS {}", SCHEMA))
-            .execute(&pool)
-            .await?;
-
         // Drop old tables (clean redesign, no backward compat needed)
         sqlx::query(&format!("DROP TABLE IF EXISTS {}.pending_requests", SCHEMA))
             .execute(&pool)
@@ -85,113 +193,7 @@ impl Database {
             .execute(&pool)
             .await?;
 
-        // Sessions table with thread support and context health tracking
-        sqlx::query(&format!(
-            r#"
-            CREATE TABLE IF NOT EXISTS {}.sessions (
-                session_id TEXT PRIMARY KEY,
-                channel_id TEXT NOT NULL,
-                thread_id TEXT NOT NULL,
-                project TEXT NOT NULL,
-                container_name TEXT NOT NULL,
-                session_type TEXT NOT NULL DEFAULT 'standard',
-                parent_session_id TEXT,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                last_activity_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                message_count INTEGER NOT NULL DEFAULT 0,
-                compaction_count INTEGER NOT NULL DEFAULT 0
-            )
-            "#,
-            SCHEMA
-        ))
-        .execute(&pool)
-        .await?;
-
-        // Project channels mapping
-        sqlx::query(&format!(
-            r#"
-            CREATE TABLE IF NOT EXISTS {}.project_channels (
-                project TEXT PRIMARY KEY,
-                channel_id TEXT NOT NULL,
-                channel_name TEXT NOT NULL,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            )
-            "#,
-            SCHEMA
-        ))
-        .execute(&pool)
-        .await?;
-
-        // Pending requests with thread support
-        sqlx::query(&format!(
-            r#"
-            CREATE TABLE IF NOT EXISTS {}.pending_requests (
-                request_id TEXT PRIMARY KEY,
-                channel_id TEXT NOT NULL,
-                thread_id TEXT NOT NULL,
-                session_id TEXT NOT NULL,
-                domain TEXT NOT NULL,
-                post_id TEXT NOT NULL,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            )
-            "#,
-            SCHEMA
-        ))
-        .execute(&pool)
-        .await?;
-
-        // Audit log (unchanged)
-        sqlx::query(&format!(
-            r#"
-            CREATE TABLE IF NOT EXISTS {}.audit_log (
-                id BIGSERIAL PRIMARY KEY,
-                request_id TEXT NOT NULL,
-                domain TEXT NOT NULL,
-                action TEXT NOT NULL,
-                approved_by TEXT NOT NULL,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            )
-            "#,
-            SCHEMA
-        ))
-        .execute(&pool)
-        .await?;
-
-        // Create indexes
-        sqlx::query(&format!(
-            "CREATE INDEX IF NOT EXISTS idx_sessions_thread ON {}.sessions(channel_id, thread_id)",
-            SCHEMA
-        ))
-        .execute(&pool)
-        .await?;
-
-        sqlx::query(&format!(
-            "CREATE INDEX IF NOT EXISTS idx_sessions_parent ON {}.sessions(parent_session_id)",
-            SCHEMA
-        ))
-        .execute(&pool)
-        .await?;
-
-        sqlx::query(&format!(
-            "CREATE INDEX IF NOT EXISTS idx_pending_session ON {}.pending_requests(session_id)",
-            SCHEMA
-        ))
-        .execute(&pool)
-        .await?;
-
-        sqlx::query(&format!(
-            "CREATE INDEX IF NOT EXISTS idx_audit_domain ON {}.audit_log(domain)",
-            SCHEMA
-        ))
-        .execute(&pool)
-        .await?;
-
-        sqlx::query(&format!(
-            "CREATE INDEX IF NOT EXISTS idx_audit_created ON {}.audit_log(created_at DESC)",
-            SCHEMA
-        ))
-        .execute(&pool)
-        .await?;
+        create_schema(&pool, SCHEMA).await?;
 
         Ok(Self { pool })
     }

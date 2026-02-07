@@ -6,9 +6,10 @@
 //! Example:
 //!   DATABASE_URL=postgres://user:pass@localhost/test_db cargo test --test database_tests
 //!
-//! Schema and tables are created once; each test runs in a transaction that
-//! auto-rolls back, providing isolation without --test-threads=1.
+//! Schema and tables are created once via the shared `create_schema` function;
+//! each test runs in a transaction that auto-rolls back for isolation.
 
+use session_manager::database::create_schema;
 use sqlx::{postgres::PgPoolOptions, PgPool};
 use std::env;
 use tokio::sync::OnceCell;
@@ -34,89 +35,15 @@ async fn get_test_db() -> Option<&'static PgPool> {
                     .await
                     .expect("Failed to connect to database");
 
-                // Fresh schema
+                // Fresh schema for test isolation
                 sqlx::query(&format!("DROP SCHEMA IF EXISTS {} CASCADE", TEST_SCHEMA))
                     .execute(&pool)
                     .await
                     .expect("Failed to drop schema");
 
-                sqlx::query(&format!("CREATE SCHEMA {}", TEST_SCHEMA))
-                    .execute(&pool)
+                create_schema(&pool, TEST_SCHEMA)
                     .await
-                    .expect("Failed to create schema");
-
-                // Create tables
-                sqlx::query(&format!(
-                    r#"
-                    CREATE TABLE {}.sessions (
-                        session_id TEXT PRIMARY KEY,
-                        channel_id TEXT NOT NULL,
-                        thread_id TEXT NOT NULL,
-                        project TEXT NOT NULL,
-                        container_name TEXT NOT NULL,
-                        session_type TEXT NOT NULL DEFAULT 'standard',
-                        parent_session_id TEXT,
-                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                        last_activity_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                        message_count INTEGER NOT NULL DEFAULT 0,
-                        compaction_count INTEGER NOT NULL DEFAULT 0
-                    )
-                    "#,
-                    TEST_SCHEMA
-                ))
-                .execute(&pool)
-                .await
-                .expect("Failed to create sessions table");
-
-                sqlx::query(&format!(
-                    r#"
-                    CREATE TABLE {}.project_channels (
-                        project TEXT PRIMARY KEY,
-                        channel_id TEXT NOT NULL,
-                        channel_name TEXT NOT NULL,
-                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-                    )
-                    "#,
-                    TEST_SCHEMA
-                ))
-                .execute(&pool)
-                .await
-                .expect("Failed to create project_channels table");
-
-                sqlx::query(&format!(
-                    r#"
-                    CREATE TABLE {}.pending_requests (
-                        request_id TEXT PRIMARY KEY,
-                        channel_id TEXT NOT NULL,
-                        thread_id TEXT NOT NULL,
-                        session_id TEXT NOT NULL,
-                        domain TEXT NOT NULL,
-                        post_id TEXT NOT NULL,
-                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-                    )
-                    "#,
-                    TEST_SCHEMA
-                ))
-                .execute(&pool)
-                .await
-                .expect("Failed to create pending_requests table");
-
-                sqlx::query(&format!(
-                    r#"
-                    CREATE TABLE {}.audit_log (
-                        id BIGSERIAL PRIMARY KEY,
-                        request_id TEXT NOT NULL,
-                        domain TEXT NOT NULL,
-                        action TEXT NOT NULL,
-                        approved_by TEXT NOT NULL,
-                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-                    )
-                    "#,
-                    TEST_SCHEMA
-                ))
-                .execute(&pool)
-                .await
-                .expect("Failed to create audit_log table");
+                    .expect("Failed to create test schema");
 
                 pool
             })
