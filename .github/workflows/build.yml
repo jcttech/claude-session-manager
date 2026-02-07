@@ -23,5 +23,4 @@ jobs:
         .dockerignore
         tests/**
       enable-database-tests: true
-      database-test-command: 'cargo test --test database_tests -- --nocapture --test-threads=1'
     secrets: inherit
