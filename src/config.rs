@@ -6,6 +6,16 @@ use std::sync::OnceLock;
 pub struct Settings {
     pub mattermost_url: String,
     pub mattermost_token: String,
+    /// Mattermost team ID (required for channel creation and sidebar categories)
+    pub mattermost_team_id: String,
+
+    /// Sidebar category display name for auto-created channels
+    #[serde(default = "default_channel_category")]
+    pub channel_category: String,
+
+    /// Default GitHub org — allows `start repo-name` instead of `start org/repo`
+    #[serde(default)]
+    pub default_org: Option<String>,
 
     pub vm_host: String,
     #[serde(default = "default_vm_user")]
@@ -20,20 +30,22 @@ pub struct Settings {
 
     #[serde(default = "default_container_runtime")]
     pub container_runtime: String,
-    #[serde(default = "default_container_network")]
-    pub container_network: String,
+    /// Fallback container image used when a repo has no devcontainer.json
     #[serde(default = "default_container_image")]
     pub container_image: String,
+    /// Fallback container network used when a repo has no devcontainer.json
+    #[serde(default = "default_container_network")]
+    pub container_network: String,
     #[serde(default = "default_claude_command")]
     pub claude_command: String,
-    /// Shared volume for Claude config (authentication)
-    /// If mounted and authenticated, uses stored credentials
-    /// Falls back to ANTHROPIC_API_KEY if volume is empty
-    #[serde(default = "default_claude_config_volume")]
-    pub claude_config_volume: String,
-    /// Path inside container where Claude config is mounted
-    #[serde(default = "default_claude_config_path")]
-    pub claude_config_path: String,
+
+    /// Timeout for devcontainer up operations (image pull + feature install + lifecycle hooks)
+    #[serde(default = "default_devcontainer_timeout_secs")]
+    pub devcontainer_timeout_secs: u64,
+
+    /// Message count threshold for auto-compacting orchestrator sessions (0 = disabled)
+    #[serde(default = "default_orchestrator_compact_threshold")]
+    pub orchestrator_compact_threshold: i32,
 
     pub opnsense_url: String,
     pub opnsense_key: String,
@@ -96,11 +108,12 @@ pub struct Settings {
 fn default_vm_user() -> String { "claude".into() }
 fn default_ssh_key_path() -> String { "/secrets/ssh/id_ed25519".into() }
 fn default_container_runtime() -> String { "podman".into() }
-fn default_container_network() -> String { "isolated".into() }
 fn default_container_image() -> String { "claude-code:latest".into() }
+fn default_container_network() -> String { "isolated".into() }
 fn default_claude_command() -> String { "claude --dangerously-skip-permissions".into() }
-fn default_claude_config_volume() -> String { "claude-config-shared".into() }
-fn default_claude_config_path() -> String { "/home/vscode/.claude".into() }
+fn default_devcontainer_timeout_secs() -> u64 { 120 }
+fn default_orchestrator_compact_threshold() -> i32 { 50 }
+fn default_channel_category() -> String { "Claude Sessions".into() }
 fn default_opnsense_alias() -> String { "llm_approved_domains".into() }
 fn default_opnsense_verify_tls() -> bool { true }
 fn default_opnsense_timeout() -> u64 { 30 }

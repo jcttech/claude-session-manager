@@ -11,10 +11,13 @@ RUN cargo build --release
 
 FROM debian:bookworm-slim
 
-RUN apt-get update && apt-get install -y ca-certificates openssh-client && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y ca-certificates openssh-client curl && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /app/target/release/session-manager /usr/local/bin/
 
 EXPOSE 8000
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD curl -f http://localhost:8000/health || exit 1
 
 CMD ["session-manager"]

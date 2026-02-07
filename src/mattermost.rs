@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use futures_util::{SinkExt, StreamExt};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -37,6 +37,8 @@ pub struct Post {
     pub channel_id: String,
     pub user_id: String,
     pub message: String,
+    #[serde(default)]
+    pub root_id: String,
 }
 
 #[derive(Serialize)]
@@ -44,7 +46,27 @@ struct PostRequest<'a> {
     channel_id: &'a str,
     message: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
+    root_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     props: Option<serde_json::Value>,
+}
+
+#[derive(Deserialize)]
+struct ChannelResponse {
+    id: String,
+}
+
+#[derive(Deserialize)]
+struct SidebarCategory {
+    id: String,
+    display_name: String,
+    #[serde(default)]
+    channel_ids: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct SidebarCategoriesResponse {
+    categories: Vec<SidebarCategory>,
 }
 
 impl Mattermost {
@@ -160,10 +182,17 @@ impl Mattermost {
             }
             let Some(post_str) = data["data"]["post"].as_str() else { continue };
             let Ok(post) = serde_json::from_str::<Post>(post_str) else { continue };
-            if post.user_id != self.bot_user_id
-                && let Err(e) = tx.send(post).await
-            {
-                tracing::warn!(error = %e, "Failed to send post to handler channel");
+            if post.user_id != self.bot_user_id {
+                match tx.try_send(post) {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        tracing::warn!("Message handler channel full, dropping message to prevent backpressure");
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        tracing::warn!("Message handler channel closed");
+                        break;
+                    }
+                }
             }
         }
 
@@ -171,26 +200,65 @@ impl Mattermost {
         Ok(received_any_message)
     }
 
-    pub async fn post(&self, channel_id: &str, message: &str) -> Result<()> {
+    /// Post a message to a channel, returns the post ID
+    pub async fn post(&self, channel_id: &str, message: &str) -> Result<String> {
         let s = settings();
 
-        self.client
+        let resp: PostResponse = self
+            .client
             .post(format!("{}/posts", self.base_url))
             .header("Authorization", format!("Bearer {}", s.mattermost_token))
             .json(&PostRequest {
                 channel_id,
                 message,
+                root_id: None,
                 props: None,
             })
             .send()
+            .await?
+            .json()
             .await?;
 
-        Ok(())
+        Ok(resp.id)
     }
 
-    pub async fn post_approval(
+    /// Post a root message to a channel (becomes thread anchor), returns post ID
+    pub async fn post_root(&self, channel_id: &str, message: &str) -> Result<String> {
+        self.post(channel_id, message).await
+    }
+
+    /// Post a reply in a thread, returns post ID
+    pub async fn post_in_thread(
         &self,
         channel_id: &str,
+        root_id: &str,
+        message: &str,
+    ) -> Result<String> {
+        let s = settings();
+
+        let resp: PostResponse = self
+            .client
+            .post(format!("{}/posts", self.base_url))
+            .header("Authorization", format!("Bearer {}", s.mattermost_token))
+            .json(&PostRequest {
+                channel_id,
+                message,
+                root_id: Some(root_id),
+                props: None,
+            })
+            .send()
+            .await?
+            .json()
+            .await?;
+
+        Ok(resp.id)
+    }
+
+    /// Post an approval card as a thread reply
+    pub async fn post_approval_in_thread(
+        &self,
+        channel_id: &str,
+        root_id: &str,
         request_id: &str,
         domain: &str,
         approve_signature: &str,
@@ -237,6 +305,7 @@ impl Mattermost {
             .header("Authorization", format!("Bearer {}", s.mattermost_token))
             .json(&serde_json::json!({
                 "channel_id": channel_id,
+                "root_id": root_id,
                 "message": "",
                 "props": props
             }))
@@ -264,4 +333,236 @@ impl Mattermost {
 
         Ok(())
     }
+
+    // --- Channel management ---
+
+    /// Create a channel in a team, returns channel_id
+    pub async fn create_channel(
+        &self,
+        team_id: &str,
+        name: &str,
+        display_name: &str,
+        purpose: &str,
+    ) -> Result<String> {
+        let s = settings();
+
+        let resp = self
+            .client
+            .post(format!("{}/channels", self.base_url))
+            .header("Authorization", format!("Bearer {}", s.mattermost_token))
+            .json(&serde_json::json!({
+                "team_id": team_id,
+                "name": name,
+                "display_name": display_name,
+                "purpose": purpose,
+                "type": "O"
+            }))
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(anyhow!("Failed to create channel '{}': {} {}", name, status, body));
+        }
+
+        let channel: ChannelResponse = resp.json().await?;
+        Ok(channel.id)
+    }
+
+    /// Get a channel by name in a team, returns channel_id or None if not found
+    pub async fn get_channel_by_name(
+        &self,
+        team_id: &str,
+        name: &str,
+    ) -> Result<Option<String>> {
+        let s = settings();
+
+        let resp = self
+            .client
+            .get(format!(
+                "{}/teams/{}/channels/name/{}",
+                self.base_url, team_id, name
+            ))
+            .header("Authorization", format!("Bearer {}", s.mattermost_token))
+            .send()
+            .await?;
+
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(anyhow!("Failed to get channel '{}': {} {}", name, status, body));
+        }
+
+        let channel: ChannelResponse = resp.json().await?;
+        Ok(Some(channel.id))
+    }
+
+    // --- Sidebar category management ---
+
+    /// Ensure a sidebar category exists for a user, returns category_id
+    pub async fn ensure_sidebar_category(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        category_name: &str,
+    ) -> Result<String> {
+        let s = settings();
+
+        // Get existing categories
+        let resp = self
+            .client
+            .get(format!(
+                "{}/users/{}/teams/{}/channels/categories",
+                self.base_url, user_id, team_id
+            ))
+            .header("Authorization", format!("Bearer {}", s.mattermost_token))
+            .send()
+            .await?;
+
+        if resp.status().is_success() {
+            let categories: SidebarCategoriesResponse = resp.json().await?;
+
+            // Look for existing category by name
+            if let Some(cat) = categories
+                .categories
+                .iter()
+                .find(|c| c.display_name == category_name)
+            {
+                return Ok(cat.id.clone());
+            }
+        }
+
+        // Create new category
+        let resp = self
+            .client
+            .post(format!(
+                "{}/users/{}/teams/{}/channels/categories",
+                self.base_url, user_id, team_id
+            ))
+            .header("Authorization", format!("Bearer {}", s.mattermost_token))
+            .json(&serde_json::json!({
+                "display_name": category_name,
+                "type": "custom",
+                "channel_ids": []
+            }))
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(anyhow!(
+                "Failed to create sidebar category '{}': {} {}",
+                category_name,
+                status,
+                body
+            ));
+        }
+
+        let cat: SidebarCategory = resp.json().await?;
+        Ok(cat.id)
+    }
+
+    /// Add a channel to a user's sidebar category
+    pub async fn add_channel_to_category(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        category_id: &str,
+        channel_id: &str,
+    ) -> Result<()> {
+        let s = settings();
+
+        // First get current category to preserve existing channels
+        let resp = self
+            .client
+            .get(format!(
+                "{}/users/{}/teams/{}/channels/categories/{}",
+                self.base_url, user_id, team_id, category_id
+            ))
+            .header("Authorization", format!("Bearer {}", s.mattermost_token))
+            .send()
+            .await?;
+
+        let mut channel_ids: Vec<String> = if resp.status().is_success() {
+            let cat: SidebarCategory = resp.json().await?;
+            cat.channel_ids
+        } else {
+            vec![]
+        };
+
+        // Add channel if not already present
+        if !channel_ids.contains(&channel_id.to_string()) {
+            channel_ids.push(channel_id.to_string());
+        } else {
+            return Ok(()); // Already in category
+        }
+
+        // Update category with new channel list
+        self.client
+            .put(format!(
+                "{}/users/{}/teams/{}/channels/categories/{}",
+                self.base_url, user_id, team_id, category_id
+            ))
+            .header("Authorization", format!("Bearer {}", s.mattermost_token))
+            .json(&serde_json::json!({
+                "id": category_id,
+                "channel_ids": channel_ids
+            }))
+            .send()
+            .await?;
+
+        Ok(())
+    }
+}
+
+/// Sanitize a string for use as a Mattermost channel name.
+/// Lowercase, `[a-z0-9-]` only, max 64 chars.
+pub fn sanitize_channel_name(name: &str) -> String {
+    let sanitized: String = name
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '-' })
+        .collect();
+
+    // Collapse consecutive hyphens and trim leading/trailing hyphens
+    let mut result = String::new();
+    let mut prev_hyphen = true; // treat start as hyphen to skip leading
+    for c in sanitized.chars() {
+        if c == '-' {
+            if !prev_hyphen {
+                result.push(c);
+            }
+            prev_hyphen = true;
+        } else {
+            result.push(c);
+            prev_hyphen = false;
+        }
+    }
+
+    // Trim trailing hyphen
+    if result.ends_with('-') {
+        result.pop();
+    }
+
+    // Truncate to 64 chars
+    if result.len() > 64 {
+        result.truncate(64);
+        // Don't leave a trailing hyphen after truncation
+        while result.ends_with('-') {
+            result.pop();
+        }
+    }
+
+    // Fallback for all-special-char input that sanitizes to empty string
+    if result.is_empty() {
+        return "claude-session".to_string();
+    }
+
+    result
 }

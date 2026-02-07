@@ -1,13 +1,3 @@
-mod config;
-mod container;
-mod crypto;
-mod database;
-mod git;
-mod mattermost;
-mod opnsense;
-mod rate_limit;
-mod ssh;
-
 use anyhow::Result;
 use axum::{
     extract::State,
@@ -23,13 +13,15 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::container::ContainerManager;
-use crate::crypto::{sign_request, verify_signature};
-use crate::database::Database;
-use crate::git::{GitManager, RepoRef};
-use crate::mattermost::{Mattermost, Post};
-use crate::opnsense::OPNsense;
-use crate::rate_limit::RateLimitLayer;
+use session_manager::config;
+use session_manager::container::ContainerManager;
+use session_manager::crypto::{sign_request, verify_signature};
+use session_manager::database::{self, Database};
+use session_manager::git::{GitManager, RepoRef};
+use session_manager::mattermost::{sanitize_channel_name, Mattermost, Post};
+use session_manager::opnsense::OPNsense;
+use session_manager::rate_limit::{self, RateLimitLayer};
+use session_manager::ssh;
 
 /// Cached regex for network request detection (compiled once on first use)
 static NETWORK_REQUEST_RE: OnceLock<Regex> = OnceLock::new();
@@ -37,6 +29,36 @@ static NETWORK_REQUEST_RE: OnceLock<Regex> = OnceLock::new();
 fn network_request_regex() -> &'static Regex {
     NETWORK_REQUEST_RE.get_or_init(|| {
         Regex::new(r"\[NETWORK_REQUEST:\s*([^\]]+)\]").expect("Invalid regex pattern")
+    })
+}
+
+/// Cached regex for orchestrator output markers
+static CREATE_SESSION_RE: OnceLock<Regex> = OnceLock::new();
+static CREATE_REVIEWER_RE: OnceLock<Regex> = OnceLock::new();
+static SESSION_STATUS_RE: OnceLock<Regex> = OnceLock::new();
+static STOP_SESSION_RE: OnceLock<Regex> = OnceLock::new();
+
+fn create_session_regex() -> &'static Regex {
+    CREATE_SESSION_RE.get_or_init(|| {
+        Regex::new(r"\[CREATE_SESSION:\s*([^\]]+)\]").expect("Invalid regex pattern")
+    })
+}
+
+fn create_reviewer_regex() -> &'static Regex {
+    CREATE_REVIEWER_RE.get_or_init(|| {
+        Regex::new(r"\[CREATE_REVIEWER:\s*([^\]]+)\]").expect("Invalid regex pattern")
+    })
+}
+
+fn session_status_regex() -> &'static Regex {
+    SESSION_STATUS_RE.get_or_init(|| {
+        Regex::new(r"\[SESSION_STATUS\]").expect("Invalid regex pattern")
+    })
+}
+
+fn stop_session_regex() -> &'static Regex {
+    STOP_SESSION_RE.get_or_init(|| {
+        Regex::new(r"\[STOP_SESSION:\s*([^\]]+)\]").expect("Invalid regex pattern")
     })
 }
 
@@ -88,9 +110,8 @@ async fn main() -> Result<()> {
     let git = GitManager::new();
     let db = Database::new().await?;
 
-    // Recover sessions from database on startup
-    let recovered = recover_sessions(&db, &containers).await;
-    tracing::info!("Recovered {} sessions from database", recovered);
+    // NOTE: Tables are dropped on startup (pre-production). No recovery needed.
+    // TODO: Add migration-based persistence for production.
 
     let state = Arc::new(AppState {
         mm,
@@ -178,9 +199,15 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Health check endpoint for Kubernetes probes
-async fn health_check() -> &'static str {
-    "OK"
+/// Health check endpoint for Kubernetes probes.
+/// Verifies database connectivity and returns 503 if dependencies are down.
+async fn health_check(
+    State(state): State<Arc<AppState>>,
+) -> (axum::http::StatusCode, &'static str) {
+    match state.db.health_check().await {
+        Ok(()) => (axum::http::StatusCode::OK, "OK"),
+        Err(_) => (axum::http::StatusCode::SERVICE_UNAVAILABLE, "Database unavailable"),
+    }
 }
 
 /// Graceful shutdown signal handler
@@ -211,73 +238,6 @@ async fn shutdown_signal(cancel_token: CancellationToken) {
     tracing::info!("Shutdown signal received, starting graceful shutdown");
 }
 
-/// Recover active sessions from the database on startup
-/// Checks if containers are still running and cleans up stale sessions
-async fn recover_sessions(db: &Database, containers: &ContainerManager) -> usize {
-    match db.get_all_sessions().await {
-        Ok(sessions) => {
-            let mut cleaned = 0;
-
-            for session in &sessions {
-                // Check if container still exists
-                if containers.is_container_running(&session.container_name).await {
-                    // Container is running but we can't reconnect to it
-                    // (would need complex stdin/stdout reconnection)
-                    // So we stop the orphaned container and clean up
-                    tracing::info!(
-                        session_id = %session.session_id,
-                        container = %session.container_name,
-                        "Stopping orphaned container from previous run"
-                    );
-                    if let Err(e) = containers.remove_container(&session.container_name).await {
-                        tracing::warn!(
-                            session_id = %session.session_id,
-                            error = %e,
-                            "Failed to remove orphaned container"
-                        );
-                    }
-                    if let Err(e) = db.delete_session(&session.session_id).await {
-                        tracing::warn!(
-                            session_id = %session.session_id,
-                            error = %e,
-                            "Failed to delete stale session from database"
-                        );
-                    }
-                    cleaned += 1;
-                } else {
-                    // Container not running, just clean up the database entry
-                    tracing::debug!(
-                        session_id = %session.session_id,
-                        container = %session.container_name,
-                        "Cleaning up stale session record"
-                    );
-                    if let Err(e) = db.delete_session(&session.session_id).await {
-                        tracing::warn!(
-                            session_id = %session.session_id,
-                            error = %e,
-                            "Failed to delete stale session from database"
-                        );
-                    }
-                    cleaned += 1;
-                }
-            }
-
-            if cleaned > 0 {
-                tracing::info!(
-                    cleaned = cleaned,
-                    "Cleaned up stale sessions from previous run"
-                );
-            }
-
-            0 // No sessions were actually recovered (we clean up, not reconnect)
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, "Failed to recover sessions");
-            0
-        }
-    }
-}
-
 /// Periodically clean up stale pending requests
 async fn cleanup_stale_requests(state: Arc<AppState>, cancel_token: CancellationToken) {
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600)); // Every hour
@@ -302,6 +262,281 @@ async fn cleanup_stale_requests(state: Arc<AppState>, cancel_token: Cancellation
     }
 }
 
+/// Resolve a project channel: look up or create the channel for a project.
+/// Also manages sidebar categories for bot and requesting user.
+/// Returns (channel_id, channel_name, repo_ref).
+async fn resolve_project_channel(
+    state: &AppState,
+    project_name: &str,
+    requesting_user_id: &str,
+) -> Result<(String, String, RepoRef)> {
+    let s = config::settings();
+
+    // Parse the repo reference (with default org)
+    let repo_ref = RepoRef::parse_with_default_org(project_name, s.default_org.as_deref())
+        .ok_or_else(|| anyhow::anyhow!(
+            "Invalid repository format. Use: `org/repo`, `repo` (with default org), `org/repo@branch`, or add `--worktree`"
+        ))?;
+
+    let full_name = repo_ref.full_name();
+    let channel_name = sanitize_channel_name(&repo_ref.repo);
+
+    // Check if we already have a channel for this project
+    let channel_id = if let Some(pc) = state.db.get_project_channel(&full_name).await? {
+        pc.channel_id
+    } else {
+        // Try to find existing channel by name first
+        let channel_id = match state.mm.get_channel_by_name(&s.mattermost_team_id, &channel_name).await {
+            Ok(Some(id)) => id,
+            Ok(None) => {
+                // Create new channel
+                state.mm.create_channel(
+                    &s.mattermost_team_id,
+                    &channel_name,
+                    &repo_ref.repo,
+                    &format!("Claude sessions for {}", full_name),
+                ).await?
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to look up channel, creating new one");
+                state.mm.create_channel(
+                    &s.mattermost_team_id,
+                    &channel_name,
+                    &repo_ref.repo,
+                    &format!("Claude sessions for {}", full_name),
+                ).await?
+            }
+        };
+
+        // Persist project -> channel mapping
+        state.db.create_project_channel(&full_name, &channel_id, &channel_name).await?;
+
+        channel_id
+    };
+
+    // Manage sidebar categories (best-effort, don't fail the whole operation)
+    if let Err(e) = setup_sidebar_category(state, &channel_id, requesting_user_id).await {
+        tracing::warn!(error = %e, "Failed to setup sidebar category (non-fatal)");
+    }
+
+    Ok((channel_id, channel_name, repo_ref))
+}
+
+/// Setup sidebar category for bot and requesting user (best-effort)
+async fn setup_sidebar_category(
+    state: &AppState,
+    channel_id: &str,
+    user_id: &str,
+) -> Result<()> {
+    let s = config::settings();
+    let team_id = &s.mattermost_team_id;
+    let category_name = &s.channel_category;
+
+    // Ensure category exists for bot
+    let bot_cat_id = state.mm.ensure_sidebar_category("me", team_id, category_name).await?;
+    state.mm.add_channel_to_category("me", team_id, &bot_cat_id, channel_id).await?;
+
+    // Ensure category exists for requesting user
+    if user_id != state.mm.bot_user_id {
+        let user_cat_id = state.mm.ensure_sidebar_category(user_id, team_id, category_name).await?;
+        state.mm.add_channel_to_category(user_id, team_id, &user_cat_id, channel_id).await?;
+    }
+
+    Ok(())
+}
+
+/// Start a session: clone/worktree repo, start container, create thread, persist to DB.
+/// Returns session_id on success.
+async fn start_session(
+    state: &Arc<AppState>,
+    channel_id: &str,
+    project_input: &str,
+    repo_ref: &RepoRef,
+    session_type: &str,
+    parent_session_id: Option<&str>,
+) -> Result<String> {
+    use std::path::PathBuf;
+
+    let session_id = Uuid::new_v4().to_string();
+    let mut worktree_path: Option<PathBuf> = None;
+
+    // Resolve project path (clone/worktree)
+    let project_path = if repo_ref.worktree.is_some() {
+        match state.git.create_worktree(repo_ref, &session_id).await {
+            Ok(path) => {
+                worktree_path = Some(path.clone());
+                path.to_string_lossy().to_string()
+            }
+            Err(e) => return Err(anyhow::anyhow!("Failed to create worktree: {}", e)),
+        }
+    } else {
+        // Using main clone - atomically try to acquire
+        if let Err(existing_session) = state.git.try_acquire_repo(repo_ref, &session_id) {
+            return Err(anyhow::anyhow!(
+                "Repository **{}** is already in use by session `{}`.\n\
+                Use `--worktree` for an isolated working directory:\n\
+                `@claude start {} --worktree`",
+                repo_ref.full_name(),
+                &existing_session[..8.min(existing_session.len())],
+                project_input
+            ));
+        }
+
+        match state.git.ensure_repo(repo_ref).await {
+            Ok(path) => path.to_string_lossy().to_string(),
+            Err(e) => {
+                state.git.release_repo_by_session(&session_id);
+                return Err(anyhow::anyhow!("Failed to prepare repository: {}", e));
+            }
+        }
+    };
+
+    // Post root message to create thread anchor
+    let root_msg = match session_type {
+        "orchestrator" => format!("**Orchestrator session** for **{}**", repo_ref.full_name()),
+        "worker" => format!("**Worker session** for **{}**", repo_ref.full_name()),
+        "reviewer" => format!("**Reviewer session** for **{}**", repo_ref.full_name()),
+        _ => format!("**Session** for **{}**", repo_ref.full_name()),
+    };
+    let thread_id = state.mm.post_root(channel_id, &root_msg).await?;
+
+    let _ = state.mm.post_in_thread(channel_id, &thread_id, "Starting session...").await;
+    let session_start_time = std::time::Instant::now();
+
+    let (output_tx, output_rx) = mpsc::channel::<String>(100);
+    match state.containers.start(&session_id, &project_path, output_tx).await {
+        Ok(name) => {
+            let session_duration = session_start_time.elapsed();
+            histogram!("session_start_duration_seconds").record(session_duration.as_secs_f64());
+            counter!("sessions_started_total").increment(1);
+            gauge!("active_sessions").increment(1.0);
+
+            if let Some(wt_path) = worktree_path {
+                state.containers.set_worktree_path(&session_id, wt_path);
+            }
+
+            // Persist session to database — if this fails, clean up everything (fix 1b)
+            if let Err(e) = state.db.create_session(
+                &session_id,
+                channel_id,
+                &thread_id,
+                project_input,
+                &name,
+                session_type,
+                parent_session_id,
+            ).await {
+                tracing::error!(
+                    session_id = %session_id,
+                    error = %e,
+                    "Failed to persist session, cleaning up container"
+                );
+                cleanup_session(state, &session_id, parent_session_id).await;
+                return Err(anyhow::anyhow!("Failed to persist session to database: {}", e));
+            }
+
+            tracing::info!(
+                session_id = %session_id,
+                container = %name,
+                project = %project_input,
+                session_type = %session_type,
+                "Session started"
+            );
+
+            let _ = state.mm.post_in_thread(
+                channel_id,
+                &thread_id,
+                &format!("Ready. Container: `{}`", name),
+            ).await;
+
+            // Start output streaming
+            let state_clone = state.clone();
+            let channel_id_clone = channel_id.to_string();
+            let thread_id_clone = thread_id.clone();
+            let session_id_clone = session_id.clone();
+            let session_type_clone = session_type.to_string();
+            let parent_session_id_clone = parent_session_id.map(|s| s.to_string());
+            tokio::spawn(async move {
+                stream_output(
+                    state_clone,
+                    channel_id_clone,
+                    thread_id_clone,
+                    session_id_clone,
+                    session_type_clone,
+                    parent_session_id_clone,
+                    output_rx,
+                ).await;
+            });
+
+            Ok(session_id)
+        }
+        Err(e) => {
+            state.git.release_repo_by_session(&session_id);
+            Err(anyhow::anyhow!("Failed to start container: {}", e))
+        }
+    }
+}
+
+/// Centralized session cleanup. Uses atomic `claim_session()` as a guard:
+/// whichever caller (stop command vs stream-end) claims first does cleanup;
+/// the other is a no-op. This prevents double-decrement of metrics.
+async fn cleanup_session(state: &AppState, session_id: &str, parent_session_id: Option<&str>) {
+    // Atomic claim — only one caller will succeed
+    let Some(claimed) = state.containers.claim_session(session_id) else {
+        tracing::debug!(session_id = %session_id, "Session already cleaned up by another path");
+        return;
+    };
+
+    // Remove container
+    if let Err(e) = state.containers.remove_container_by_name(&claimed.name).await {
+        tracing::warn!(session_id = %session_id, error = %e, "Failed to remove container");
+    }
+
+    // Release repo lock
+    state.git.release_repo_by_session(session_id);
+
+    // Clean up worktree if present
+    if let Some(ref wt_path) = claimed.worktree_path {
+        state.git.cleanup_worktree_by_path(wt_path).await;
+    }
+
+    // Delete session from database
+    if let Err(e) = state.db.delete_session(session_id).await {
+        tracing::warn!(session_id = %session_id, error = %e, "Failed to delete session from database");
+    }
+
+    gauge!("active_sessions").decrement(1.0);
+    tracing::info!(session_id = %session_id, "Session cleaned up");
+
+    // Notify parent orchestrator if this is a child session
+    if let Some(parent_id) = parent_session_id {
+        let _ = state.containers.send(
+            parent_id,
+            &format!("[SESSION_ENDED: {}]", session_id),
+        ).await;
+    }
+}
+
+/// Stop a session by ID, cleaning up container and database.
+async fn stop_session(state: &Arc<AppState>, session: &database::StoredSession) {
+    cleanup_session(state, &session.session_id, session.parent_session_id.as_deref()).await;
+}
+
+/// Format a chrono::Duration as a human-readable string (e.g. "2h 15m", "5m", "30s")
+fn format_duration(d: chrono::Duration) -> String {
+    let total_secs = d.num_seconds().max(0);
+    let hours = total_secs / 3600;
+    let mins = (total_secs % 3600) / 60;
+    let secs = total_secs % 60;
+
+    if hours > 0 {
+        format!("{}h {}m", hours, mins)
+    } else if mins > 0 {
+        format!("{}m", mins)
+    } else {
+        format!("{}s", secs)
+    }
+}
+
 async fn handle_messages(state: Arc<AppState>, mut rx: mpsc::Receiver<Post>, cancel_token: CancellationToken) {
     let bot_trigger = &config::settings().bot_trigger;
 
@@ -321,202 +556,333 @@ async fn handle_messages(state: Arc<AppState>, mut rx: mpsc::Receiver<Post>, can
         let text = post.message.trim();
         let channel_id = &post.channel_id;
 
-        if text.starts_with(bot_trigger) {
-            let text = text.trim_start_matches(bot_trigger).trim();
+        if !post.root_id.is_empty() {
+            // --- Thread reply: route to session by thread ---
+            let root_id = &post.root_id;
 
-            // Start session
-            if let Some(project_input) = text.strip_prefix("start ").map(|s| s.trim()) {
-                use std::path::PathBuf;
-                let session_id = Uuid::new_v4().to_string();
+            if let Ok(Some(session)) = state.db.get_session_by_thread(channel_id, root_id).await {
+                // Check for in-thread commands
+                if text.starts_with(bot_trigger) {
+                    let cmd = text.trim_start_matches(bot_trigger).trim();
+                    if cmd == "stop" {
+                        stop_session(&state, &session).await;
+                        let _ = state.mm.post_in_thread(channel_id, root_id, "Stopped.").await;
+                        continue;
+                    }
+                    if cmd == "compact" {
+                        let _ = state.containers.send(&session.session_id, "/compact").await;
+                        let _ = state.mm.post_in_thread(channel_id, root_id, "Compacting context...").await;
+                        let _ = state.db.record_compaction(&session.session_id).await;
+                        continue;
+                    }
+                    if cmd == "clear" {
+                        let _ = state.containers.send(&session.session_id, "/clear").await;
+                        let _ = state.mm.post_in_thread(channel_id, root_id, "Context cleared.").await;
+                        continue;
+                    }
+                    if cmd == "restart" {
+                        let _ = state.mm.post_in_thread(channel_id, root_id, "Restarting session...").await;
+                        match state.containers.restart_session(&session.session_id).await {
+                            Ok(new_rx) => {
+                                let state_clone = state.clone();
+                                let channel_id_clone = channel_id.to_string();
+                                let root_id_clone = root_id.to_string();
+                                let session_id_clone = session.session_id.clone();
+                                let session_type_clone = session.session_type.clone();
+                                let parent_id_clone = session.parent_session_id.clone();
+                                tokio::spawn(async move {
+                                    stream_output(
+                                        state_clone,
+                                        channel_id_clone,
+                                        root_id_clone,
+                                        session_id_clone,
+                                        session_type_clone,
+                                        parent_id_clone,
+                                        new_rx,
+                                    ).await;
+                                });
+                                let _ = state.mm.post_in_thread(channel_id, root_id, "Restarted with previous context.").await;
+                            }
+                            Err(e) => {
+                                let _ = state.mm.post_in_thread(channel_id, root_id, &format!("Restart failed: {e}")).await;
+                            }
+                        }
+                        continue;
+                    }
+                    if cmd == "context" {
+                        let age = chrono::Utc::now() - session.created_at;
+                        let idle = chrono::Utc::now() - session.last_activity_at;
+                        let msg = format!(
+                            "**Context Health:**\n\
+                            - Messages: {}\n\
+                            - Compactions: {}\n\
+                            - Session age: {}\n\
+                            - Last active: {} ago",
+                            session.message_count,
+                            session.compaction_count,
+                            format_duration(age),
+                            format_duration(idle),
+                        );
+                        let _ = state.mm.post_in_thread(channel_id, root_id, &msg).await;
+                        continue;
+                    }
+                }
+                // Forward message to session
+                if let Err(e) = state.containers.send(&session.session_id, text).await {
+                    tracing::warn!(
+                        session_id = %session.session_id,
+                        error = %e,
+                        "Failed to forward message to container"
+                    );
+                }
+                // Track activity
+                if let Ok(msg_count) = state.db.touch_session(&session.session_id).await {
+                    // Auto-compact orchestrator sessions
+                    let s = config::settings();
+                    if session.session_type == "orchestrator"
+                        && s.orchestrator_compact_threshold > 0
+                        && msg_count > 0
+                        && msg_count % s.orchestrator_compact_threshold == 0
+                    {
+                        let _ = state.containers.send(&session.session_id, "/compact").await;
+                        let _ = state.db.record_compaction(&session.session_id).await;
+                        tracing::info!(
+                            session_id = %session.session_id,
+                            message_count = msg_count,
+                            "Auto-compacted orchestrator session"
+                        );
+                    }
+                }
+            } else if text.starts_with(bot_trigger) {
+                let _ = state.mm.post_in_thread(
+                    channel_id,
+                    root_id,
+                    "No active session in this thread.",
+                ).await;
+            }
+            // Non-bot thread replies to non-session threads are silently ignored
+        } else {
+            // --- Top-level post: check for bot commands FIRST, then route ---
 
-                // Track worktree path if created (for reference, not auto-cleanup)
-                let mut worktree_path: Option<PathBuf> = None;
+            // Step 1: Check for bot command trigger before any routing
+            if text.starts_with(bot_trigger) {
+                let cmd_text = text.trim_start_matches(bot_trigger).trim();
 
-                // Try to parse as GitHub repo first (org/repo format)
-                let project_path = if RepoRef::looks_like_repo(project_input) {
-                    match RepoRef::parse(project_input) {
-                        Some(repo_ref) => {
-                            // Check if using worktree mode
-                            if repo_ref.worktree.is_some() {
-                                // Create worktree for isolation
-                                let _ = state.mm.post(channel_id, &format!(
-                                    "Creating worktree for **{}**...",
-                                    repo_ref.full_name()
-                                )).await;
+                // --- start <project> ---
+                if let Some(project_input) = cmd_text.strip_prefix("start ").map(|s| s.trim()) {
+                    if project_input.is_empty() {
+                        let _ = state.mm.post(channel_id, "Usage: `@claude start <org/repo>` or `@claude start <repo>`").await;
+                        continue;
+                    }
 
-                                match state.git.create_worktree(&repo_ref, &session_id).await {
-                                    Ok(path) => {
-                                        worktree_path = Some(path.clone());
-                                        path.to_string_lossy().to_string()
+                    let s = config::settings();
+
+                    // Check if input looks like a repo reference or has a default org
+                    let has_slash = project_input.split_whitespace().next()
+                        .map(|p| p.split('@').next().unwrap_or(p))
+                        .map(|p| p.contains('/'))
+                        .unwrap_or(false);
+
+                    if has_slash || s.default_org.is_some() || RepoRef::looks_like_repo(project_input) {
+                        match resolve_project_channel(&state, project_input, &post.user_id).await {
+                            Ok((proj_channel_id, channel_name, repo_ref)) => {
+                                match start_session(
+                                    &state,
+                                    &proj_channel_id,
+                                    project_input,
+                                    &repo_ref,
+                                    "standard",
+                                    None,
+                                ).await {
+                                    Ok(session_id) => {
+                                        let _ = state.mm.post(channel_id, &format!(
+                                            "Session `{}` started in ~{}",
+                                            &session_id[..8],
+                                            channel_name,
+                                        )).await;
                                     }
                                     Err(e) => {
-                                        let _ = state.mm.post(channel_id, &format!(
-                                            "Failed to create worktree: {}",
-                                            e
-                                        )).await;
-                                        continue;
-                                    }
-                                }
-                            } else {
-                                // Using main clone - atomically try to acquire
-                                if let Err(existing_session) = state.git.try_acquire_repo(&repo_ref, &session_id) {
-                                    let _ = state.mm.post(channel_id, &format!(
-                                        "Repository **{}** is already in use by session `{}`.\n\
-                                        Use `--worktree` for an isolated working directory:\n\
-                                        `@claude start {} --worktree`",
-                                        repo_ref.full_name(),
-                                        &existing_session[..8.min(existing_session.len())],
-                                        project_input
-                                    )).await;
-                                    continue;
-                                }
-
-                                // Ensure repo is cloned
-                                let _ = state.mm.post(channel_id, &format!(
-                                    "Preparing **{}**...",
-                                    repo_ref.full_name()
-                                )).await;
-
-                                match state.git.ensure_repo(&repo_ref).await {
-                                    Ok(path) => {
-                                        path.to_string_lossy().to_string()
-                                    }
-                                    Err(e) => {
-                                        // Release the repo since we failed
-                                        state.git.release_repo_by_session(&session_id);
-                                        let _ = state.mm.post(channel_id, &format!(
-                                            "Failed to prepare repository: {}",
-                                            e
-                                        )).await;
-                                        continue;
+                                        let _ = state.mm.post(channel_id, &format!("Failed: {}", e)).await;
                                     }
                                 }
                             }
+                            Err(e) => {
+                                let _ = state.mm.post(channel_id, &format!("Failed: {}", e)).await;
+                            }
                         }
-                        None => {
-                            let _ = state.mm.post(channel_id,
-                                "Invalid repository format. Use: `org/repo`, `org/repo@branch`, or `org/repo --worktree`"
-                            ).await;
-                            continue;
+                    } else {
+                        // Fall back to static projects mapping
+                        let s = config::settings();
+                        match s.projects.get(project_input) {
+                            Some(_path) => {
+                                let _ = state.mm.post(
+                                    channel_id,
+                                    "Static project mapping is deprecated. Use `org/repo` format or configure `SM_DEFAULT_ORG`.",
+                                ).await;
+                            }
+                            None => {
+                                let _ = state.mm.post(channel_id, &format!(
+                                    "Unknown project `{}`. Use `org/repo` format or configure `SM_DEFAULT_ORG`.",
+                                    project_input,
+                                )).await;
+                            }
                         }
                     }
-                } else {
-                    // Fall back to static projects mapping
-                    let s = config::settings();
-                    match s.projects.get(project_input) {
-                        Some(path) => path.clone(),
-                        None => {
-                            let available = if s.projects.is_empty() {
-                                "none configured".to_string()
-                            } else {
-                                s.projects.keys().cloned().collect::<Vec<_>>().join(", ")
-                            };
-                            let _ = state.mm.post(channel_id, &format!(
-                                "Unknown project `{}`. Available: {}\n\n\
-                                Or use GitHub repo format: `org/repo`",
+                    continue;
+                }
+
+                // --- orchestrate <project> ---
+                if let Some(project_input) = cmd_text.strip_prefix("orchestrate ").map(|s| s.trim()) {
+                    if project_input.is_empty() {
+                        let _ = state.mm.post(channel_id, "Usage: `@claude orchestrate <org/repo>` or `@claude orchestrate <repo>`").await;
+                        continue;
+                    }
+
+                    match resolve_project_channel(&state, project_input, &post.user_id).await {
+                        Ok((proj_channel_id, channel_name, repo_ref)) => {
+                            match start_session(
+                                &state,
+                                &proj_channel_id,
                                 project_input,
-                                available
-                            )).await;
-                            continue;
+                                &repo_ref,
+                                "orchestrator",
+                                None,
+                            ).await {
+                                Ok(session_id) => {
+                                    let _ = state.mm.post(channel_id, &format!(
+                                        "Orchestrator `{}` started in ~{}",
+                                        &session_id[..8],
+                                        channel_name,
+                                    )).await;
+                                }
+                                Err(e) => {
+                                    let _ = state.mm.post(channel_id, &format!("Failed: {}", e)).await;
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            let _ = state.mm.post(channel_id, &format!("Failed: {}", e)).await;
                         }
                     }
-                };
+                    continue;
+                }
 
-                let _ = state.mm.post(channel_id, "Starting session...").await;
-                let session_start_time = std::time::Instant::now();
+                // --- stop [short-id] ---
+                if cmd_text == "stop" || cmd_text.starts_with("stop ") {
+                    let short_id = cmd_text.strip_prefix("stop").unwrap().trim();
 
-                let (output_tx, output_rx) = mpsc::channel::<String>(100);
-                match state.containers.start(&session_id, &project_path, output_tx).await {
-                    Ok(name) => {
-                        // Record session start latency
-                        let session_duration = session_start_time.elapsed();
-                        histogram!("session_start_duration_seconds").record(session_duration.as_secs_f64());
-
-                        // Track metrics
-                        counter!("sessions_started_total").increment(1);
-                        gauge!("active_sessions").increment(1.0);
-
-                        // Track worktree path in session (for reference, not auto-cleanup)
-                        if let Some(wt_path) = worktree_path {
-                            state.containers.set_worktree_path(&session_id, wt_path);
+                    if short_id.is_empty() {
+                        // No short-id: show help
+                        let _ = state.mm.post(channel_id, "Usage: `@claude stop <session-id-prefix>` or reply `@claude stop` in a session thread.").await;
+                    } else {
+                        // Stop by ID prefix
+                        match state.db.get_session_by_id_prefix(short_id).await {
+                            Ok(Some(session)) => {
+                                stop_session(&state, &session).await;
+                                let _ = state.mm.post(channel_id, &format!(
+                                    "Stopped session `{}`.",
+                                    &session.session_id[..8]
+                                )).await;
+                            }
+                            Ok(None) => {
+                                let _ = state.mm.post(channel_id, &format!(
+                                    "No session found matching `{}`.",
+                                    short_id
+                                )).await;
+                            }
+                            Err(e) => {
+                                let _ = state.mm.post(channel_id, &format!("Error: {}", e)).await;
+                            }
                         }
+                    }
+                    continue;
+                }
 
-                        // Persist session to database
-                        if let Err(e) = state.db.create_session(&session_id, channel_id, project_input, &name).await {
-                            tracing::error!(
-                                session_id = %session_id,
+                // --- status ---
+                if cmd_text == "status" {
+                    match state.db.get_all_sessions().await {
+                        Ok(sessions) if sessions.is_empty() => {
+                            let _ = state.mm.post(channel_id, "No active sessions.").await;
+                        }
+                        Ok(sessions) => {
+                            let now = chrono::Utc::now();
+                            let mut msg = String::from("**Active Sessions:**\n");
+                            for s in &sessions {
+                                let idle = now - s.last_activity_at;
+                                msg.push_str(&format!(
+                                    "- `{}` | {} | **{}** | {} msgs | {} compactions | idle {}\n",
+                                    &s.session_id[..8],
+                                    s.session_type,
+                                    s.project,
+                                    s.message_count,
+                                    s.compaction_count,
+                                    format_duration(idle),
+                                ));
+                            }
+                            let _ = state.mm.post(channel_id, &msg).await;
+                        }
+                        Err(e) => {
+                            let _ = state.mm.post(channel_id, &format!("Error: {}", e)).await;
+                        }
+                    }
+                    continue;
+                }
+
+                // --- help ---
+                if cmd_text == "help" {
+                    let _ = state.mm.post(channel_id, &format!(
+                        "**Commands:**\n\
+                        - `{trigger} start <org/repo>` — Start a standard session\n\
+                        - `{trigger} start <repo> --worktree` — Start with isolated worktree\n\
+                        - `{trigger} orchestrate <org/repo>` — Start an orchestrator session\n\
+                        - `{trigger} stop <id-prefix>` — Stop a session by ID prefix\n\
+                        - `{trigger} status` — List all active sessions\n\
+                        - `{trigger} help` — Show this message\n\
+                        \n\
+                        **In a session thread:**\n\
+                        - Reply directly to send input\n\
+                        - `{trigger} stop` — End the session\n\
+                        - `{trigger} compact` — Compact/summarize context\n\
+                        - `{trigger} clear` — Clear conversation history\n\
+                        - `{trigger} restart` — Kill & restart Claude (preserves context via --continue)\n\
+                        - `{trigger} context` — Show context health",
+                        trigger = bot_trigger,
+                    )).await;
+                    continue;
+                }
+
+                // Unknown command
+                let _ = state.mm.post(channel_id, &format!(
+                    "Unknown command. Try `{} help`.",
+                    bot_trigger,
+                )).await;
+            } else {
+                // Step 2: Non-command top-level message — route to active session in this channel
+                match state.db.get_non_worker_sessions_by_channel(channel_id).await {
+                    Ok(sessions) if sessions.len() == 1 => {
+                        // Exactly one session — forward the message to it
+                        let session = &sessions[0];
+                        if let Err(e) = state.containers.send(&session.session_id, text).await {
+                            tracing::warn!(
+                                session_id = %session.session_id,
                                 error = %e,
-                                "Failed to persist session"
+                                "Failed to forward top-level message to session"
                             );
                         }
-
-                        tracing::info!(
-                            session_id = %session_id,
-                            container = %name,
-                            project = %project_input,
-                            "Session started"
-                        );
-
-                        let _ = state.mm.post(channel_id, &format!("Ready. Container: `{}`", name)).await;
-
-                        // Start output streaming
-                        let state_clone = state.clone();
-                        let channel_id_clone = channel_id.clone();
-                        let session_id_clone = session_id.clone();
-                        tokio::spawn(async move {
-                            stream_output(state_clone, channel_id_clone, session_id_clone, output_rx).await;
-                        });
+                        let _ = state.db.touch_session(&session.session_id).await;
                     }
-                    Err(e) => {
-                        // Release repo if we marked it in use
-                        state.git.release_repo_by_session(&session_id);
-                        let _ = state.mm.post(channel_id, &format!("Failed to start: {}", e)).await;
+                    Ok(sessions) if sessions.len() > 1 => {
+                        // Multiple sessions — guide user to reply in thread
+                        let _ = state.mm.post(
+                            channel_id,
+                            "Multiple sessions active in this channel. Please reply in the specific session thread.",
+                        ).await;
+                    }
+                    _ => {
+                        // No sessions or error — silently ignore non-bot top-level messages
                     }
                 }
-                continue;
             }
-
-            // Stop session
-            if text == "stop" {
-                if let Ok(Some(session)) = state.db.get_session_by_channel(channel_id).await {
-                    if let Err(e) = state.containers.stop(&session.session_id).await {
-                        tracing::warn!(
-                            session_id = %session.session_id,
-                            error = %e,
-                            "Failed to stop container"
-                        );
-                    }
-                    // Release repo tracking (if using main clone)
-                    state.git.release_repo_by_session(&session.session_id);
-                    if let Err(e) = state.db.delete_session(&session.session_id).await {
-                        tracing::warn!(
-                            session_id = %session.session_id,
-                            error = %e,
-                            "Failed to delete session from database"
-                        );
-                    }
-                    gauge!("active_sessions").decrement(1.0);
-                    tracing::info!(
-                        session_id = %session.session_id,
-                        "Session stopped by user"
-                    );
-                }
-                if let Err(e) = state.mm.post(channel_id, "Stopped.").await {
-                    tracing::warn!(error = %e, "Failed to post stop message");
-                }
-                continue;
-            }
-        }
-
-        // Forward to Claude
-        if let Ok(Some(session)) = state.db.get_session_by_channel(channel_id).await
-            && let Err(e) = state.containers.send(&session.session_id, text).await
-        {
-            tracing::warn!(
-                session_id = %session.session_id,
-                error = %e,
-                "Failed to forward message to container"
-            );
         }
     }
 }
@@ -524,15 +890,48 @@ async fn handle_messages(state: Arc<AppState>, mut rx: mpsc::Receiver<Post>, can
 async fn stream_output(
     state: Arc<AppState>,
     channel_id: String,
+    thread_id: String,
     session_id: String,
+    session_type: String,
+    parent_session_id: Option<String>,
     mut rx: mpsc::Receiver<String>,
 ) {
     let network_re = network_request_regex();
+    let is_orchestrator = session_type == "orchestrator";
+
     while let Some(line) = rx.recv().await {
+        // Network request handling (all session types)
         if let Some(caps) = network_re.captures(&line) {
             let domain = caps[1].trim();
-            handle_network_request(&state, &channel_id, &session_id, domain).await;
-        } else if let Err(e) = state.mm.post(&channel_id, &format!("```\n{}\n```", line)).await {
+            handle_network_request(&state, &channel_id, &thread_id, &session_id, domain).await;
+            continue;
+        }
+
+        // Orchestrator-specific markers
+        if is_orchestrator {
+            if let Some(caps) = create_session_regex().captures(&line) {
+                let marker_input = caps[1].trim();
+                handle_orchestrator_create_session(&state, &channel_id, &session_id, marker_input, "worker").await;
+                continue;
+            }
+            if let Some(caps) = create_reviewer_regex().captures(&line) {
+                let marker_input = caps[1].trim();
+                handle_orchestrator_create_reviewer(&state, &channel_id, &session_id, marker_input).await;
+                continue;
+            }
+            if session_status_regex().is_match(&line) {
+                handle_orchestrator_status(&state, &session_id).await;
+                continue;
+            }
+            if let Some(caps) = stop_session_regex().captures(&line) {
+                let short_id = caps[1].trim();
+                handle_orchestrator_stop(&state, &session_id, short_id).await;
+                continue;
+            }
+        }
+
+        // Regular output: post in thread
+        if let Err(e) = state.mm.post_in_thread(&channel_id, &thread_id, &format!("```\n{}\n```", line)).await {
             tracing::warn!(
                 session_id = %session_id,
                 error = %e,
@@ -541,32 +940,29 @@ async fn stream_output(
         }
     }
 
-    // Clean up session from database when stream ends
-    // Also release repo tracking (if using main clone)
-    state.git.release_repo_by_session(&session_id);
-    if let Err(e) = state.db.delete_session(&session_id).await {
-        tracing::warn!(
-            session_id = %session_id,
-            error = %e,
-            "Failed to delete session from database on stream end"
-        );
-    }
-    gauge!("active_sessions").decrement(1.0);
+    // Stream ended — use centralized cleanup (atomic, prevents double-decrement)
+    cleanup_session(&state, &session_id, parent_session_id.as_deref()).await;
+
     tracing::info!(
         session_id = %session_id,
         channel_id = %channel_id,
         "Session stream ended"
     );
-    if let Err(e) = state.mm.post(&channel_id, "Session ended.").await {
+    if let Err(e) = state.mm.post_in_thread(&channel_id, &thread_id, "Session ended.").await {
         tracing::warn!(error = %e, "Failed to post session end message");
     }
 }
 
-async fn handle_network_request(state: &AppState, channel_id: &str, session_id: &str, domain: &str) {
+async fn handle_network_request(
+    state: &AppState,
+    channel_id: &str,
+    thread_id: &str,
+    session_id: &str,
+    domain: &str,
+) {
     let start_time = std::time::Instant::now();
 
-    // Check if there's already a pending request for this domain in this session
-    // This prevents duplicate approval cards for the same domain
+    // Deduplicate: check for existing pending request for same domain in session
     match state.db.get_pending_request_by_domain_and_session(domain, session_id).await {
         Ok(Some(existing)) => {
             tracing::debug!(
@@ -586,9 +982,7 @@ async fn handle_network_request(state: &AppState, channel_id: &str, session_id: 
                 "Failed to check for duplicate request, proceeding anyway"
             );
         }
-        Ok(None) => {
-            // No existing request, proceed normally
-        }
+        Ok(None) => {}
     }
 
     let request_id = Uuid::new_v4().to_string();
@@ -602,16 +996,17 @@ async fn handle_network_request(state: &AppState, channel_id: &str, session_id: 
         "Network request received, awaiting approval"
     );
 
-    // Generate HMAC signatures for both approve and deny actions
     let approve_sig = sign_request(&s.callback_secret, &request_id, "approve");
     let deny_sig = sign_request(&s.callback_secret, &request_id, "deny");
 
-    match state.mm.post_approval(channel_id, &request_id, domain, &approve_sig, &deny_sig).await {
+    match state.mm.post_approval_in_thread(
+        channel_id, thread_id, &request_id, domain, &approve_sig, &deny_sig,
+    ).await {
         Ok(post_id) => {
-            // Persist pending request to database
             if let Err(e) = state.db.create_pending_request(
                 &request_id,
                 channel_id,
+                thread_id,
                 session_id,
                 domain,
                 &post_id,
@@ -624,9 +1019,284 @@ async fn handle_network_request(state: &AppState, channel_id: &str, session_id: 
         }
     }
 
-    // Record network request handling latency
     let duration = start_time.elapsed();
     histogram!("network_request_duration_seconds").record(duration.as_secs_f64());
+}
+
+// --- Orchestrator marker handlers ---
+
+async fn handle_orchestrator_create_session(
+    state: &Arc<AppState>,
+    _parent_channel_id: &str,
+    parent_session_id: &str,
+    marker_input: &str,
+    session_type: &str,
+) {
+    tracing::info!(
+        parent = %parent_session_id,
+        input = %marker_input,
+        session_type = %session_type,
+        "Orchestrator creating {} session", session_type
+    );
+
+    let s = config::settings();
+    let repo_ref = match RepoRef::parse_with_default_org(marker_input, s.default_org.as_deref()) {
+        Some(r) => r,
+        None => {
+            let _ = state.containers.send(
+                parent_session_id,
+                &format!("[SESSION_ERROR: Invalid repo format '{}']", marker_input),
+            ).await;
+            return;
+        }
+    };
+
+    let full_name = repo_ref.full_name();
+    let channel_name = sanitize_channel_name(&repo_ref.repo);
+
+    // Find or create project channel
+    let channel_id = match state.db.get_project_channel(&full_name).await {
+        Ok(Some(pc)) => pc.channel_id,
+        _ => {
+            match state.mm.get_channel_by_name(&s.mattermost_team_id, &channel_name).await {
+                Ok(Some(id)) => {
+                    if let Err(e) = state.db.create_project_channel(&full_name, &id, &channel_name).await {
+                        tracing::error!(error = %e, "Failed to persist project channel mapping");
+                    }
+                    id
+                }
+                _ => {
+                    match state.mm.create_channel(
+                        &s.mattermost_team_id,
+                        &channel_name,
+                        &repo_ref.repo,
+                        &format!("Claude sessions for {}", full_name),
+                    ).await {
+                        Ok(id) => {
+                            if let Err(e) = state.db.create_project_channel(&full_name, &id, &channel_name).await {
+                                tracing::error!(error = %e, "Failed to persist project channel mapping");
+                            }
+                            id
+                        }
+                        Err(e) => {
+                            let _ = state.containers.send(
+                                parent_session_id,
+                                &format!("[SESSION_ERROR: Failed to create channel: {}]", e),
+                            ).await;
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+    };
+
+    // Ensure worktree mode for worker sessions
+    let worker_input = if marker_input.contains("--worktree") {
+        marker_input.to_string()
+    } else {
+        format!("{} --worktree", marker_input)
+    };
+
+    let session_id = Uuid::new_v4().to_string();
+    let repo_ref_worker = match RepoRef::parse_with_default_org(&worker_input, s.default_org.as_deref()) {
+        Some(r) => r,
+        None => {
+            let _ = state.containers.send(
+                parent_session_id,
+                &format!("[SESSION_ERROR: Invalid worker input '{}']", worker_input),
+            ).await;
+            return;
+        }
+    };
+
+    // Create worktree
+    let project_path = match state.git.create_worktree(&repo_ref_worker, &session_id).await {
+        Ok(path) => {
+            state.containers.set_worktree_path(&session_id, path.clone());
+            path.to_string_lossy().to_string()
+        }
+        Err(e) => {
+            let _ = state.containers.send(
+                parent_session_id,
+                &format!("[SESSION_ERROR: Failed to create worktree: {}]", e),
+            ).await;
+            return;
+        }
+    };
+
+    // Post root message for worker thread
+    let thread_id = match state.mm.post_root(
+        &channel_id,
+        &format!("**Worker session** for **{}** (spawned by orchestrator `{}`)", full_name, &parent_session_id[..8]),
+    ).await {
+        Ok(id) => id,
+        Err(e) => {
+            let _ = state.containers.send(
+                parent_session_id,
+                &format!("[SESSION_ERROR: Failed to create thread: {}]", e),
+            ).await;
+            return;
+        }
+    };
+
+    let (output_tx, output_rx) = mpsc::channel::<String>(100);
+    match state.containers.start(&session_id, &project_path, output_tx).await {
+        Ok(name) => {
+            counter!("sessions_started_total").increment(1);
+            gauge!("active_sessions").increment(1.0);
+
+            // Persist session — if this fails, clean up the container (fix 1b)
+            if let Err(e) = state.db.create_session(
+                &session_id,
+                &channel_id,
+                &thread_id,
+                &worker_input,
+                &name,
+                session_type,
+                Some(parent_session_id),
+            ).await {
+                tracing::error!(session_id = %session_id, error = %e, "Failed to persist worker session, cleaning up");
+                cleanup_session(state, &session_id, Some(parent_session_id)).await;
+                let _ = state.containers.send(
+                    parent_session_id,
+                    &format!("[SESSION_ERROR: Failed to persist session: {}]", e),
+                ).await;
+                return;
+            }
+
+            // Notify orchestrator
+            let _ = state.containers.send(
+                parent_session_id,
+                &format!("[SESSION_CREATED: {} {} {} {}]", session_id, session_type, project_path, thread_id),
+            ).await;
+
+            // Start output streaming for worker/reviewer
+            let state_clone = state.clone();
+            let session_id_clone = session_id.clone();
+            let channel_id_clone = channel_id.clone();
+            let thread_id_clone = thread_id.clone();
+            let parent_id_clone = parent_session_id.to_string();
+            tokio::spawn(async move {
+                stream_output_worker(
+                    state_clone,
+                    channel_id_clone,
+                    thread_id_clone,
+                    session_id_clone,
+                    parent_id_clone,
+                    output_rx,
+                ).await;
+            });
+        }
+        Err(e) => {
+            state.git.release_repo_by_session(&session_id);
+            let _ = state.containers.send(
+                parent_session_id,
+                &format!("[SESSION_ERROR: Failed to start container: {}]", e),
+            ).await;
+        }
+    }
+}
+
+async fn handle_orchestrator_create_reviewer(
+    state: &Arc<AppState>,
+    parent_channel_id: &str,
+    parent_session_id: &str,
+    marker_input: &str,
+) {
+    handle_orchestrator_create_session(state, parent_channel_id, parent_session_id, marker_input, "reviewer").await;
+}
+
+async fn handle_orchestrator_status(state: &AppState, orchestrator_session_id: &str) {
+    match state.db.get_all_sessions().await {
+        Ok(sessions) => {
+            let json = serde_json::json!(
+                sessions.iter().map(|s| {
+                    serde_json::json!({
+                        "id": &s.session_id[..8],
+                        "type": s.session_type,
+                        "project": s.project,
+                        "container": s.container_name,
+                        "messages": s.message_count,
+                        "compactions": s.compaction_count,
+                    })
+                }).collect::<Vec<_>>()
+            );
+            let _ = state.containers.send(
+                orchestrator_session_id,
+                &format!("[SESSIONS: {}]", json),
+            ).await;
+        }
+        Err(e) => {
+            let _ = state.containers.send(
+                orchestrator_session_id,
+                &format!("[SESSION_ERROR: Failed to get status: {}]", e),
+            ).await;
+        }
+    }
+}
+
+async fn handle_orchestrator_stop(
+    state: &AppState,
+    orchestrator_session_id: &str,
+    short_id: &str,
+) {
+    match state.db.get_session_by_id_prefix(short_id).await {
+        Ok(Some(session)) => {
+            cleanup_session(state, &session.session_id, session.parent_session_id.as_deref()).await;
+
+            let _ = state.containers.send(
+                orchestrator_session_id,
+                &format!("[SESSION_STOPPED: {}]", session.session_id),
+            ).await;
+        }
+        Ok(None) => {
+            let _ = state.containers.send(
+                orchestrator_session_id,
+                &format!("[SESSION_ERROR: No session matching '{}']", short_id),
+            ).await;
+        }
+        Err(e) => {
+            let _ = state.containers.send(
+                orchestrator_session_id,
+                &format!("[SESSION_ERROR: {}]", e),
+            ).await;
+        }
+    }
+}
+
+/// Output streaming for orchestrator-spawned worker/reviewer sessions.
+/// Uses full AppState for centralized cleanup and network request approval cards.
+async fn stream_output_worker(
+    state: Arc<AppState>,
+    channel_id: String,
+    thread_id: String,
+    session_id: String,
+    parent_session_id: String,
+    mut rx: mpsc::Receiver<String>,
+) {
+    let network_re = network_request_regex();
+
+    while let Some(line) = rx.recv().await {
+        // Handle network requests with proper approval cards (fix 2c)
+        if let Some(caps) = network_re.captures(&line) {
+            let domain = caps[1].trim();
+            handle_network_request(&state, &channel_id, &thread_id, &session_id, domain).await;
+            continue;
+        }
+
+        if let Err(e) = state.mm.post_in_thread(&channel_id, &thread_id, &format!("```\n{}\n```", line)).await {
+            tracing::warn!(session_id = %session_id, error = %e, "Failed to post output");
+        }
+    }
+
+    // Use centralized cleanup (atomic, prevents double-decrement)
+    cleanup_session(&state, &session_id, Some(&parent_session_id)).await;
+    tracing::info!(session_id = %session_id, "Worker session stream ended");
+
+    if let Err(e) = state.mm.post_in_thread(&channel_id, &thread_id, "Session ended.").await {
+        tracing::warn!(error = %e, "Failed to post session end message");
+    }
 }
 
 async fn handle_callback(
@@ -652,7 +1322,7 @@ async fn handle_callback(
         });
     }
 
-    // Verify HMAC signature to ensure request came from our approval buttons
+    // Verify HMAC signature
     if !verify_signature(&s.callback_secret, request_id, action, signature) {
         tracing::warn!(
             "Invalid signature for request_id={} action={} from user={}",
@@ -664,7 +1334,7 @@ async fn handle_callback(
         });
     }
 
-    // Retrieve and remove pending request from database
+    // Retrieve pending request
     let req = match state.db.get_pending_request(request_id).await {
         Ok(Some(req)) => req,
         Ok(None) => {
@@ -683,20 +1353,14 @@ async fn handle_callback(
     };
 
     if action == "approve" {
-        // For approvals, try OPNsense first - this is the critical operation
-        // Only delete the pending request and log if OPNsense succeeds
         match state.opnsense.add_domain(&req.domain).await {
             Ok(_added) => {
-                // OPNsense succeeded, now we can delete the pending request
                 if let Err(e) = state.db.delete_pending_request(request_id).await {
                     tracing::error!("Failed to delete pending request: {}", e);
                 }
-
-                // Log the action for audit
                 if let Err(e) = state.db.log_approval(request_id, &req.domain, action, &payload.user_name).await {
                     tracing::error!("Failed to log approval: {}", e);
                 }
-
                 if let Err(e) = state.mm.update_post(&req.post_id, &format!("`{}` approved by @{}", req.domain, payload.user_name)).await {
                     tracing::warn!(error = %e, "Failed to update Mattermost post");
                 }
@@ -713,7 +1377,6 @@ async fn handle_callback(
                 );
             }
             Err(e) => {
-                // OPNsense failed - don't mark as approved, keep the pending request
                 tracing::error!(
                     request_id = %request_id,
                     domain = %req.domain,
@@ -727,16 +1390,12 @@ async fn handle_callback(
             }
         }
     } else {
-        // For denials, delete the pending request first (no external dependency)
         if let Err(e) = state.db.delete_pending_request(request_id).await {
             tracing::error!("Failed to delete pending request: {}", e);
         }
-
-        // Log the action for audit
         if let Err(e) = state.db.log_approval(request_id, &req.domain, action, &payload.user_name).await {
             tracing::error!("Failed to log denial: {}", e);
         }
-
         if let Err(e) = state.mm.update_post(&req.post_id, &format!("`{}` denied by @{}", req.domain, payload.user_name)).await {
             tracing::warn!(error = %e, "Failed to update Mattermost post");
         }
@@ -753,7 +1412,6 @@ async fn handle_callback(
         );
     }
 
-    // Record callback processing latency
     let duration = start_time.elapsed();
     histogram!("callback_duration_seconds").record(duration.as_secs_f64());
 
@@ -762,3 +1420,4 @@ async fn handle_callback(
         update: Some(serde_json::json!({ "message": "" })),
     })
 }
+

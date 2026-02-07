@@ -13,6 +13,15 @@ fn shell_escape(s: &str) -> Cow<'_, str> {
     escape(Cow::Borrowed(s))
 }
 
+/// Validate a worktree name: only `[a-zA-Z0-9_.-]` allowed.
+/// Rejects absolute paths, `..` components, and path separators.
+fn is_safe_worktree_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '-')
+        && !name.contains("..")
+        && !name.starts_with('.')
+}
+
 /// Parsed GitHub repository reference
 #[derive(Debug, Clone)]
 pub struct RepoRef {
@@ -44,6 +53,10 @@ impl RepoRef {
             let worktree = if worktree_part.starts_with("--worktree=") {
                 let name = worktree_part.strip_prefix("--worktree=")?.trim();
                 if name.is_empty() {
+                    return None;
+                }
+                // Validate worktree name to prevent path traversal
+                if !is_safe_worktree_name(name) {
                     return None;
                 }
                 Some(WorktreeMode::Named(name.to_string()))
@@ -85,6 +98,30 @@ impl RepoRef {
         format!("{}/{}", self.org, self.repo)
     }
 
+    /// Parse with default org: if input has no `/` and default_org is set, prepend it
+    pub fn parse_with_default_org(input: &str, default_org: Option<&str>) -> Option<Self> {
+        // Try direct parse first
+        if let Some(r) = Self::parse(input) {
+            return Some(r);
+        }
+
+        // If no slash in the repo part and default_org is available, prepend it
+        if let Some(org) = default_org {
+            let trimmed = input.trim();
+            // Extract repo part (before flags like --worktree)
+            let repo_part = trimmed.split_whitespace().next().unwrap_or(trimmed);
+            let repo_part = repo_part.split('@').next().unwrap_or(repo_part);
+
+            if !repo_part.contains('/') && !repo_part.is_empty() {
+                // Reconstruct input with org prefix
+                let with_org = format!("{}/{}", org, trimmed);
+                return Self::parse(&with_org);
+            }
+        }
+
+        None
+    }
+
     /// Check if this looks like a GitHub repo reference (contains exactly one /)
     pub fn looks_like_repo(input: &str) -> bool {
         let input = input.split_whitespace().next().unwrap_or(input);
@@ -97,13 +134,13 @@ impl RepoRef {
 /// Manages GitHub repository cloning and worktree operations on the VM
 pub struct GitManager {
     /// Tracks which repos have active sessions (repo full_name -> session_id)
-    active_repos: DashMap<String, String>,
+    active_repos: std::sync::Arc<DashMap<String, String>>,
 }
 
 impl GitManager {
     pub fn new() -> Self {
         Self {
-            active_repos: DashMap::new(),
+            active_repos: std::sync::Arc::new(DashMap::new()),
         }
     }
 
@@ -230,18 +267,6 @@ impl GitManager {
         Ok(worktree_path)
     }
 
-    /// Check if the main clone of a repo has an active session
-    #[allow(dead_code)]
-    pub fn is_repo_in_use(&self, repo_ref: &RepoRef) -> Option<String> {
-        self.active_repos.get(&repo_ref.full_name()).map(|r| r.clone())
-    }
-
-    /// Mark a repo's main clone as in use by a session
-    #[allow(dead_code)]
-    pub fn mark_repo_in_use(&self, repo_ref: &RepoRef, session_id: &str) {
-        self.active_repos.insert(repo_ref.full_name(), session_id.to_string());
-    }
-
     /// Atomically try to acquire a repo for a session
     /// Returns true if acquired, false if already in use
     /// This prevents race conditions between is_repo_in_use and mark_repo_in_use
@@ -255,33 +280,30 @@ impl GitManager {
         }
     }
 
-    /// Release a repo's main clone
-    #[allow(dead_code)]
-    pub fn release_repo(&self, repo_ref: &RepoRef) {
-        self.active_repos.remove(&repo_ref.full_name());
-    }
-
     /// Release a repo by session ID (useful when we don't have the RepoRef)
     pub fn release_repo_by_session(&self, session_id: &str) {
         self.active_repos.retain(|_, v| v != session_id);
     }
 
-    /// Cleanup a worktree (optional - not called automatically)
-    #[allow(dead_code)]
-    pub async fn cleanup_worktree(&self, repo_ref: &RepoRef, worktree_path: &Path) -> Result<()> {
-        let repo_path = self.repo_path(repo_ref);
-        let repo_path_str = repo_path.to_string_lossy();
+    /// Cleanup a worktree by its path (best-effort, for session cleanup).
+    /// Uses `rm -rf` as fallback since we may not have the parent repo path.
+    pub async fn cleanup_worktree_by_path(&self, worktree_path: &Path) {
         let worktree_path_str = worktree_path.to_string_lossy();
 
-        // Remove worktree from git
+        // Try git worktree remove first, then fall back to rm -rf
         let remove_cmd = format!(
-            "git -C {} worktree remove {} --force",
-            shell_escape(&repo_path_str),
+            "rm -rf {}",
             shell_escape(&worktree_path_str)
         );
-        self.ssh_command(&remove_cmd).await?;
-
-        Ok(())
+        if let Err(e) = self.ssh_command(&remove_cmd).await {
+            tracing::warn!(
+                worktree = %worktree_path_str,
+                error = %e,
+                "Failed to cleanup worktree"
+            );
+        } else {
+            tracing::info!(worktree = %worktree_path_str, "Worktree cleaned up");
+        }
     }
 }
 
@@ -357,5 +379,70 @@ mod tests {
     fn test_full_name() {
         let ref_ = RepoRef::parse("myorg/myrepo@branch").unwrap();
         assert_eq!(ref_.full_name(), "myorg/myrepo");
+    }
+
+    #[test]
+    fn test_parse_with_default_org_no_slash() {
+        let ref_ = RepoRef::parse_with_default_org("session-manager", Some("jcttech")).unwrap();
+        assert_eq!(ref_.org, "jcttech");
+        assert_eq!(ref_.repo, "session-manager");
+        assert!(ref_.branch.is_none());
+    }
+
+    #[test]
+    fn test_parse_with_default_org_with_branch() {
+        let ref_ = RepoRef::parse_with_default_org("session-manager@main", Some("jcttech")).unwrap();
+        assert_eq!(ref_.org, "jcttech");
+        assert_eq!(ref_.repo, "session-manager");
+        assert_eq!(ref_.branch, Some("main".to_string()));
+    }
+
+    #[test]
+    fn test_parse_with_default_org_with_worktree() {
+        let ref_ = RepoRef::parse_with_default_org("session-manager --worktree", Some("jcttech")).unwrap();
+        assert_eq!(ref_.org, "jcttech");
+        assert_eq!(ref_.repo, "session-manager");
+        assert!(matches!(ref_.worktree, Some(WorktreeMode::Auto)));
+    }
+
+    #[test]
+    fn test_parse_with_default_org_explicit_org() {
+        // When input already has org/repo, default_org should be ignored
+        let ref_ = RepoRef::parse_with_default_org("other/repo", Some("jcttech")).unwrap();
+        assert_eq!(ref_.org, "other");
+        assert_eq!(ref_.repo, "repo");
+    }
+
+    #[test]
+    fn test_parse_with_default_org_no_default() {
+        // Without default_org, bare repo name should fail
+        assert!(RepoRef::parse_with_default_org("session-manager", None).is_none());
+    }
+
+    // --- Path traversal prevention tests (3c) ---
+
+    #[test]
+    fn test_safe_worktree_name() {
+        assert!(is_safe_worktree_name("my-feature"));
+        assert!(is_safe_worktree_name("fix_bug_123"));
+        assert!(is_safe_worktree_name("v1.2.3"));
+        assert!(is_safe_worktree_name("feature-branch-abc12345"));
+    }
+
+    #[test]
+    fn test_reject_path_traversal_worktree() {
+        assert!(!is_safe_worktree_name("../../etc/passwd"));
+        assert!(!is_safe_worktree_name("/etc/passwd"));
+        assert!(!is_safe_worktree_name(".."));
+        assert!(!is_safe_worktree_name("foo/bar"));
+        assert!(!is_safe_worktree_name(""));
+        assert!(!is_safe_worktree_name(".hidden"));
+    }
+
+    #[test]
+    fn test_parse_rejects_traversal_worktree() {
+        assert!(RepoRef::parse("org/repo --worktree=../../etc").is_none());
+        assert!(RepoRef::parse("org/repo --worktree=/tmp/evil").is_none());
+        assert!(RepoRef::parse("org/repo --worktree=.hidden").is_none());
     }
 }
