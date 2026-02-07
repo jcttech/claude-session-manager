@@ -185,14 +185,6 @@ impl Database {
             "Database connection pool initialized"
         );
 
-        // Drop old tables (clean redesign, no backward compat needed)
-        sqlx::query(&format!("DROP TABLE IF EXISTS {}.pending_requests", SCHEMA))
-            .execute(&pool)
-            .await?;
-        sqlx::query(&format!("DROP TABLE IF EXISTS {}.sessions", SCHEMA))
-            .execute(&pool)
-            .await?;
-
         create_schema(&pool, SCHEMA).await?;
 
         Ok(Self { pool })
