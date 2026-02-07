@@ -22,30 +22,5 @@ jobs:
         Dockerfile
         .dockerignore
         tests/**
+      enable-database-tests: true
     secrets: inherit
-
-  database-tests:
-    name: Database Tests
-    runs-on: ubuntu-latest
-    services:
-      postgres:
-        image: postgres:16
-        env:
-          POSTGRES_USER: test
-          POSTGRES_PASSWORD: test
-          POSTGRES_DB: session_manager_test
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U test"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Run database tests
-        env:
-          DATABASE_URL: postgres://test:test@localhost:5432/session_manager_test
-        run: cargo test --test database_tests -- --nocapture
