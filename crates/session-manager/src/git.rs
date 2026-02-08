@@ -207,7 +207,7 @@ impl GitManager {
             // Clone with GH_TOKEN for private repo support
             // Format: https://{token}@github.com/org/repo.git
             let clone_url = format!(
-                "https://\\$GH_TOKEN@github.com/{}/{}.git",
+                "https://$GH_TOKEN@github.com/{}/{}.git",
                 shell_escape(&repo_ref.org),
                 shell_escape(&repo_ref.repo)
             );
