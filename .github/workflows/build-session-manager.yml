@@ -15,7 +15,7 @@ jobs:
       packages: write
     with:
       tag-prefix: 'session-manager/'
-      image-name: 'session-manager'
+      image-name: 'claude-session-manager'
       dockerfile: 'Dockerfile.session-manager'
       code-paths: |
         crates/**

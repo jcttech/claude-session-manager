@@ -9,7 +9,7 @@ jobs:
   cleanup-session-manager:
     uses: jcttech/.github/.github/workflows/cleanup-docker.yml@v1
     with:
-      image-name: session-manager
+      image-name: claude-session-manager
     permissions:
       packages: write
     secrets: inherit
