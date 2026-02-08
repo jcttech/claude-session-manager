@@ -99,7 +99,7 @@ impl ContainerManager {
 
         // Start interactive session via podman exec
         let exec_container_cmd = format!(
-            "{} exec -i {} {}",
+            "stty -echo; {} exec -i {} {}",
             shell_escape(&s.container_runtime),
             shell_escape(&container_id),
             &s.claude_command  // claude_command is from config, trusted
@@ -252,7 +252,7 @@ impl ContainerManager {
 
         // Step 4: Re-exec with --continue
         let exec_cmd = format!(
-            "{} exec -i {} {} --continue",
+            "stty -echo; {} exec -i {} {} --continue",
             shell_escape(&s.container_runtime),
             shell_escape(&container_name),
             &s.claude_command,
