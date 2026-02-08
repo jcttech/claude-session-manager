@@ -1,11 +1,12 @@
 use axum::{
     body::Body,
+    extract::ConnectInfo,
     http::{Request, Response, StatusCode},
 };
 use dashmap::DashMap;
 use std::{
     future::Future,
-    net::IpAddr,
+    net::{IpAddr, SocketAddr},
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
@@ -141,6 +142,12 @@ fn extract_client_ip(req: &Request<Body>) -> Option<IpAddr> {
                 .get("x-real-ip")
                 .and_then(|h| h.to_str().ok())
                 .and_then(|v| v.trim().parse::<IpAddr>().ok())
+        })
+        .or_else(|| {
+            // Fall back to socket peer address via ConnectInfo
+            req.extensions()
+                .get::<ConnectInfo<SocketAddr>>()
+                .map(|ci| ci.0.ip())
         })
 }
 

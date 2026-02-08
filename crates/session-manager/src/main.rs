@@ -183,7 +183,7 @@ async fn main() -> Result<()> {
     let listen_addr = &config::settings().listen_addr;
     let listener = tokio::net::TcpListener::bind(listen_addr).await?;
     tracing::info!("Listening on {}", listen_addr);
-    axum::serve(listener, app)
+    axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>())
         .with_graceful_shutdown(shutdown_signal(cancel_token.clone()))
         .await?;
 
