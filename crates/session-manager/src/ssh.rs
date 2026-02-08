@@ -11,8 +11,12 @@ use crate::config::settings;
 /// Wrap a command to run in a login shell on the remote VM.
 /// Non-interactive SSH sessions get a minimal PATH; `bash -lc` sources
 /// the user's profile so tools like `devcontainer` are found.
+/// We also source `~/.bashrc` because `bash -lc` only reads
+/// `~/.bash_profile`, and PATH additions (e.g. devcontainer CLI)
+/// often live in `~/.bashrc`.
 pub fn login_shell(cmd: &str) -> String {
-    format!("bash -lc {}", escape(Cow::Borrowed(cmd)))
+    let inner = format!(". ~/.bashrc 2>/dev/null; {}", cmd);
+    format!("bash -lc {}", escape(Cow::Owned(inner)))
 }
 
 /// Path to the SSH key file (either from config or written from env var)
