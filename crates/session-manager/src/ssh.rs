@@ -9,14 +9,12 @@ use tokio::process::Command;
 use crate::config::settings;
 
 /// Wrap a command to run in a login shell on the remote VM.
-/// Non-interactive SSH sessions get a minimal PATH; `bash -lc` sources
-/// the user's profile so tools like `devcontainer` are found.
-/// We also source `~/.bashrc` because `bash -lc` only reads
-/// `~/.bash_profile`, and PATH additions (e.g. devcontainer CLI)
-/// often live in `~/.bashrc`.
+/// `bash -lc` sources ~/.bash_profile or ~/.profile, giving tools their
+/// full PATH.  Note: ~/.bashrc is NOT sourced—its standard non-interactive
+/// guard (`case $- in *i*)...`) causes early exit.  PATH exports for
+/// tools like `devcontainer` must live in ~/.profile on the VM.
 pub fn login_shell(cmd: &str) -> String {
-    let inner = format!(". ~/.bashrc 2>/dev/null; {}", cmd);
-    format!("bash -lc {}", escape(Cow::Owned(inner)))
+    format!("bash -lc {}", escape(Cow::Owned(cmd.to_string())))
 }
 
 /// Path to the SSH key file (either from config or written from env var)
