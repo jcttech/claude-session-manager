@@ -78,7 +78,7 @@ impl ContainerManager {
 
         let timeout = Duration::from_secs(s.devcontainer_timeout_secs);
         let output_future = ssh::command()?
-            .arg(&devcontainer_cmd)
+            .arg(ssh::login_shell(&devcontainer_cmd))
             .output();
         let output = tokio::time::timeout(timeout, output_future)
             .await
@@ -106,7 +106,7 @@ impl ContainerManager {
         );
 
         let mut child = match ssh::command_with_tty()?
-            .arg(&exec_container_cmd)
+            .arg(ssh::login_shell(&exec_container_cmd))
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -118,7 +118,7 @@ impl ContainerManager {
                 tracing::error!(container = %container_id, error = %e, "Failed to exec into container, removing orphan");
                 let rm_cmd = format!("{} rm -f {}", shell_escape(&s.container_runtime), shell_escape(&container_id));
                 let _ = ssh::command().map(|mut cmd| {
-                    cmd.arg(&rm_cmd);
+                    cmd.arg(ssh::login_shell(&rm_cmd));
                     tokio::spawn(async move { let _ = cmd.output().await; })
                 });
                 return Err(e.into());
@@ -220,7 +220,7 @@ impl ContainerManager {
 
         let timeout = Duration::from_secs(s.ssh_timeout_secs);
         let output_future = ssh::command()?
-            .arg(&rm_cmd)
+            .arg(ssh::login_shell(&rm_cmd))
             .output();
         tokio::time::timeout(timeout, output_future)
             .await
@@ -259,7 +259,7 @@ impl ContainerManager {
         );
 
         let mut child = ssh::command_with_tty()?
-            .arg(&exec_cmd)
+            .arg(ssh::login_shell(&exec_cmd))
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())

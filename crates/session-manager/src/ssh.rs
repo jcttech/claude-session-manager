@@ -1,10 +1,19 @@
 use anyhow::{anyhow, Result};
+use shell_escape::escape;
+use std::borrow::Cow;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::time::Duration;
 use tokio::process::Command;
 
 use crate::config::settings;
+
+/// Wrap a command to run in a login shell on the remote VM.
+/// Non-interactive SSH sessions get a minimal PATH; `bash -lc` sources
+/// the user's profile so tools like `devcontainer` are found.
+pub fn login_shell(cmd: &str) -> String {
+    format!("bash -lc {}", escape(Cow::Borrowed(cmd)))
+}
 
 /// Path to the SSH key file (either from config or written from env var)
 static SSH_KEY_PATH: OnceLock<PathBuf> = OnceLock::new();
@@ -81,7 +90,7 @@ pub async fn run_command(cmd: &str) -> Result<String> {
         .arg("-i")
         .arg(key_path)
         .arg(format!("{}@{}", &s.vm_user, &s.vm_host))
-        .arg(cmd)
+        .arg(login_shell(cmd))
         .output();
 
     let output = tokio::time::timeout(timeout, ssh_future)
