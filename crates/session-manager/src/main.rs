@@ -997,7 +997,7 @@ async fn handle_messages(state: Arc<AppState>, mut rx: mpsc::Receiver<Post>, can
     }
 }
 
-/// Flush accumulated output lines as a single Mattermost message wrapped in a code fence.
+/// Flush accumulated output lines as a single Mattermost message.
 async fn flush_batch(
     state: &AppState,
     channel_id: &str,
@@ -1010,7 +1010,7 @@ async fn flush_batch(
     }
     let content = batch.join("\n");
     batch.clear();
-    if let Err(e) = state.mm.post_in_thread(channel_id, thread_id, &format!("```\n{}\n```", content)).await {
+    if let Err(e) = state.mm.post_in_thread(channel_id, thread_id, &content).await {
         tracing::warn!(
             session_id = %session_id,
             error = %e,
@@ -1045,6 +1045,10 @@ async fn stream_output(
     let batch_timer = tokio::time::sleep(BATCH_TIMEOUT);
     tokio::pin!(batch_timer);
 
+    // Single status post that accumulates processing info and tool actions
+    let mut status_post_id: Option<String> = None;
+    let mut status_lines: Vec<String> = Vec::new();
+
     loop {
         tokio::select! {
             event_opt = rx.recv() => {
@@ -1056,8 +1060,14 @@ async fn stream_output(
 
                 match event {
                     OutputEvent::ProcessingStarted { input_tokens } => {
-                        let msg = format!("_Processing... (context: {} tokens)_", input_tokens);
-                        let _ = state.mm.post_in_thread(&channel_id, &thread_id, &msg).await;
+                        // Start a new status post (reset from previous turn)
+                        status_lines.clear();
+                        status_lines.push(format!("_Processing... (context: {} tokens)_", input_tokens));
+                        let msg = status_lines.join("\n");
+                        match state.mm.post_in_thread(&channel_id, &thread_id, &msg).await {
+                            Ok(post_id) => { status_post_id = Some(post_id); }
+                            Err(_) => { status_post_id = None; }
+                        }
                     }
                     OutputEvent::TextLine(line) => {
                         // Check for markers — flush batch before processing
@@ -1106,11 +1116,21 @@ async fn stream_output(
                         batch_timer.as_mut().reset(tokio::time::Instant::now() + BATCH_TIMEOUT);
                     }
                     OutputEvent::ToolAction(action) => {
-                        // Flush any accumulated text batch before posting tool action
+                        // Flush any accumulated text batch before updating status
                         flush_batch(&state, &channel_id, &thread_id, &session_id, &mut batch).await;
                         batch_bytes = 0;
-                        let msg = format!("> {}", action);
-                        let _ = state.mm.post_in_thread(&channel_id, &thread_id, &msg).await;
+                        // Append tool action to the status post
+                        status_lines.push(format!("> {}", action));
+                        let msg = status_lines.join("\n");
+                        if let Some(ref post_id) = status_post_id {
+                            let _ = state.mm.update_post(post_id, &msg).await;
+                        } else {
+                            // No status post yet — create one
+                            match state.mm.post_in_thread(&channel_id, &thread_id, &msg).await {
+                                Ok(post_id) => { status_post_id = Some(post_id); }
+                                Err(_) => {}
+                            }
+                        }
                     }
                     OutputEvent::TitleGenerated(title) => {
                         flush_batch(&state, &channel_id, &thread_id, &session_id, &mut batch).await;
@@ -1121,10 +1141,10 @@ async fn stream_output(
                         let _ = state.mm.post_in_thread(&channel_id, &thread_id, "Title updated.").await;
                     }
                     OutputEvent::ResponseComplete { input_tokens, output_tokens } => {
+                        // Append token footer inline with the last message
+                        batch.push(format!("\n---\n`tokens: {} in / {} out`", input_tokens, output_tokens));
                         flush_batch(&state, &channel_id, &thread_id, &session_id, &mut batch).await;
                         batch_bytes = 0;
-                        let msg = format!("_Tokens: {} in / {} out_", input_tokens, output_tokens);
-                        let _ = state.mm.post_in_thread(&channel_id, &thread_id, &msg).await;
                         counter!("tokens_input_total").increment(input_tokens);
                         counter!("tokens_output_total").increment(output_tokens);
                     }
@@ -1514,6 +1534,10 @@ async fn stream_output_worker(
     let batch_timer = tokio::time::sleep(BATCH_TIMEOUT);
     tokio::pin!(batch_timer);
 
+    // Single status post that accumulates processing info and tool actions
+    let mut status_post_id: Option<String> = None;
+    let mut status_lines: Vec<String> = Vec::new();
+
     loop {
         tokio::select! {
             event_opt = rx.recv() => {
@@ -1524,8 +1548,13 @@ async fn stream_output_worker(
 
                 match event {
                     OutputEvent::ProcessingStarted { input_tokens } => {
-                        let msg = format!("_Processing... (context: {} tokens)_", input_tokens);
-                        let _ = state.mm.post_in_thread(&channel_id, &thread_id, &msg).await;
+                        status_lines.clear();
+                        status_lines.push(format!("_Processing... (context: {} tokens)_", input_tokens));
+                        let msg = status_lines.join("\n");
+                        match state.mm.post_in_thread(&channel_id, &thread_id, &msg).await {
+                            Ok(post_id) => { status_post_id = Some(post_id); }
+                            Err(_) => { status_post_id = None; }
+                        }
                     }
                     OutputEvent::TextLine(line) => {
                         // Check for network request markers — flush batch first
@@ -1551,17 +1580,25 @@ async fn stream_output_worker(
                     OutputEvent::ToolAction(action) => {
                         flush_batch(&state, &channel_id, &thread_id, &session_id, &mut batch).await;
                         batch_bytes = 0;
-                        let msg = format!("> {}", action);
-                        let _ = state.mm.post_in_thread(&channel_id, &thread_id, &msg).await;
+                        status_lines.push(format!("> {}", action));
+                        let msg = status_lines.join("\n");
+                        if let Some(ref post_id) = status_post_id {
+                            let _ = state.mm.update_post(post_id, &msg).await;
+                        } else {
+                            match state.mm.post_in_thread(&channel_id, &thread_id, &msg).await {
+                                Ok(post_id) => { status_post_id = Some(post_id); }
+                                Err(_) => {}
+                            }
+                        }
                     }
                     OutputEvent::TitleGenerated(_) => {
                         // Worker sessions don't support title generation
                     }
                     OutputEvent::ResponseComplete { input_tokens, output_tokens } => {
+                        // Append token footer inline with the last message
+                        batch.push(format!("\n---\n`tokens: {} in / {} out`", input_tokens, output_tokens));
                         flush_batch(&state, &channel_id, &thread_id, &session_id, &mut batch).await;
                         batch_bytes = 0;
-                        let msg = format!("_Tokens: {} in / {} out_", input_tokens, output_tokens);
-                        let _ = state.mm.post_in_thread(&channel_id, &thread_id, &msg).await;
                         counter!("tokens_input_total").increment(input_tokens);
                         counter!("tokens_output_total").increment(output_tokens);
                     }

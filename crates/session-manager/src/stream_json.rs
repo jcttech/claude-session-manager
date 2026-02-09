@@ -118,6 +118,24 @@ pub fn format_tool_action(name: &str, input: &serde_json::Value) -> String {
             let desc = input.get("description").and_then(|v| v.as_str()).unwrap_or("subagent");
             format!("**Task** _{}_", desc)
         }
+        "Skill" => {
+            let skill = input.get("skill").and_then(|v| v.as_str()).unwrap_or("?");
+            let args = input.get("args").and_then(|v| v.as_str());
+            match args {
+                Some(a) => format!("**Skill** `/{} {}`", skill, a),
+                None => format!("**Skill** `/{}`", skill),
+            }
+        }
+        "EnterPlanMode" => {
+            "**EnterPlanMode**".to_string()
+        }
+        "NotebookEdit" => {
+            let path = input.get("notebook_path").and_then(|v| v.as_str()).unwrap_or("?");
+            format!("**NotebookEdit** `{}`", path)
+        }
+        "AskUserQuestion" => {
+            "**AskUserQuestion**".to_string()
+        }
         _ => {
             // For MCP tools and others, just show the name
             if name.starts_with("mcp__") {
