@@ -2141,6 +2141,7 @@ dependencies = [
  "common",
  "config",
  "dashmap",
+ "dotenvy",
  "mattermost-client",
  "metrics",
  "metrics-exporter-prometheus",
