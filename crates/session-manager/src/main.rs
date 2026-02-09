@@ -9,6 +9,7 @@ use metrics_exporter_prometheus::PrometheusBuilder;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -16,6 +17,7 @@ use uuid::Uuid;
 use mattermost_client::{sanitize_channel_name, Mattermost, Post};
 use session_manager::config;
 use session_manager::container::ContainerManager;
+use session_manager::stream_json::OutputEvent;
 use session_manager::crypto::{sign_request, verify_signature};
 use session_manager::database::{self, Database};
 use session_manager::git::{GitManager, RepoRef};
@@ -119,9 +121,6 @@ async fn main() -> Result<()> {
     let git = GitManager::new();
     let db = Database::new().await?;
 
-    // NOTE: Tables are dropped on startup (pre-production). No recovery needed.
-    // TODO: Add migration-based persistence for production.
-
     let state = Arc::new(AppState {
         mm,
         containers,
@@ -129,6 +128,51 @@ async fn main() -> Result<()> {
         opnsense,
         db,
     });
+
+    // Reconnect any sessions that survived a restart
+    match state.db.get_all_sessions().await {
+        Ok(sessions) if !sessions.is_empty() => {
+            tracing::info!(count = sessions.len(), "Reconnecting surviving sessions");
+            for session in sessions {
+                if session.project_path.is_empty() {
+                    tracing::warn!(
+                        session_id = %session.session_id,
+                        "Skipping reconnect: no project_path stored (pre-migration session)"
+                    );
+                    continue;
+                }
+                let (output_tx, output_rx) = mpsc::channel::<OutputEvent>(100);
+                state.containers.reconnect(
+                    &session.session_id,
+                    &session.container_name,
+                    &session.project_path,
+                    output_tx,
+                );
+
+                let state_clone = state.clone();
+                let channel_id = session.channel_id.clone();
+                let thread_id = session.thread_id.clone();
+                let session_id = session.session_id.clone();
+                let session_type = session.session_type.clone();
+                let parent_session_id = session.parent_session_id.clone();
+                tokio::spawn(async move {
+                    stream_output(
+                        state_clone,
+                        channel_id,
+                        thread_id,
+                        session_id,
+                        session_type,
+                        parent_session_id,
+                        output_rx,
+                    ).await;
+                });
+            }
+        }
+        Ok(_) => {}
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to query sessions for reconnection");
+        }
+    }
 
     // Create cancellation token for graceful shutdown of background tasks
     let cancel_token = CancellationToken::new();
@@ -365,6 +409,7 @@ async fn start_session(
     repo_ref: &RepoRef,
     session_type: &str,
     parent_session_id: Option<&str>,
+    plan_mode: bool,
 ) -> Result<String> {
     use std::path::PathBuf;
 
@@ -414,8 +459,8 @@ async fn start_session(
     let _ = state.mm.post_in_thread(channel_id, &thread_id, "Starting session...").await;
     let session_start_time = std::time::Instant::now();
 
-    let (output_tx, output_rx) = mpsc::channel::<String>(100);
-    match state.containers.start(&session_id, &project_path, output_tx).await {
+    let (output_tx, output_rx) = mpsc::channel::<OutputEvent>(100);
+    match state.containers.start(&session_id, &project_path, output_tx, plan_mode).await {
         Ok(name) => {
             let session_duration = session_start_time.elapsed();
             histogram!("session_start_duration_seconds").record(session_duration.as_secs_f64());
@@ -432,6 +477,7 @@ async fn start_session(
                 channel_id,
                 &thread_id,
                 project_input,
+                &project_path,
                 &name,
                 session_type,
                 parent_session_id,
@@ -594,30 +640,33 @@ async fn handle_messages(state: Arc<AppState>, mut rx: mpsc::Receiver<Post>, can
                     if cmd == "restart" {
                         let _ = state.mm.post_in_thread(channel_id, root_id, "Restarting session...").await;
                         match state.containers.restart_session(&session.session_id).await {
-                            Ok(new_rx) => {
-                                let state_clone = state.clone();
-                                let channel_id_clone = channel_id.to_string();
-                                let root_id_clone = root_id.to_string();
-                                let session_id_clone = session.session_id.clone();
-                                let session_type_clone = session.session_type.clone();
-                                let parent_id_clone = session.parent_session_id.clone();
-                                tokio::spawn(async move {
-                                    stream_output(
-                                        state_clone,
-                                        channel_id_clone,
-                                        root_id_clone,
-                                        session_id_clone,
-                                        session_type_clone,
-                                        parent_id_clone,
-                                        new_rx,
-                                    ).await;
-                                });
-                                let _ = state.mm.post_in_thread(channel_id, root_id, "Restarted with previous context.").await;
+                            Ok(()) => {
+                                let _ = state.mm.post_in_thread(channel_id, root_id, "Restarted. Next message starts a fresh conversation.").await;
                             }
                             Err(e) => {
                                 let _ = state.mm.post_in_thread(channel_id, root_id, &format!("Restart failed: {e}")).await;
                             }
                         }
+                        continue;
+                    }
+                    if cmd == "plan" || cmd.starts_with("plan ") {
+                        let arg = cmd.strip_prefix("plan").unwrap().trim();
+                        let new_state = match arg {
+                            "on" => true,
+                            "off" => false,
+                            "" => !state.containers.get_plan_mode(&session.session_id),
+                            _ => {
+                                let _ = state.mm.post_in_thread(channel_id, root_id, "Usage: `@claude plan` (toggle), `@claude plan on`, `@claude plan off`").await;
+                                continue;
+                            }
+                        };
+                        state.containers.set_plan_mode(&session.session_id, new_state);
+                        let msg = if new_state {
+                            "Plan mode **enabled**. Claude will analyze but not modify files."
+                        } else {
+                            "Plan mode **disabled**. Claude can modify files."
+                        };
+                        let _ = state.mm.post_in_thread(channel_id, root_id, msg).await;
                         continue;
                     }
                     if cmd == "context" {
@@ -639,6 +688,11 @@ async fn handle_messages(state: Arc<AppState>, mut rx: mpsc::Receiver<Post>, can
                     }
                 }
                 // Forward message to session
+                tracing::info!(
+                    session_id = %session.session_id,
+                    text_len = text.len(),
+                    "Forwarding thread message to session"
+                );
                 if let Err(e) = state.containers.send(&session.session_id, text).await {
                     tracing::warn!(
                         session_id = %session.session_id,
@@ -679,12 +733,20 @@ async fn handle_messages(state: Arc<AppState>, mut rx: mpsc::Receiver<Post>, can
             if text.starts_with(bot_trigger) {
                 let cmd_text = text.trim_start_matches(bot_trigger).trim();
 
-                // --- start <project> ---
+                // --- start <project> [--plan] ---
                 if let Some(project_input) = cmd_text.strip_prefix("start ").map(|s| s.trim()) {
                     if project_input.is_empty() {
                         let _ = state.mm.post(channel_id, "Usage: `@claude start <org/repo>` or `@claude start <repo>`").await;
                         continue;
                     }
+
+                    // Parse --plan flag from input
+                    let plan_mode = project_input.split_whitespace().any(|w| w == "--plan");
+                    let project_input_clean = project_input.split_whitespace()
+                        .filter(|w| *w != "--plan")
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    let project_input = project_input_clean.as_str();
 
                     let s = config::settings();
 
@@ -704,6 +766,7 @@ async fn handle_messages(state: Arc<AppState>, mut rx: mpsc::Receiver<Post>, can
                                     &repo_ref,
                                     "standard",
                                     None,
+                                    plan_mode,
                                 ).await {
                                     Ok(session_id) => {
                                         let _ = state.mm.post(channel_id, &format!(
@@ -758,6 +821,7 @@ async fn handle_messages(state: Arc<AppState>, mut rx: mpsc::Receiver<Post>, can
                                 &repo_ref,
                                 "orchestrator",
                                 None,
+                                false,
                             ).await {
                                 Ok(session_id) => {
                                     let _ = state.mm.post(channel_id, &format!(
@@ -845,6 +909,7 @@ async fn handle_messages(state: Arc<AppState>, mut rx: mpsc::Receiver<Post>, can
                         "**Commands:**\n\
                         - `{trigger} start <org/repo>` — Start a standard session\n\
                         - `{trigger} start <repo> --worktree` — Start with isolated worktree\n\
+                        - `{trigger} start <repo> --plan` — Start in plan mode (read-only analysis)\n\
                         - `{trigger} orchestrate <org/repo>` — Start an orchestrator session\n\
                         - `{trigger} stop <id-prefix>` — Stop a session by ID prefix\n\
                         - `{trigger} status` — List all active sessions\n\
@@ -855,7 +920,8 @@ async fn handle_messages(state: Arc<AppState>, mut rx: mpsc::Receiver<Post>, can
                         - `{trigger} stop` — End the session\n\
                         - `{trigger} compact` — Compact/summarize context\n\
                         - `{trigger} clear` — Clear conversation history\n\
-                        - `{trigger} restart` — Kill & restart Claude (preserves context via --continue)\n\
+                        - `{trigger} restart` — Restart Claude conversation\n\
+                        - `{trigger} plan` — Toggle plan mode (read-only analysis)\n\
                         - `{trigger} context` — Show context health",
                         trigger = bot_trigger,
                     )).await;
@@ -898,6 +964,35 @@ async fn handle_messages(state: Arc<AppState>, mut rx: mpsc::Receiver<Post>, can
     }
 }
 
+/// Flush accumulated output lines as a single Mattermost message wrapped in a code fence.
+async fn flush_batch(
+    state: &AppState,
+    channel_id: &str,
+    thread_id: &str,
+    session_id: &str,
+    batch: &mut Vec<String>,
+) {
+    if batch.is_empty() {
+        return;
+    }
+    let content = batch.join("\n");
+    batch.clear();
+    if let Err(e) = state.mm.post_in_thread(channel_id, thread_id, &format!("```\n{}\n```", content)).await {
+        tracing::warn!(
+            session_id = %session_id,
+            error = %e,
+            "Failed to post batched output to Mattermost"
+        );
+    }
+}
+
+/// Maximum batch size in bytes before flushing (14KB safety margin under Mattermost's 16KB limit)
+const BATCH_MAX_BYTES: usize = 14 * 1024;
+/// Maximum number of lines before flushing
+const BATCH_MAX_LINES: usize = 80;
+/// Batch timeout before flushing accumulated output
+const BATCH_TIMEOUT: Duration = Duration::from_millis(200);
+
 async fn stream_output(
     state: Arc<AppState>,
     channel_id: String,
@@ -905,49 +1000,100 @@ async fn stream_output(
     session_id: String,
     session_type: String,
     parent_session_id: Option<String>,
-    mut rx: mpsc::Receiver<String>,
+    mut rx: mpsc::Receiver<OutputEvent>,
 ) {
     let network_re = network_request_regex();
     let is_orchestrator = session_type == "orchestrator";
 
-    while let Some(line) = rx.recv().await {
-        // Network request handling (all session types)
-        if let Some(caps) = network_re.captures(&line) {
-            let domain = caps[1].trim();
-            handle_network_request(&state, &channel_id, &thread_id, &session_id, domain).await;
-            continue;
-        }
+    let mut batch: Vec<String> = Vec::new();
+    let mut batch_bytes: usize = 0;
+    let batch_timer = tokio::time::sleep(BATCH_TIMEOUT);
+    tokio::pin!(batch_timer);
 
-        // Orchestrator-specific markers
-        if is_orchestrator {
-            if let Some(caps) = create_session_regex().captures(&line) {
-                let marker_input = caps[1].trim();
-                handle_orchestrator_create_session(&state, &channel_id, &session_id, marker_input, "worker").await;
-                continue;
-            }
-            if let Some(caps) = create_reviewer_regex().captures(&line) {
-                let marker_input = caps[1].trim();
-                handle_orchestrator_create_reviewer(&state, &channel_id, &session_id, marker_input).await;
-                continue;
-            }
-            if session_status_regex().is_match(&line) {
-                handle_orchestrator_status(&state, &session_id).await;
-                continue;
-            }
-            if let Some(caps) = stop_session_regex().captures(&line) {
-                let short_id = caps[1].trim();
-                handle_orchestrator_stop(&state, &session_id, short_id).await;
-                continue;
-            }
-        }
+    loop {
+        tokio::select! {
+            event_opt = rx.recv() => {
+                let Some(event) = event_opt else {
+                    // Channel closed — flush remaining batch and exit
+                    flush_batch(&state, &channel_id, &thread_id, &session_id, &mut batch).await;
+                    break;
+                };
 
-        // Regular output: post in thread
-        if let Err(e) = state.mm.post_in_thread(&channel_id, &thread_id, &format!("```\n{}\n```", line)).await {
-            tracing::warn!(
-                session_id = %session_id,
-                error = %e,
-                "Failed to post output to Mattermost"
-            );
+                match event {
+                    OutputEvent::ProcessingStarted { input_tokens } => {
+                        let msg = format!("_Processing... (context: {} tokens)_", input_tokens);
+                        let _ = state.mm.post_in_thread(&channel_id, &thread_id, &msg).await;
+                    }
+                    OutputEvent::TextLine(line) => {
+                        // Check for markers — flush batch before processing
+                        if let Some(caps) = network_re.captures(&line) {
+                            flush_batch(&state, &channel_id, &thread_id, &session_id, &mut batch).await;
+                            batch_bytes = 0;
+                            let domain = caps[1].trim();
+                            handle_network_request(&state, &channel_id, &thread_id, &session_id, domain).await;
+                            continue;
+                        }
+
+                        if is_orchestrator {
+                            let is_marker = create_session_regex().is_match(&line)
+                                || create_reviewer_regex().is_match(&line)
+                                || session_status_regex().is_match(&line)
+                                || stop_session_regex().is_match(&line);
+
+                            if is_marker {
+                                flush_batch(&state, &channel_id, &thread_id, &session_id, &mut batch).await;
+                                batch_bytes = 0;
+
+                                if let Some(caps) = create_session_regex().captures(&line) {
+                                    handle_orchestrator_create_session(&state, &channel_id, &session_id, caps[1].trim(), "worker").await;
+                                } else if let Some(caps) = create_reviewer_regex().captures(&line) {
+                                    handle_orchestrator_create_reviewer(&state, &channel_id, &session_id, caps[1].trim()).await;
+                                } else if session_status_regex().is_match(&line) {
+                                    handle_orchestrator_status(&state, &session_id).await;
+                                } else if let Some(caps) = stop_session_regex().captures(&line) {
+                                    handle_orchestrator_stop(&state, &session_id, caps[1].trim()).await;
+                                }
+                                continue;
+                            }
+                        }
+
+                        // Accumulate line into batch
+                        batch_bytes += line.len() + 1; // +1 for newline separator
+                        batch.push(line);
+
+                        // Flush if batch exceeds size or line limits
+                        if batch_bytes >= BATCH_MAX_BYTES || batch.len() >= BATCH_MAX_LINES {
+                            flush_batch(&state, &channel_id, &thread_id, &session_id, &mut batch).await;
+                            batch_bytes = 0;
+                        }
+
+                        // Reset timer on each new line
+                        batch_timer.as_mut().reset(tokio::time::Instant::now() + BATCH_TIMEOUT);
+                    }
+                    OutputEvent::ToolAction(action) => {
+                        // Flush any accumulated text batch before posting tool action
+                        flush_batch(&state, &channel_id, &thread_id, &session_id, &mut batch).await;
+                        batch_bytes = 0;
+                        let msg = format!("> {}", action);
+                        let _ = state.mm.post_in_thread(&channel_id, &thread_id, &msg).await;
+                    }
+                    OutputEvent::ResponseComplete { input_tokens, output_tokens } => {
+                        flush_batch(&state, &channel_id, &thread_id, &session_id, &mut batch).await;
+                        batch_bytes = 0;
+                        let msg = format!("_Tokens: {} in / {} out_", input_tokens, output_tokens);
+                        let _ = state.mm.post_in_thread(&channel_id, &thread_id, &msg).await;
+                        counter!("tokens_input_total").increment(input_tokens);
+                        counter!("tokens_output_total").increment(output_tokens);
+                    }
+                }
+            }
+            _ = &mut batch_timer => {
+                // Timer expired — flush accumulated batch
+                flush_batch(&state, &channel_id, &thread_id, &session_id, &mut batch).await;
+                batch_bytes = 0;
+                // Reset timer far into the future (only re-armed when lines arrive)
+                batch_timer.as_mut().reset(tokio::time::Instant::now() + Duration::from_secs(86400));
+            }
         }
     }
 
@@ -1182,8 +1328,8 @@ async fn handle_orchestrator_create_session(
         }
     };
 
-    let (output_tx, output_rx) = mpsc::channel::<String>(100);
-    match state.containers.start(&session_id, &project_path, output_tx).await {
+    let (output_tx, output_rx) = mpsc::channel::<OutputEvent>(100);
+    match state.containers.start(&session_id, &project_path, output_tx, false).await {
         Ok(name) => {
             counter!("sessions_started_total").increment(1);
             gauge!("active_sessions").increment(1.0);
@@ -1194,6 +1340,7 @@ async fn handle_orchestrator_create_session(
                 &channel_id,
                 &thread_id,
                 &worker_input,
+                &project_path,
                 &name,
                 session_type,
                 Some(parent_session_id),
@@ -1315,20 +1462,70 @@ async fn stream_output_worker(
     thread_id: String,
     session_id: String,
     parent_session_id: String,
-    mut rx: mpsc::Receiver<String>,
+    mut rx: mpsc::Receiver<OutputEvent>,
 ) {
     let network_re = network_request_regex();
 
-    while let Some(line) = rx.recv().await {
-        // Handle network requests with proper approval cards (fix 2c)
-        if let Some(caps) = network_re.captures(&line) {
-            let domain = caps[1].trim();
-            handle_network_request(&state, &channel_id, &thread_id, &session_id, domain).await;
-            continue;
-        }
+    let mut batch: Vec<String> = Vec::new();
+    let mut batch_bytes: usize = 0;
+    let batch_timer = tokio::time::sleep(BATCH_TIMEOUT);
+    tokio::pin!(batch_timer);
 
-        if let Err(e) = state.mm.post_in_thread(&channel_id, &thread_id, &format!("```\n{}\n```", line)).await {
-            tracing::warn!(session_id = %session_id, error = %e, "Failed to post output");
+    loop {
+        tokio::select! {
+            event_opt = rx.recv() => {
+                let Some(event) = event_opt else {
+                    flush_batch(&state, &channel_id, &thread_id, &session_id, &mut batch).await;
+                    break;
+                };
+
+                match event {
+                    OutputEvent::ProcessingStarted { input_tokens } => {
+                        let msg = format!("_Processing... (context: {} tokens)_", input_tokens);
+                        let _ = state.mm.post_in_thread(&channel_id, &thread_id, &msg).await;
+                    }
+                    OutputEvent::TextLine(line) => {
+                        // Check for network request markers — flush batch first
+                        if let Some(caps) = network_re.captures(&line) {
+                            flush_batch(&state, &channel_id, &thread_id, &session_id, &mut batch).await;
+                            batch_bytes = 0;
+                            let domain = caps[1].trim();
+                            handle_network_request(&state, &channel_id, &thread_id, &session_id, domain).await;
+                            continue;
+                        }
+
+                        // Accumulate line into batch
+                        batch_bytes += line.len() + 1;
+                        batch.push(line);
+
+                        if batch_bytes >= BATCH_MAX_BYTES || batch.len() >= BATCH_MAX_LINES {
+                            flush_batch(&state, &channel_id, &thread_id, &session_id, &mut batch).await;
+                            batch_bytes = 0;
+                        }
+
+                        batch_timer.as_mut().reset(tokio::time::Instant::now() + BATCH_TIMEOUT);
+                    }
+                    OutputEvent::ToolAction(action) => {
+                        flush_batch(&state, &channel_id, &thread_id, &session_id, &mut batch).await;
+                        batch_bytes = 0;
+                        let msg = format!("> {}", action);
+                        let _ = state.mm.post_in_thread(&channel_id, &thread_id, &msg).await;
+                    }
+                    OutputEvent::ResponseComplete { input_tokens, output_tokens } => {
+                        flush_batch(&state, &channel_id, &thread_id, &session_id, &mut batch).await;
+                        batch_bytes = 0;
+                        let msg = format!("_Tokens: {} in / {} out_", input_tokens, output_tokens);
+                        let _ = state.mm.post_in_thread(&channel_id, &thread_id, &msg).await;
+                        counter!("tokens_input_total").increment(input_tokens);
+                        counter!("tokens_output_total").increment(output_tokens);
+                    }
+                }
+            }
+            _ = &mut batch_timer => {
+                flush_batch(&state, &channel_id, &thread_id, &session_id, &mut batch).await;
+                batch_bytes = 0;
+                batch_timer.as_mut().reset(tokio::time::Instant::now() + Duration::from_secs(86400));
+            }
         }
     }
 

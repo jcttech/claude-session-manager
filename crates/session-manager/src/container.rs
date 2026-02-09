@@ -2,8 +2,8 @@ use anyhow::{anyhow, Result};
 use dashmap::DashMap;
 use shell_escape::escape;
 use std::borrow::Cow;
-use std::collections::VecDeque;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -12,6 +12,7 @@ use tokio::sync::mpsc;
 use crate::config::settings;
 use crate::devcontainer;
 use crate::ssh;
+use crate::stream_json::{ContentPart, LineBuffer, OutputEvent, StreamLine, format_tool_action};
 
 /// Escape a string for safe use in shell commands
 fn shell_escape(s: &str) -> Cow<'_, str> {
@@ -31,11 +32,15 @@ pub struct ClaimedSession {
 
 struct Session {
     name: String,
-    stdin_tx: mpsc::Sender<String>,
+    message_tx: mpsc::Sender<String>,
     /// Path to worktree if session is using one (for cleanup)
     worktree_path: Option<PathBuf>,
-    /// Workspace folder path for devcontainer exec
-    project_path: String,
+    /// true → first message (no --resume); false → subsequent (--resume)
+    is_first_message: Arc<AtomicBool>,
+    /// Claude Code session ID captured from first invocation's init event
+    claude_session_id: Arc<Mutex<Option<String>>>,
+    /// Whether plan mode is enabled for this session
+    plan_mode: Arc<AtomicBool>,
 }
 
 impl Default for ContainerManager {
@@ -55,7 +60,8 @@ impl ContainerManager {
         &self,
         session_id: &str,
         project_path: &str,
-        output_tx: mpsc::Sender<String>,
+        output_tx: mpsc::Sender<OutputEvent>,
+        plan_mode: bool,
     ) -> Result<String> {
         let s = settings();
 
@@ -101,122 +107,104 @@ impl ContainerManager {
             .ok_or_else(|| anyhow!("No containerId in devcontainer output"))?
             .to_string();
 
-        // Start interactive session via devcontainer exec (honors remoteUser, remoteEnv, etc.)
-        // No PTY (-tt) — eliminates stdin echo at source
-        let exec_container_cmd = format!(
-            "devcontainer exec --workspace-folder {} --docker-path {} {}",
-            escaped_project_path,
-            shell_escape(&s.container_runtime),
-            &s.claude_command,  // claude_command is from config, trusted
-        );
+        // Set up message channel for per-message processing
+        let (message_tx, message_rx) = mpsc::channel::<String>(32);
+        let is_first_message = Arc::new(AtomicBool::new(true));
+        let claude_session_id = Arc::new(Mutex::new(None));
+        let plan_mode_flag = Arc::new(AtomicBool::new(plan_mode));
 
-        let mut child = match ssh::command()?
-            .arg(ssh::login_shell(&exec_container_cmd))
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-        {
-            Ok(child) => child,
-            Err(e) => {
-                // Container is running but exec failed — clean it up
-                tracing::error!(container = %container_id, error = %e, "Failed to exec into container, removing orphan");
-                let rm_cmd = format!("{} rm -f {}", shell_escape(&s.container_runtime), shell_escape(&container_id));
-                let _ = ssh::command().map(|mut cmd| {
-                    cmd.arg(ssh::login_shell(&rm_cmd));
-                    tokio::spawn(async move { let _ = cmd.output().await; })
-                });
-                return Err(e.into());
-            }
-        };
-
-        let stdin = child.stdin.take().expect("Failed to get stdin");
-        let stdout = child.stdout.take().expect("Failed to get stdout");
-        let stderr = child.stderr.take().expect("Failed to get stderr");
-
-        let (stdin_tx, mut stdin_rx) = mpsc::channel::<String>(32);
-
-        // Echo filter: safety net in case any echo leaks through
-        let echo_filter: Arc<Mutex<VecDeque<String>>> = Arc::new(Mutex::new(VecDeque::new()));
-
-        // Stdin writer task — records sent lines for echo filtering
-        let mut stdin = stdin;
-        let echo_filter_write = Arc::clone(&echo_filter);
+        // Spawn message processor task
+        let project_path_owned = project_path.to_string();
+        let session_id_owned = session_id.to_string();
+        let is_first_clone = Arc::clone(&is_first_message);
+        let claude_sid_clone = Arc::clone(&claude_session_id);
+        let plan_mode_clone = Arc::clone(&plan_mode_flag);
         tokio::spawn(async move {
-            while let Some(text) = stdin_rx.recv().await {
-                // Record what we send so stdout reader can filter echoes
-                {
-                    let mut pending = echo_filter_write.lock().unwrap();
-                    pending.push_back(text.clone());
-                    // Cap at 100 to bound memory
-                    while pending.len() > 100 {
-                        pending.pop_front();
-                    }
-                }
-                if let Err(e) = stdin.write_all(text.as_bytes()).await {
-                    tracing::warn!(error = %e, "Failed to write to container stdin");
-                    break;
-                }
-                if let Err(e) = stdin.write_all(b"\n").await {
-                    tracing::warn!(error = %e, "Failed to write newline to container stdin");
-                    break;
-                }
-                if let Err(e) = stdin.flush().await {
-                    tracing::warn!(error = %e, "Failed to flush container stdin");
-                    break;
-                }
-            }
-        });
-
-        // Stderr drain task (prevents pipe deadlock)
-        let session_id_for_stderr = session_id.to_string();
-        tokio::spawn(async move {
-            let reader = BufReader::new(stderr);
-            let mut lines = reader.lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                tracing::debug!(session_id = %session_id_for_stderr, stderr = %line, "Container stderr");
-            }
-        });
-
-        // Stdout reader task + child reaper (prevents zombie)
-        // Filters echoed stdin lines before forwarding output
-        let reader = BufReader::new(stdout);
-        let echo_filter_read = Arc::clone(&echo_filter);
-        tokio::spawn(async move {
-            let mut lines = reader.lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                // Check if this line is an echo of something we sent
-                {
-                    let mut pending = echo_filter_read.lock().unwrap();
-                    if let Some(pos) = pending.iter().position(|s| s == &line) {
-                        pending.remove(pos);
-                        continue; // Drop echoed line
-                    }
-                }
-                if output_tx.send(line).await.is_err() {
-                    break;
-                }
-            }
-            // After stdout closes, wait for child to prevent zombie process
-            let _ = child.wait().await;
+            message_processor(
+                message_rx,
+                output_tx,
+                project_path_owned,
+                session_id_owned,
+                is_first_clone,
+                claude_sid_clone,
+                plan_mode_clone,
+            ).await;
         });
 
         self.sessions.insert(
             session_id.to_string(),
             Session {
                 name: container_id.clone(),
-                stdin_tx,
+                message_tx,
                 worktree_path: None,
-                project_path: project_path.to_string(),
+                is_first_message,
+                claude_session_id,
+                plan_mode: plan_mode_flag,
             },
         );
 
         Ok(container_id)
     }
 
+    /// Reconnect to an existing session after a restart.
+    /// Creates in-memory state (channels, message_processor) without running `devcontainer up`.
+    /// The container must already be running.
+    pub fn reconnect(
+        &self,
+        session_id: &str,
+        container_name: &str,
+        project_path: &str,
+        output_tx: mpsc::Sender<OutputEvent>,
+    ) {
+        let (message_tx, message_rx) = mpsc::channel::<String>(32);
+        let is_first_message = Arc::new(AtomicBool::new(true));
+        let claude_session_id = Arc::new(Mutex::new(None));
+        let plan_mode_flag = Arc::new(AtomicBool::new(false));
+
+        let project_path_owned = project_path.to_string();
+        let session_id_owned = session_id.to_string();
+        let is_first_clone = Arc::clone(&is_first_message);
+        let claude_sid_clone = Arc::clone(&claude_session_id);
+        let plan_mode_clone = Arc::clone(&plan_mode_flag);
+        tokio::spawn(async move {
+            message_processor(
+                message_rx,
+                output_tx,
+                project_path_owned,
+                session_id_owned,
+                is_first_clone,
+                claude_sid_clone,
+                plan_mode_clone,
+            ).await;
+        });
+
+        self.sessions.insert(
+            session_id.to_string(),
+            Session {
+                name: container_name.to_string(),
+                message_tx,
+                worktree_path: None,
+                is_first_message,
+                claude_session_id,
+                plan_mode: plan_mode_flag,
+            },
+        );
+
+        tracing::info!(
+            session_id = %session_id,
+            container = %container_name,
+            "Reconnected session (fresh conversation)"
+        );
+    }
+
     pub async fn send(&self, session_id: &str, text: &str) -> Result<()> {
-        if let Some(session) = self.sessions.get(session_id) {
-            session.stdin_tx.send(text.to_string()).await?;
+        match self.sessions.get(session_id) {
+            Some(session) => {
+                session.message_tx.send(text.to_string()).await?;
+            }
+            None => {
+                return Err(anyhow!("Session {} not found in-memory (stale DB record after restart?)", session_id));
+            }
         }
         Ok(())
     }
@@ -257,123 +245,275 @@ impl ContainerManager {
         Ok(())
     }
 
-    /// Restart the Claude process inside a container.
-    /// Kills the old process, re-execs with --continue, rewires pipes.
-    /// Returns a new mpsc::Receiver<String> for the caller to spawn a new stream_output.
-    pub async fn restart_session(&self, session_id: &str) -> Result<mpsc::Receiver<String>> {
-        // Step 1: Remove session from DashMap (prevents old stdout reader from triggering cleanup)
-        let old_session = self.sessions.remove(session_id)
+    /// Restart the Claude conversation inside a session.
+    /// Resets the first-message flag and clears the Claude session ID
+    /// so the next message starts a fresh conversation.
+    pub async fn restart_session(&self, session_id: &str) -> Result<()> {
+        let session = self.sessions.get(session_id)
             .ok_or_else(|| anyhow!("Session {} not found", session_id))?;
-        let container_name = old_session.1.name.clone();
-        let worktree_path = old_session.1.worktree_path.clone();
-        let project_path = old_session.1.project_path.clone();
+        session.is_first_message.store(true, Ordering::SeqCst);
+        *session.claude_session_id.lock().unwrap() = None;
+        Ok(())
+    }
 
-        // Step 2: Kill Claude process inside container
-        let s = settings();
-        let kill_cmd = format!(
-            "{} exec {} pkill -f claude",
-            shell_escape(&s.container_runtime),
-            shell_escape(&container_name),
-        );
-        let _ = ssh::run_command(&kill_cmd).await;
+    /// Set plan mode for a session
+    pub fn set_plan_mode(&self, session_id: &str, enabled: bool) {
+        if let Some(session) = self.sessions.get(session_id) {
+            session.plan_mode.store(enabled, Ordering::SeqCst);
+        }
+    }
 
-        // Step 3: Wait for process to die
-        tokio::time::sleep(Duration::from_secs(1)).await;
+    /// Get plan mode status for a session
+    pub fn get_plan_mode(&self, session_id: &str) -> bool {
+        self.sessions
+            .get(session_id)
+            .map(|s| s.plan_mode.load(Ordering::SeqCst))
+            .unwrap_or(false)
+    }
+}
 
-        // Step 4: Re-exec with --continue via devcontainer exec (no PTY)
+/// Per-message processor task. Reads messages from the channel and for each one:
+/// 1. Builds `claude -p [--resume <id>] --output-format stream-json` command via devcontainer exec
+/// 2. Writes message to stdin, shuts down stdin (ensures flush + EOF)
+/// 3. Parses NDJSON stdout → OutputEvent variants
+/// 4. Drains stderr to tracing at warn level
+/// 5. Waits for process exit, logs non-zero status
+async fn message_processor(
+    mut message_rx: mpsc::Receiver<String>,
+    output_tx: mpsc::Sender<OutputEvent>,
+    project_path: String,
+    session_id: String,
+    is_first_message: Arc<AtomicBool>,
+    claude_session_id: Arc<Mutex<Option<String>>>,
+    plan_mode: Arc<AtomicBool>,
+) {
+    let s = settings();
+
+    while let Some(message) = message_rx.recv().await {
+        // Build claude command with --resume if we have a session ID
+        let stored_sid = claude_session_id.lock().unwrap().clone();
+        let mut claude_args = match stored_sid.as_deref() {
+            Some(id) => format!(
+                "{} -p --verbose --resume {} --output-format stream-json",
+                &s.claude_command, id
+            ),
+            None => format!(
+                "{} -p --verbose --output-format stream-json",
+                &s.claude_command
+            ),
+        };
+
+        // Append plan mode if enabled
+        if plan_mode.load(Ordering::SeqCst) {
+            claude_args.push_str(" --permission-mode plan");
+        }
+
         let exec_cmd = format!(
-            "devcontainer exec --workspace-folder {} --docker-path {} {} --continue",
+            "devcontainer exec --workspace-folder {} --docker-path {} {}",
             shell_escape(&project_path),
             shell_escape(&s.container_runtime),
-            &s.claude_command,
+            &claude_args,
         );
 
-        let mut child = ssh::command()?
-            .arg(ssh::login_shell(&exec_cmd))
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()?;
+        tracing::info!(
+            session_id = %session_id,
+            has_resume_id = stored_sid.is_some(),
+            plan_mode = plan_mode.load(Ordering::SeqCst),
+            "Spawning claude -p for message"
+        );
+
+        let mut child = match ssh::command() {
+            Ok(mut cmd) => {
+                match cmd
+                    .arg(ssh::login_shell(&exec_cmd))
+                    .stdin(std::process::Stdio::piped())
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .spawn()
+                {
+                    Ok(child) => child,
+                    Err(e) => {
+                        tracing::error!(session_id = %session_id, error = %e, "Failed to spawn claude -p");
+                        continue;
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::error!(session_id = %session_id, error = %e, "Failed to create SSH command");
+                continue;
+            }
+        };
 
         let stdin = child.stdin.take().expect("Failed to get stdin");
         let stdout = child.stdout.take().expect("Failed to get stdout");
         let stderr = child.stderr.take().expect("Failed to get stderr");
 
-        let (stdin_tx, mut stdin_rx) = mpsc::channel::<String>(32);
-        let (output_tx, output_rx) = mpsc::channel::<String>(100);
-
-        // Echo filter: safety net in case any echo leaks through
-        let echo_filter: Arc<Mutex<VecDeque<String>>> = Arc::new(Mutex::new(VecDeque::new()));
-
-        // Step 5: Spawn new stdin writer, stderr drain, stdout reader tasks
+        // Write message to stdin, then shutdown to ensure flush + EOF
         let mut stdin = stdin;
-        let echo_filter_write = Arc::clone(&echo_filter);
-        tokio::spawn(async move {
-            while let Some(text) = stdin_rx.recv().await {
-                // Record what we send so stdout reader can filter echoes
-                {
-                    let mut pending = echo_filter_write.lock().unwrap();
-                    pending.push_back(text.clone());
-                    while pending.len() > 100 {
-                        pending.pop_front();
-                    }
-                }
-                if let Err(e) = stdin.write_all(text.as_bytes()).await {
-                    tracing::warn!(error = %e, "Failed to write to container stdin");
-                    break;
-                }
-                if let Err(e) = stdin.write_all(b"\n").await {
-                    tracing::warn!(error = %e, "Failed to write newline to container stdin");
-                    break;
-                }
-                if let Err(e) = stdin.flush().await {
-                    tracing::warn!(error = %e, "Failed to flush container stdin");
-                    break;
-                }
-            }
-        });
+        if let Err(e) = stdin.write_all(message.as_bytes()).await {
+            tracing::warn!(session_id = %session_id, error = %e, "Failed to write to claude stdin");
+            let _ = child.wait().await;
+            continue;
+        }
+        if let Err(e) = stdin.shutdown().await {
+            tracing::warn!(session_id = %session_id, error = %e, "Failed to shutdown claude stdin");
+        }
+        drop(stdin);
+        tracing::info!(session_id = %session_id, "Stdin written and closed, reading stdout");
 
-        let session_id_for_stderr = session_id.to_string();
-        tokio::spawn(async move {
+        // Drain stderr in background — log at warn level so errors are visible
+        let session_id_for_stderr = session_id.clone();
+        let stderr_handle = tokio::spawn(async move {
             let reader = BufReader::new(stderr);
             let mut lines = reader.lines();
             while let Ok(Some(line)) = lines.next_line().await {
-                tracing::debug!(session_id = %session_id_for_stderr, stderr = %line, "Container stderr (restarted)");
+                tracing::warn!(session_id = %session_id_for_stderr, stderr = %line, "claude -p stderr");
             }
         });
 
+        // Parse NDJSON stdout → OutputEvent
+        //
+        // The Claude CLI with `-p --verbose --output-format stream-json` emits:
+        //   {"type":"system","subtype":"init","session_id":"..."}  — capture session ID
+        //   {"type":"system","subtype":"hook_*",...}               — skip
+        //   {"type":"assistant","message":{"content":[...],...}}   — extract text
+        //   {"type":"result","result":"...","usage":{...}}         — final stats
         let reader = BufReader::new(stdout);
-        let echo_filter_read = Arc::clone(&echo_filter);
-        tokio::spawn(async move {
-            let mut lines = reader.lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                // Check if this line is an echo of something we sent
-                {
-                    let mut pending = echo_filter_read.lock().unwrap();
-                    if let Some(pos) = pending.iter().position(|s| s == &line) {
-                        pending.remove(pos);
-                        continue; // Drop echoed line
+        let mut lines = reader.lines();
+        let mut output_closed = false;
+        let mut line_buffer = LineBuffer::new();
+        let mut input_tokens: u64 = 0;
+        let mut output_tokens: u64 = 0;
+
+        while let Ok(Some(raw_line)) = lines.next_line().await {
+            // Try to parse as NDJSON
+            let parsed = match serde_json::from_str::<StreamLine>(&raw_line) {
+                Ok(p) => p,
+                Err(_) => {
+                    // Non-JSON line (SSH noise, etc.) — skip
+                    tracing::info!(session_id = %session_id, line = %raw_line, "Non-JSON stdout line");
+                    continue;
+                }
+            };
+
+            match parsed {
+                StreamLine::System { subtype, session_id: sid } => {
+                    // Capture session ID from the init event
+                    if subtype.as_deref() == Some("init") {
+                        if let Some(sid) = sid {
+                            tracing::info!(session_id = %session_id, claude_session_id = %sid, "Captured Claude session ID");
+                            *claude_session_id.lock().unwrap() = Some(sid);
+                        }
+                    }
+                    // Other system events (hooks, tool use metadata) are silently skipped
+                }
+                StreamLine::Assistant { message, .. } => {
+                    // Extract input tokens from the assistant message usage
+                    if let Some(usage) = &message.usage {
+                        input_tokens = usage.input_tokens.unwrap_or(0)
+                            + usage.cache_read_input_tokens.unwrap_or(0)
+                            + usage.cache_creation_input_tokens.unwrap_or(0);
+                    }
+
+                    // Notify that processing started (with token count)
+                    if output_tx.send(OutputEvent::ProcessingStarted { input_tokens }).await.is_err() {
+                        output_closed = true;
+                        break;
+                    }
+
+                    // Extract text and tool actions from content parts
+                    if let Some(parts) = message.content {
+                        for part in parts {
+                            match part {
+                                ContentPart::Text { text } => {
+                                    let complete_lines = line_buffer.feed(&text);
+                                    for line in complete_lines {
+                                        if output_tx.send(OutputEvent::TextLine(line)).await.is_err() {
+                                            output_closed = true;
+                                            break;
+                                        }
+                                    }
+                                    if output_closed { break; }
+                                }
+                                ContentPart::ToolUse { ref name, ref input } => {
+                                    // Flush any buffered text before showing tool action
+                                    if let Some(partial) = line_buffer.flush() {
+                                        if output_tx.send(OutputEvent::TextLine(partial)).await.is_err() {
+                                            output_closed = true;
+                                            break;
+                                        }
+                                    }
+                                    let action = format_tool_action(name, input);
+                                    if output_tx.send(OutputEvent::ToolAction(action)).await.is_err() {
+                                        output_closed = true;
+                                        break;
+                                    }
+                                }
+                                ContentPart::ToolResult { .. } | ContentPart::Other => {
+                                    // Skip tool results and unknown content types
+                                }
+                            }
+                        }
+                        if output_closed { break; }
+
+                        // Flush any remaining partial line
+                        if let Some(partial) = line_buffer.flush() {
+                            if output_tx.send(OutputEvent::TextLine(partial)).await.is_err() {
+                                output_closed = true;
+                                break;
+                            }
+                        }
                     }
                 }
-                if output_tx.send(line).await.is_err() {
-                    break;
+                StreamLine::Result { usage, .. } => {
+                    // Extract final usage stats
+                    if let Some(u) = usage {
+                        output_tokens = u.output_tokens.unwrap_or(0);
+                        // Update input_tokens if we missed the assistant event
+                        if input_tokens == 0 {
+                            input_tokens = u.input_tokens.unwrap_or(0)
+                                + u.cache_read_input_tokens.unwrap_or(0)
+                                + u.cache_creation_input_tokens.unwrap_or(0);
+                        }
+                    }
+
+                    if output_tx.send(OutputEvent::ResponseComplete { input_tokens, output_tokens }).await.is_err() {
+                        output_closed = true;
+                        break;
+                    }
+                }
+                StreamLine::Unknown => {
+                    // Skip unrecognized event types
                 }
             }
-            let _ = child.wait().await;
-        });
+        }
 
-        // Step 6: Re-insert session with new stdin_tx, same container name/worktree_path/project_path
-        self.sessions.insert(
-            session_id.to_string(),
-            Session {
-                name: container_name,
-                stdin_tx,
-                worktree_path,
-                project_path,
-            },
-        );
+        tracing::info!(session_id = %session_id, "Stdout stream ended, waiting for process exit");
 
-        // Step 7: Return new receiver
-        Ok(output_rx)
+        // Wait for process to finish and stderr to drain
+        let status = child.wait().await;
+        let _ = stderr_handle.await;
+
+        match &status {
+            Ok(s) if !s.success() => {
+                tracing::warn!(session_id = %session_id, status = ?s, "claude -p exited with error");
+            }
+            Err(e) => {
+                tracing::warn!(session_id = %session_id, error = %e, "Failed to wait for claude -p");
+            }
+            _ => {}
+        }
+
+        // Mark that first message has been processed
+        is_first_message.store(false, Ordering::SeqCst);
+
+        if output_closed {
+            tracing::debug!(session_id = %session_id, "Output channel closed, stopping message processor");
+            break;
+        }
     }
+
+    // message_rx closed or output_tx closed → task exits
+    // Dropping output_tx here signals stream_output to exit → cleanup runs
+    tracing::debug!(session_id = %session_id, "Message processor exiting");
 }

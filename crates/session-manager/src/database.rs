@@ -15,6 +15,7 @@ pub struct StoredSession {
     pub channel_id: String,
     pub thread_id: String,
     pub project: String,
+    pub project_path: String,
     pub container_name: String,
     pub session_type: String,
     pub parent_session_id: Option<String>,
@@ -72,6 +73,7 @@ pub async fn create_schema(pool: &PgPool, schema: &str) -> Result<()> {
             channel_id TEXT NOT NULL,
             thread_id TEXT NOT NULL,
             project TEXT NOT NULL,
+            project_path TEXT NOT NULL DEFAULT '',
             container_name TEXT NOT NULL,
             session_type TEXT NOT NULL DEFAULT 'standard',
             parent_session_id TEXT,
@@ -81,6 +83,14 @@ pub async fn create_schema(pool: &PgPool, schema: &str) -> Result<()> {
             compaction_count INTEGER NOT NULL DEFAULT 0
         )
         "#,
+        schema
+    ))
+    .execute(pool)
+    .await?;
+
+    // Migration: add project_path column to existing sessions table
+    sqlx::query(&format!(
+        "ALTER TABLE {}.sessions ADD COLUMN IF NOT EXISTS project_path TEXT NOT NULL DEFAULT ''",
         schema
     ))
     .execute(pool)
@@ -199,18 +209,20 @@ impl Database {
         channel_id: &str,
         thread_id: &str,
         project: &str,
+        project_path: &str,
         container_name: &str,
         session_type: &str,
         parent_session_id: Option<&str>,
     ) -> Result<()> {
         sqlx::query(&format!(
-            "INSERT INTO {}.sessions (session_id, channel_id, thread_id, project, container_name, session_type, parent_session_id) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+            "INSERT INTO {}.sessions (session_id, channel_id, thread_id, project, project_path, container_name, session_type, parent_session_id) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
             SCHEMA
         ))
         .bind(session_id)
         .bind(channel_id)
         .bind(thread_id)
         .bind(project)
+        .bind(project_path)
         .bind(container_name)
         .bind(session_type)
         .bind(parent_session_id)
@@ -226,7 +238,7 @@ impl Database {
         thread_id: &str,
     ) -> Result<Option<StoredSession>> {
         let session = sqlx::query_as::<_, StoredSession>(&format!(
-            "SELECT session_id, channel_id, thread_id, project, container_name, session_type, parent_session_id, created_at, last_activity_at, message_count, compaction_count \
+            "SELECT session_id, channel_id, thread_id, project, project_path, container_name, session_type, parent_session_id, created_at, last_activity_at, message_count, compaction_count \
              FROM {}.sessions WHERE channel_id = $1 AND thread_id = $2",
             SCHEMA
         ))
@@ -246,7 +258,7 @@ impl Database {
         }
 
         let session = sqlx::query_as::<_, StoredSession>(&format!(
-            "SELECT session_id, channel_id, thread_id, project, container_name, session_type, parent_session_id, created_at, last_activity_at, message_count, compaction_count \
+            "SELECT session_id, channel_id, thread_id, project, project_path, container_name, session_type, parent_session_id, created_at, last_activity_at, message_count, compaction_count \
              FROM {}.sessions WHERE session_id LIKE $1 LIMIT 1",
             SCHEMA
         ))
@@ -263,7 +275,7 @@ impl Database {
         channel_id: &str,
     ) -> Result<Vec<StoredSession>> {
         let sessions = sqlx::query_as::<_, StoredSession>(&format!(
-            "SELECT session_id, channel_id, thread_id, project, container_name, session_type, parent_session_id, created_at, last_activity_at, message_count, compaction_count \
+            "SELECT session_id, channel_id, thread_id, project, project_path, container_name, session_type, parent_session_id, created_at, last_activity_at, message_count, compaction_count \
              FROM {}.sessions WHERE channel_id = $1 AND session_type != 'worker'",
             SCHEMA
         ))
@@ -292,7 +304,7 @@ impl Database {
 
     pub async fn get_all_sessions(&self) -> Result<Vec<StoredSession>> {
         let sessions = sqlx::query_as::<_, StoredSession>(&format!(
-            "SELECT session_id, channel_id, thread_id, project, container_name, session_type, parent_session_id, created_at, last_activity_at, message_count, compaction_count \
+            "SELECT session_id, channel_id, thread_id, project, project_path, container_name, session_type, parent_session_id, created_at, last_activity_at, message_count, compaction_count \
              FROM {}.sessions",
             SCHEMA
         ))
