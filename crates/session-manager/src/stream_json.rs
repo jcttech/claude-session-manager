@@ -12,6 +12,8 @@ pub enum OutputEvent {
     ToolAction(String),
     /// Response is complete (emitted on message_stop when stop_reason != "tool_use")
     ResponseComplete { input_tokens: u64, output_tokens: u64 },
+    /// Generated thread title (from `title` command)
+    TitleGenerated(String),
 }
 
 // -- NDJSON deserialization types for `claude -p --verbose --output-format stream-json` --

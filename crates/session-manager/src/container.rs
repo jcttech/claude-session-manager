@@ -41,6 +41,8 @@ struct Session {
     claude_session_id: Arc<Mutex<Option<String>>>,
     /// Whether plan mode is enabled for this session
     plan_mode: Arc<AtomicBool>,
+    /// Whether the next response should be captured as a thread title
+    pending_title: Arc<AtomicBool>,
 }
 
 impl Default for ContainerManager {
@@ -112,6 +114,7 @@ impl ContainerManager {
         let is_first_message = Arc::new(AtomicBool::new(true));
         let claude_session_id = Arc::new(Mutex::new(None));
         let plan_mode_flag = Arc::new(AtomicBool::new(plan_mode));
+        let pending_title_flag = Arc::new(AtomicBool::new(false));
 
         // Spawn message processor task
         let project_path_owned = project_path.to_string();
@@ -119,6 +122,7 @@ impl ContainerManager {
         let is_first_clone = Arc::clone(&is_first_message);
         let claude_sid_clone = Arc::clone(&claude_session_id);
         let plan_mode_clone = Arc::clone(&plan_mode_flag);
+        let pending_title_clone = Arc::clone(&pending_title_flag);
         tokio::spawn(async move {
             message_processor(
                 message_rx,
@@ -128,6 +132,7 @@ impl ContainerManager {
                 is_first_clone,
                 claude_sid_clone,
                 plan_mode_clone,
+                pending_title_clone,
             ).await;
         });
 
@@ -140,6 +145,7 @@ impl ContainerManager {
                 is_first_message,
                 claude_session_id,
                 plan_mode: plan_mode_flag,
+                pending_title: pending_title_flag,
             },
         );
 
@@ -160,12 +166,14 @@ impl ContainerManager {
         let is_first_message = Arc::new(AtomicBool::new(true));
         let claude_session_id = Arc::new(Mutex::new(None));
         let plan_mode_flag = Arc::new(AtomicBool::new(false));
+        let pending_title_flag = Arc::new(AtomicBool::new(false));
 
         let project_path_owned = project_path.to_string();
         let session_id_owned = session_id.to_string();
         let is_first_clone = Arc::clone(&is_first_message);
         let claude_sid_clone = Arc::clone(&claude_session_id);
         let plan_mode_clone = Arc::clone(&plan_mode_flag);
+        let pending_title_clone = Arc::clone(&pending_title_flag);
         tokio::spawn(async move {
             message_processor(
                 message_rx,
@@ -175,6 +183,7 @@ impl ContainerManager {
                 is_first_clone,
                 claude_sid_clone,
                 plan_mode_clone,
+                pending_title_clone,
             ).await;
         });
 
@@ -187,6 +196,7 @@ impl ContainerManager {
                 is_first_message,
                 claude_session_id,
                 plan_mode: plan_mode_flag,
+                pending_title: pending_title_flag,
             },
         );
 
@@ -263,6 +273,13 @@ impl ContainerManager {
         }
     }
 
+    /// Set pending_title flag so next response is captured as a thread title
+    pub fn set_pending_title(&self, session_id: &str) {
+        if let Some(session) = self.sessions.get(session_id) {
+            session.pending_title.store(true, Ordering::SeqCst);
+        }
+    }
+
     /// Get plan mode status for a session
     pub fn get_plan_mode(&self, session_id: &str) -> bool {
         self.sessions
@@ -278,6 +295,7 @@ impl ContainerManager {
 /// 3. Parses NDJSON stdout → OutputEvent variants
 /// 4. Drains stderr to tracing at warn level
 /// 5. Waits for process exit, logs non-zero status
+#[allow(clippy::too_many_arguments)]
 async fn message_processor(
     mut message_rx: mpsc::Receiver<String>,
     output_tx: mpsc::Sender<OutputEvent>,
@@ -286,6 +304,7 @@ async fn message_processor(
     is_first_message: Arc<AtomicBool>,
     claude_session_id: Arc<Mutex<Option<String>>>,
     plan_mode: Arc<AtomicBool>,
+    pending_title: Arc<AtomicBool>,
 ) {
     let s = settings();
 
@@ -399,11 +418,9 @@ async fn message_processor(
             match parsed {
                 StreamLine::System { subtype, session_id: sid } => {
                     // Capture session ID from the init event
-                    if subtype.as_deref() == Some("init") {
-                        if let Some(sid) = sid {
-                            tracing::info!(session_id = %session_id, claude_session_id = %sid, "Captured Claude session ID");
-                            *claude_session_id.lock().unwrap() = Some(sid);
-                        }
+                    if subtype.as_deref() == Some("init") && let Some(sid) = sid {
+                        tracing::info!(session_id = %session_id, claude_session_id = %sid, "Captured Claude session ID");
+                        *claude_session_id.lock().unwrap() = Some(sid);
                     }
                     // Other system events (hooks, tool use metadata) are silently skipped
                 }
@@ -413,6 +430,23 @@ async fn message_processor(
                         input_tokens = usage.input_tokens.unwrap_or(0)
                             + usage.cache_read_input_tokens.unwrap_or(0)
                             + usage.cache_creation_input_tokens.unwrap_or(0);
+                    }
+
+                    // If pending_title is set, collect all text and emit TitleGenerated instead
+                    if pending_title.swap(false, Ordering::SeqCst) {
+                        let mut title_text = String::new();
+                        if let Some(parts) = message.content {
+                            for part in parts {
+                                if let ContentPart::Text { text } = part {
+                                    title_text.push_str(&text);
+                                }
+                            }
+                        }
+                        if output_tx.send(OutputEvent::TitleGenerated(title_text)).await.is_err() {
+                            output_closed = true;
+                            break;
+                        }
+                        continue;
                     }
 
                     // Notify that processing started (with token count)
@@ -437,11 +471,9 @@ async fn message_processor(
                                 }
                                 ContentPart::ToolUse { ref name, ref input } => {
                                     // Flush any buffered text before showing tool action
-                                    if let Some(partial) = line_buffer.flush() {
-                                        if output_tx.send(OutputEvent::TextLine(partial)).await.is_err() {
-                                            output_closed = true;
-                                            break;
-                                        }
+                                    if let Some(partial) = line_buffer.flush() && output_tx.send(OutputEvent::TextLine(partial)).await.is_err() {
+                                        output_closed = true;
+                                        break;
                                     }
                                     let action = format_tool_action(name, input);
                                     if output_tx.send(OutputEvent::ToolAction(action)).await.is_err() {
@@ -457,11 +489,9 @@ async fn message_processor(
                         if output_closed { break; }
 
                         // Flush any remaining partial line
-                        if let Some(partial) = line_buffer.flush() {
-                            if output_tx.send(OutputEvent::TextLine(partial)).await.is_err() {
-                                output_closed = true;
-                                break;
-                            }
+                        if let Some(partial) = line_buffer.flush() && output_tx.send(OutputEvent::TextLine(partial)).await.is_err() {
+                            output_closed = true;
+                            break;
                         }
                     }
                 }

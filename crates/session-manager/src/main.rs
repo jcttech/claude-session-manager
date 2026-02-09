@@ -154,6 +154,7 @@ async fn main() -> Result<()> {
                 let thread_id = session.thread_id.clone();
                 let session_id = session.session_id.clone();
                 let session_type = session.session_type.clone();
+                let project = session.project.clone();
                 let parent_session_id = session.parent_session_id.clone();
                 tokio::spawn(async move {
                     stream_output(
@@ -162,6 +163,7 @@ async fn main() -> Result<()> {
                         thread_id,
                         session_id,
                         session_type,
+                        project,
                         parent_session_id,
                         output_rx,
                     ).await;
@@ -511,6 +513,7 @@ async fn start_session(
             let thread_id_clone = thread_id.clone();
             let session_id_clone = session_id.clone();
             let session_type_clone = session_type.to_string();
+            let project_clone = repo_ref.full_name();
             let parent_session_id_clone = parent_session_id.map(|s| s.to_string());
             tokio::spawn(async move {
                 stream_output(
@@ -519,6 +522,7 @@ async fn start_session(
                     thread_id_clone,
                     session_id_clone,
                     session_type_clone,
+                    project_clone,
                     parent_session_id_clone,
                     output_rx,
                 ).await;
@@ -591,6 +595,16 @@ fn format_duration(d: chrono::Duration) -> String {
         format!("{}m", mins)
     } else {
         format!("{}s", secs)
+    }
+}
+
+/// Format the root post label for a session thread (e.g. "**Session** for **org/repo**")
+fn format_root_label(session_type: &str, project: &str) -> String {
+    match session_type {
+        "orchestrator" => format!("**Orchestrator session** for **{}**", project),
+        "worker" => format!("**Worker session** for **{}**", project),
+        "reviewer" => format!("**Reviewer session** for **{}**", project),
+        _ => format!("**Session** for **{}**", project),
     }
 }
 
@@ -667,6 +681,24 @@ async fn handle_messages(state: Arc<AppState>, mut rx: mpsc::Receiver<Post>, can
                             "Plan mode **disabled**. Claude can modify files."
                         };
                         let _ = state.mm.post_in_thread(channel_id, root_id, msg).await;
+                        continue;
+                    }
+                    if cmd == "title" || cmd.starts_with("title ") {
+                        let arg = cmd.strip_prefix("title").unwrap().trim();
+                        if arg.is_empty() {
+                            // Auto-generate: ask Claude to summarize
+                            state.containers.set_pending_title(&session.session_id);
+                            let _ = state.containers.send(
+                                &session.session_id,
+                                "Summarize this conversation in 5-10 words as a thread title. Output ONLY the title text, nothing else. No quotes, no punctuation at the end.",
+                            ).await;
+                            let _ = state.mm.post_in_thread(channel_id, root_id, "_Generating title..._").await;
+                        } else {
+                            // Manual title
+                            let label = format_root_label(&session.session_type, &session.project);
+                            let _ = state.mm.update_post(root_id, &format!("{} — {}", label, arg)).await;
+                            let _ = state.mm.post_in_thread(channel_id, root_id, "Title updated.").await;
+                        }
                         continue;
                     }
                     if cmd == "context" {
@@ -922,6 +954,7 @@ async fn handle_messages(state: Arc<AppState>, mut rx: mpsc::Receiver<Post>, can
                         - `{trigger} clear` — Clear conversation history\n\
                         - `{trigger} restart` — Restart Claude conversation\n\
                         - `{trigger} plan` — Toggle plan mode (read-only analysis)\n\
+                        - `{trigger} title [text]` — Set thread title (auto-generate if no text)\n\
                         - `{trigger} context` — Show context health",
                         trigger = bot_trigger,
                     )).await;
@@ -993,12 +1026,14 @@ const BATCH_MAX_LINES: usize = 80;
 /// Batch timeout before flushing accumulated output
 const BATCH_TIMEOUT: Duration = Duration::from_millis(200);
 
+#[allow(clippy::too_many_arguments)]
 async fn stream_output(
     state: Arc<AppState>,
     channel_id: String,
     thread_id: String,
     session_id: String,
     session_type: String,
+    project: String,
     parent_session_id: Option<String>,
     mut rx: mpsc::Receiver<OutputEvent>,
 ) {
@@ -1076,6 +1111,14 @@ async fn stream_output(
                         batch_bytes = 0;
                         let msg = format!("> {}", action);
                         let _ = state.mm.post_in_thread(&channel_id, &thread_id, &msg).await;
+                    }
+                    OutputEvent::TitleGenerated(title) => {
+                        flush_batch(&state, &channel_id, &thread_id, &session_id, &mut batch).await;
+                        batch_bytes = 0;
+                        let title = title.trim().trim_matches('"');
+                        let label = format_root_label(&session_type, &project);
+                        let _ = state.mm.update_post(&thread_id, &format!("{} — {}", label, title)).await;
+                        let _ = state.mm.post_in_thread(&channel_id, &thread_id, "Title updated.").await;
                     }
                     OutputEvent::ResponseComplete { input_tokens, output_tokens } => {
                         flush_batch(&state, &channel_id, &thread_id, &session_id, &mut batch).await;
@@ -1510,6 +1553,9 @@ async fn stream_output_worker(
                         batch_bytes = 0;
                         let msg = format!("> {}", action);
                         let _ = state.mm.post_in_thread(&channel_id, &thread_id, &msg).await;
+                    }
+                    OutputEvent::TitleGenerated(_) => {
+                        // Worker sessions don't support title generation
                     }
                     OutputEvent::ResponseComplete { input_tokens, output_tokens } => {
                         flush_batch(&state, &channel_id, &thread_id, &session_id, &mut batch).await;
