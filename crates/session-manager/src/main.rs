@@ -708,18 +708,18 @@ async fn handle_messages(state: Arc<AppState>, mut rx: mpsc::Receiver<Post>, can
                         let plan_mode = info.as_ref().map(|i| i.plan_mode).unwrap_or(false);
                         let claude_sid = info.as_ref().and_then(|i| i.claude_session_id.as_deref().map(|s| format!("`{}`", &s[..8.min(s.len())])));
                         let msg = format!(
-                            "**Session Status:**\n\
-                            | | |\n\
-                            |---|---|\n\
-                            | Session | `{}` |\n\
-                            | Claude ID | {} |\n\
-                            | Type | {} |\n\
-                            | Project | **{}** |\n\
-                            | Messages | {} |\n\
-                            | Compactions | {} |\n\
-                            | Plan mode | {} |\n\
-                            | Age | {} |\n\
-                            | Idle | {} |",
+"**Session Status:**\n\
+| Property | Value |\n\
+|---|---|\n\
+| Session | `{}` |\n\
+| Claude ID | {} |\n\
+| Type | {} |\n\
+| Project | **{}** |\n\
+| Messages | {} |\n\
+| Compactions | {} |\n\
+| Plan mode | {} |\n\
+| Age | {} |\n\
+| Idle | {} |",
                             &session.session_id[..8.min(session.session_id.len())],
                             claude_sid.unwrap_or_else(|| "_none_".to_string()),
                             session.session_type,
