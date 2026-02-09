@@ -2,7 +2,9 @@ use anyhow::{anyhow, Result};
 use dashmap::DashMap;
 use shell_escape::escape;
 use std::borrow::Cow;
+use std::collections::VecDeque;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
@@ -32,6 +34,8 @@ struct Session {
     stdin_tx: mpsc::Sender<String>,
     /// Path to worktree if session is using one (for cleanup)
     worktree_path: Option<PathBuf>,
+    /// Workspace folder path for devcontainer exec
+    project_path: String,
 }
 
 impl Default for ContainerManager {
@@ -97,15 +101,16 @@ impl ContainerManager {
             .ok_or_else(|| anyhow!("No containerId in devcontainer output"))?
             .to_string();
 
-        // Start interactive session via podman exec
+        // Start interactive session via devcontainer exec (honors remoteUser, remoteEnv, etc.)
+        // No PTY (-tt) — eliminates stdin echo at source
         let exec_container_cmd = format!(
-            "stty -echo 2>/dev/null; {} exec -i {} {}",
+            "devcontainer exec --workspace-folder {} --docker-path {} {}",
+            escaped_project_path,
             shell_escape(&s.container_runtime),
-            shell_escape(&container_id),
-            &s.claude_command  // claude_command is from config, trusted
+            &s.claude_command,  // claude_command is from config, trusted
         );
 
-        let mut child = match ssh::command_with_tty()?
+        let mut child = match ssh::command()?
             .arg(ssh::login_shell(&exec_container_cmd))
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
@@ -131,10 +136,23 @@ impl ContainerManager {
 
         let (stdin_tx, mut stdin_rx) = mpsc::channel::<String>(32);
 
-        // Stdin writer task
+        // Echo filter: safety net in case any echo leaks through
+        let echo_filter: Arc<Mutex<VecDeque<String>>> = Arc::new(Mutex::new(VecDeque::new()));
+
+        // Stdin writer task — records sent lines for echo filtering
         let mut stdin = stdin;
+        let echo_filter_write = Arc::clone(&echo_filter);
         tokio::spawn(async move {
             while let Some(text) = stdin_rx.recv().await {
+                // Record what we send so stdout reader can filter echoes
+                {
+                    let mut pending = echo_filter_write.lock().unwrap();
+                    pending.push_back(text.clone());
+                    // Cap at 100 to bound memory
+                    while pending.len() > 100 {
+                        pending.pop_front();
+                    }
+                }
                 if let Err(e) = stdin.write_all(text.as_bytes()).await {
                     tracing::warn!(error = %e, "Failed to write to container stdin");
                     break;
@@ -161,10 +179,20 @@ impl ContainerManager {
         });
 
         // Stdout reader task + child reaper (prevents zombie)
+        // Filters echoed stdin lines before forwarding output
         let reader = BufReader::new(stdout);
+        let echo_filter_read = Arc::clone(&echo_filter);
         tokio::spawn(async move {
             let mut lines = reader.lines();
             while let Ok(Some(line)) = lines.next_line().await {
+                // Check if this line is an echo of something we sent
+                {
+                    let mut pending = echo_filter_read.lock().unwrap();
+                    if let Some(pos) = pending.iter().position(|s| s == &line) {
+                        pending.remove(pos);
+                        continue; // Drop echoed line
+                    }
+                }
                 if output_tx.send(line).await.is_err() {
                     break;
                 }
@@ -179,6 +207,7 @@ impl ContainerManager {
                 name: container_id.clone(),
                 stdin_tx,
                 worktree_path: None,
+                project_path: project_path.to_string(),
             },
         );
 
@@ -237,6 +266,7 @@ impl ContainerManager {
             .ok_or_else(|| anyhow!("Session {} not found", session_id))?;
         let container_name = old_session.1.name.clone();
         let worktree_path = old_session.1.worktree_path.clone();
+        let project_path = old_session.1.project_path.clone();
 
         // Step 2: Kill Claude process inside container
         let s = settings();
@@ -250,15 +280,15 @@ impl ContainerManager {
         // Step 3: Wait for process to die
         tokio::time::sleep(Duration::from_secs(1)).await;
 
-        // Step 4: Re-exec with --continue
+        // Step 4: Re-exec with --continue via devcontainer exec (no PTY)
         let exec_cmd = format!(
-            "stty -echo 2>/dev/null; {} exec -i {} {} --continue",
+            "devcontainer exec --workspace-folder {} --docker-path {} {} --continue",
+            shell_escape(&project_path),
             shell_escape(&s.container_runtime),
-            shell_escape(&container_name),
             &s.claude_command,
         );
 
-        let mut child = ssh::command_with_tty()?
+        let mut child = ssh::command()?
             .arg(ssh::login_shell(&exec_cmd))
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
@@ -272,10 +302,22 @@ impl ContainerManager {
         let (stdin_tx, mut stdin_rx) = mpsc::channel::<String>(32);
         let (output_tx, output_rx) = mpsc::channel::<String>(100);
 
+        // Echo filter: safety net in case any echo leaks through
+        let echo_filter: Arc<Mutex<VecDeque<String>>> = Arc::new(Mutex::new(VecDeque::new()));
+
         // Step 5: Spawn new stdin writer, stderr drain, stdout reader tasks
         let mut stdin = stdin;
+        let echo_filter_write = Arc::clone(&echo_filter);
         tokio::spawn(async move {
             while let Some(text) = stdin_rx.recv().await {
+                // Record what we send so stdout reader can filter echoes
+                {
+                    let mut pending = echo_filter_write.lock().unwrap();
+                    pending.push_back(text.clone());
+                    while pending.len() > 100 {
+                        pending.pop_front();
+                    }
+                }
                 if let Err(e) = stdin.write_all(text.as_bytes()).await {
                     tracing::warn!(error = %e, "Failed to write to container stdin");
                     break;
@@ -301,9 +343,18 @@ impl ContainerManager {
         });
 
         let reader = BufReader::new(stdout);
+        let echo_filter_read = Arc::clone(&echo_filter);
         tokio::spawn(async move {
             let mut lines = reader.lines();
             while let Ok(Some(line)) = lines.next_line().await {
+                // Check if this line is an echo of something we sent
+                {
+                    let mut pending = echo_filter_read.lock().unwrap();
+                    if let Some(pos) = pending.iter().position(|s| s == &line) {
+                        pending.remove(pos);
+                        continue; // Drop echoed line
+                    }
+                }
                 if output_tx.send(line).await.is_err() {
                     break;
                 }
@@ -311,13 +362,14 @@ impl ContainerManager {
             let _ = child.wait().await;
         });
 
-        // Step 6: Re-insert session with new stdin_tx, same container name/worktree_path
+        // Step 6: Re-insert session with new stdin_tx, same container name/worktree_path/project_path
         self.sessions.insert(
             session_id.to_string(),
             Session {
                 name: container_name,
                 stdin_tx,
                 worktree_path,
+                project_path,
             },
         );
 
