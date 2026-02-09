@@ -1141,12 +1141,19 @@ async fn stream_output(
                         let _ = state.mm.post_in_thread(&channel_id, &thread_id, "Title updated.").await;
                     }
                     OutputEvent::ResponseComplete { input_tokens, output_tokens } => {
-                        // Append token footer inline with the last message
-                        batch.push(format!("\n---\n`tokens: {} in / {} out`", input_tokens, output_tokens));
                         flush_batch(&state, &channel_id, &thread_id, &session_id, &mut batch).await;
                         batch_bytes = 0;
                         counter!("tokens_input_total").increment(input_tokens);
                         counter!("tokens_output_total").increment(output_tokens);
+                        // Warn when context window is getting full (>80% of 200k)
+                        let usage_pct = (input_tokens as f64 / 200_000.0 * 100.0) as u64;
+                        if input_tokens > 160_000 {
+                            let msg = format!(
+                                ":warning: **Context window {}% full** ({} / 200k tokens) — consider using `compact` or `clear`",
+                                usage_pct, input_tokens
+                            );
+                            let _ = state.mm.post_in_thread(&channel_id, &thread_id, &msg).await;
+                        }
                     }
                 }
             }
@@ -1595,12 +1602,19 @@ async fn stream_output_worker(
                         // Worker sessions don't support title generation
                     }
                     OutputEvent::ResponseComplete { input_tokens, output_tokens } => {
-                        // Append token footer inline with the last message
-                        batch.push(format!("\n---\n`tokens: {} in / {} out`", input_tokens, output_tokens));
                         flush_batch(&state, &channel_id, &thread_id, &session_id, &mut batch).await;
                         batch_bytes = 0;
                         counter!("tokens_input_total").increment(input_tokens);
                         counter!("tokens_output_total").increment(output_tokens);
+                        // Warn when context window is getting full (>80% of 200k)
+                        let usage_pct = (input_tokens as f64 / 200_000.0 * 100.0) as u64;
+                        if input_tokens > 160_000 {
+                            let msg = format!(
+                                ":warning: **Context window {}% full** ({} / 200k tokens) — consider using `compact` or `clear`",
+                                usage_pct, input_tokens
+                            );
+                            let _ = state.mm.post_in_thread(&channel_id, &thread_id, &msg).await;
+                        }
                     }
                 }
             }
