@@ -701,17 +701,32 @@ async fn handle_messages(state: Arc<AppState>, mut rx: mpsc::Receiver<Post>, can
                         }
                         continue;
                     }
-                    if cmd == "context" {
+                    if cmd == "context" || cmd == "status" {
                         let age = chrono::Utc::now() - session.created_at;
                         let idle = chrono::Utc::now() - session.last_activity_at;
+                        let info = state.containers.get_session_info(&session.session_id);
+                        let plan_mode = info.as_ref().map(|i| i.plan_mode).unwrap_or(false);
+                        let claude_sid = info.as_ref().and_then(|i| i.claude_session_id.as_deref().map(|s| format!("`{}`", &s[..8.min(s.len())])));
                         let msg = format!(
-                            "**Context Health:**\n\
-                            - Messages: {}\n\
-                            - Compactions: {}\n\
-                            - Session age: {}\n\
-                            - Last active: {} ago",
+                            "**Session Status:**\n\
+                            | | |\n\
+                            |---|---|\n\
+                            | Session | `{}` |\n\
+                            | Claude ID | {} |\n\
+                            | Type | {} |\n\
+                            | Project | **{}** |\n\
+                            | Messages | {} |\n\
+                            | Compactions | {} |\n\
+                            | Plan mode | {} |\n\
+                            | Age | {} |\n\
+                            | Idle | {} |",
+                            &session.session_id[..8.min(session.session_id.len())],
+                            claude_sid.unwrap_or_else(|| "_none_".to_string()),
+                            session.session_type,
+                            session.project,
                             session.message_count,
                             session.compaction_count,
+                            if plan_mode { "on" } else { "off" },
                             format_duration(age),
                             format_duration(idle),
                         );
@@ -955,7 +970,7 @@ async fn handle_messages(state: Arc<AppState>, mut rx: mpsc::Receiver<Post>, can
                         - `{trigger} restart` — Restart Claude conversation\n\
                         - `{trigger} plan` — Toggle plan mode (read-only analysis)\n\
                         - `{trigger} title [text]` — Set thread title (auto-generate if no text)\n\
-                        - `{trigger} context` — Show context health",
+                        - `{trigger} status` — Show session status and context health",
                         trigger = bot_trigger,
                     )).await;
                     continue;

@@ -287,6 +287,22 @@ impl ContainerManager {
             .map(|s| s.plan_mode.load(Ordering::SeqCst))
             .unwrap_or(false)
     }
+
+    /// Get live runtime info for a session
+    pub fn get_session_info(&self, session_id: &str) -> Option<SessionInfo> {
+        self.sessions.get(session_id).map(|s| SessionInfo {
+            claude_session_id: s.claude_session_id.lock().unwrap().clone(),
+            plan_mode: s.plan_mode.load(Ordering::SeqCst),
+            is_first_message: s.is_first_message.load(Ordering::SeqCst),
+        })
+    }
+}
+
+/// Live runtime info for a session (from ContainerManager)
+pub struct SessionInfo {
+    pub claude_session_id: Option<String>,
+    pub plan_mode: bool,
+    pub is_first_message: bool,
 }
 
 /// Per-message processor task. Reads messages from the channel and for each one:
