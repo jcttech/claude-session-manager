@@ -1,30 +1,20 @@
-name: session-manager
+name: CI
 
 on:
-  push:
-    tags: ['session-manager/v*']
   pull_request:
     branches: [main]
-  workflow_dispatch:
 
 jobs:
   ci:
     uses: jcttech/.github/.github/workflows/rust-pipeline.yml@v1
     permissions:
-      contents: write
-      packages: write
+      contents: read
       pull-requests: read
     with:
-      tag-prefix: 'session-manager/'
-      image-name: 'claude-session-manager'
-      dockerfile: 'Dockerfile.session-manager'
-      binary-name: 'session-manager'
-      ci-dockerfile: 'Dockerfile.session-manager.ci'
       code-paths: |
         crates/**
         Cargo.toml
         Cargo.lock
-        Dockerfile.session-manager
-        Dockerfile.session-manager.ci
+      enable-docker: false
+      enable-release: false
       enable-database-tests: true
-    secrets: inherit
