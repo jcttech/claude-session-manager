@@ -79,6 +79,7 @@ impl ContainerManager {
 
     /// Start a session, reusing an existing container for the same (repo, branch) if available.
     /// Falls back to `devcontainer up` for cold start.
+    #[allow(clippy::too_many_arguments)]
     pub async fn start(
         &self,
         session_id: &str,
@@ -126,18 +127,14 @@ impl ContainerManager {
 
             // Check devcontainer.json hash for rebuild
             let current_hash = devcontainer::hash_config(project_path).await;
-            if let Some(ref stored_hash) = entry.devcontainer_json_hash {
-                if let Some(ref current) = current_hash {
-                    if stored_hash != current {
-                        tracing::warn!(
-                            repo, branch,
-                            stored_hash, current_hash = current,
-                            "devcontainer.json changed — rebuild needed on next cold start"
-                        );
-                        // For now, we reuse the container and log the warning.
-                        // Full drain-and-rebuild is deferred to a future story.
-                    }
-                }
+            if let (Some(stored_hash), Some(current)) = (&entry.devcontainer_json_hash, &current_hash) && stored_hash != current {
+                tracing::warn!(
+                    repo, branch,
+                    %stored_hash, current_hash = %current,
+                    "devcontainer.json changed — rebuild needed on next cold start"
+                );
+                // For now, we reuse the container and log the warning.
+                // Full drain-and-rebuild is deferred to a future story.
             }
 
             // Reuse existing container — increment session count
@@ -151,8 +148,7 @@ impl ContainerManager {
             entry.container_name.clone()
         } else {
             // Cold start: no existing container, run devcontainer up
-            let container_name = self.cold_start(project_path, repo, branch, db).await?;
-            container_name
+            self.cold_start(project_path, repo, branch, db).await?
         };
 
         // Set up message channel and spawn processor
@@ -238,6 +234,7 @@ impl ContainerManager {
     }
 
     /// Internal helper to create session state and spawn message processor.
+    #[allow(clippy::too_many_arguments)]
     fn create_session_internal(
         &self,
         session_id: &str,
