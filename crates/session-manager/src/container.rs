@@ -13,6 +13,7 @@ use crate::config::settings;
 use crate::container_registry::{ContainerRegistry, ContainerState};
 use crate::database::Database;
 use crate::devcontainer;
+use crate::orchestrator_prompt;
 use crate::ssh;
 use crate::stream_json::{ContentPart, LineBuffer, OutputEvent, StreamLine, format_tool_action, signal_name};
 
@@ -44,6 +45,8 @@ struct Session {
     repo: String,
     /// Branch name for container registry lookups
     branch: String,
+    /// Session type: "standard", "orchestrator", "worker", "reviewer"
+    session_type: String,
     /// true → first message (no --resume); false → subsequent (--resume)
     is_first_message: Arc<AtomicBool>,
     /// Claude Code session ID captured from first invocation's init event
@@ -89,6 +92,7 @@ impl ContainerManager {
         db: &Database,
         output_tx: mpsc::Sender<OutputEvent>,
         plan_mode: bool,
+        session_type: &str,
     ) -> Result<StartResult> {
         let s = settings();
         let mut warning: Option<String> = None;
@@ -155,7 +159,7 @@ impl ContainerManager {
         let reused = existing.is_some();
         self.create_session_internal(
             session_id, &container_name, project_path, repo, branch,
-            output_tx, plan_mode,
+            output_tx, plan_mode, session_type,
         );
 
         Ok(StartResult {
@@ -244,6 +248,7 @@ impl ContainerManager {
         branch: &str,
         output_tx: mpsc::Sender<OutputEvent>,
         plan_mode: bool,
+        session_type: &str,
     ) {
         let (message_tx, message_rx) = mpsc::channel::<String>(32);
         let is_first_message = Arc::new(AtomicBool::new(true));
@@ -253,6 +258,7 @@ impl ContainerManager {
 
         let project_path_owned = project_path.to_string();
         let session_id_owned = session_id.to_string();
+        let session_type_owned = session_type.to_string();
         let is_first_clone = Arc::clone(&is_first_message);
         let claude_sid_clone = Arc::clone(&claude_session_id);
         let plan_mode_clone = Arc::clone(&plan_mode_flag);
@@ -263,6 +269,7 @@ impl ContainerManager {
                 output_tx,
                 project_path_owned,
                 session_id_owned,
+                session_type_owned,
                 is_first_clone,
                 claude_sid_clone,
                 plan_mode_clone,
@@ -278,6 +285,7 @@ impl ContainerManager {
                 worktree_path: None,
                 repo: repo.to_string(),
                 branch: branch.to_string(),
+                session_type: session_type.to_string(),
                 is_first_message,
                 claude_session_id,
                 plan_mode: plan_mode_flag,
@@ -296,11 +304,12 @@ impl ContainerManager {
         project_path: &str,
         repo: &str,
         branch: &str,
+        session_type: &str,
         output_tx: mpsc::Sender<OutputEvent>,
     ) {
         self.create_session_internal(
             session_id, container_name, project_path, repo, branch,
-            output_tx, false,
+            output_tx, false, session_type,
         );
 
         tracing::info!(
@@ -488,6 +497,7 @@ async fn message_processor(
     output_tx: mpsc::Sender<OutputEvent>,
     project_path: String,
     session_id: String,
+    session_type: String,
     is_first_message: Arc<AtomicBool>,
     claude_session_id: Arc<Mutex<Option<String>>>,
     plan_mode: Arc<AtomicBool>,
@@ -496,6 +506,19 @@ async fn message_processor(
     let s = settings();
 
     while let Some(message) = message_rx.recv().await {
+        // Prepend orchestrator prompt template on first message for orchestrator sessions
+        let message = if session_type == "orchestrator" && is_first_message.load(Ordering::SeqCst) {
+            let template = if let Ok(custom_path) = std::env::var("ORCHESTRATOR_PROMPT_PATH") {
+                orchestrator_prompt::load_custom_template(&custom_path)
+                    .unwrap_or_else(|| orchestrator_prompt::DEFAULT_TEMPLATE.to_string())
+            } else {
+                orchestrator_prompt::DEFAULT_TEMPLATE.to_string()
+            };
+            let rendered = orchestrator_prompt::render_template(&template, &project_path, &session_id);
+            format!("{}\n\n---\n\n{}", rendered, message)
+        } else {
+            message
+        };
         // Build claude command with --resume if we have a session ID
         let stored_sid = claude_session_id.lock().unwrap().clone();
         let mut claude_args = match stored_sid.as_deref() {

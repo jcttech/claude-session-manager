@@ -158,6 +158,7 @@ async fn main() -> Result<()> {
                     &session.project_path,
                     &reconnect_repo,
                     &reconnect_branch,
+                    &session.session_type,
                     output_tx,
                 );
 
@@ -479,7 +480,7 @@ async fn start_session(
     let (output_tx, output_rx) = mpsc::channel::<OutputEvent>(100);
     match state.containers.start(
         &session_id, &project_path, &repo_name, &branch_name,
-        &state.db, output_tx, plan_mode,
+        &state.db, output_tx, plan_mode, session_type,
     ).await {
         Ok(result) => {
             let session_duration = session_start_time.elapsed();
@@ -1593,7 +1594,7 @@ async fn handle_orchestrator_create_session(
     let (output_tx, output_rx) = mpsc::channel::<OutputEvent>(100);
     match state.containers.start(
         &session_id, &project_path, &worker_repo_name, &worker_branch,
-        &state.db, output_tx, false,
+        &state.db, output_tx, session_type == "reviewer", session_type,
     ).await {
         Ok(result) => {
             counter!("sessions_started_total").increment(1);
