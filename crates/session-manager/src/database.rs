@@ -17,12 +17,27 @@ pub struct StoredSession {
     pub project: String,
     pub project_path: String,
     pub container_name: String,
+    pub container_id: Option<i64>,
     pub session_type: String,
     pub parent_session_id: Option<String>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub last_activity_at: chrono::DateTime<chrono::Utc>,
     pub message_count: i32,
     pub compaction_count: i32,
+}
+
+#[derive(Debug, FromRow)]
+#[allow(dead_code)]
+pub struct StoredContainer {
+    pub id: i64,
+    pub repo: String,
+    pub branch: String,
+    pub container_name: String,
+    pub state: String,
+    pub session_count: i32,
+    pub last_activity_at: chrono::DateTime<chrono::Utc>,
+    pub devcontainer_json_hash: Option<String>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
 #[derive(Debug, FromRow)]
@@ -91,6 +106,35 @@ pub async fn create_schema(pool: &PgPool, schema: &str) -> Result<()> {
     // Migration: add project_path column to existing sessions table
     sqlx::query(&format!(
         "ALTER TABLE {}.sessions ADD COLUMN IF NOT EXISTS project_path TEXT NOT NULL DEFAULT ''",
+        schema
+    ))
+    .execute(pool)
+    .await?;
+
+    // Containers table: tracks devcontainers independently from sessions
+    sqlx::query(&format!(
+        r#"
+        CREATE TABLE IF NOT EXISTS {}.containers (
+            id BIGSERIAL PRIMARY KEY,
+            repo TEXT NOT NULL,
+            branch TEXT NOT NULL DEFAULT '',
+            container_name TEXT NOT NULL,
+            state TEXT NOT NULL DEFAULT 'running',
+            session_count INTEGER NOT NULL DEFAULT 0,
+            last_activity_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            devcontainer_json_hash TEXT,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            UNIQUE(repo, branch)
+        )
+        "#,
+        schema
+    ))
+    .execute(pool)
+    .await?;
+
+    // Migration: add container_id foreign key to sessions table
+    sqlx::query(&format!(
+        "ALTER TABLE {}.sessions ADD COLUMN IF NOT EXISTS container_id BIGINT",
         schema
     ))
     .execute(pool)
@@ -178,6 +222,20 @@ pub async fn create_schema(pool: &PgPool, schema: &str) -> Result<()> {
     .execute(pool)
     .await?;
 
+    sqlx::query(&format!(
+        "CREATE INDEX IF NOT EXISTS idx_containers_repo_branch ON {}.containers(repo, branch)",
+        schema
+    ))
+    .execute(pool)
+    .await?;
+
+    sqlx::query(&format!(
+        "CREATE INDEX IF NOT EXISTS idx_sessions_container_id ON {}.sessions(container_id)",
+        schema
+    ))
+    .execute(pool)
+    .await?;
+
     Ok(())
 }
 
@@ -238,7 +296,7 @@ impl Database {
         thread_id: &str,
     ) -> Result<Option<StoredSession>> {
         let session = sqlx::query_as::<_, StoredSession>(&format!(
-            "SELECT session_id, channel_id, thread_id, project, project_path, container_name, session_type, parent_session_id, created_at, last_activity_at, message_count, compaction_count \
+            "SELECT session_id, channel_id, thread_id, project, project_path, container_name, container_id, session_type, parent_session_id, created_at, last_activity_at, message_count, compaction_count \
              FROM {}.sessions WHERE channel_id = $1 AND thread_id = $2",
             SCHEMA
         ))
@@ -258,7 +316,7 @@ impl Database {
         }
 
         let session = sqlx::query_as::<_, StoredSession>(&format!(
-            "SELECT session_id, channel_id, thread_id, project, project_path, container_name, session_type, parent_session_id, created_at, last_activity_at, message_count, compaction_count \
+            "SELECT session_id, channel_id, thread_id, project, project_path, container_name, container_id, session_type, parent_session_id, created_at, last_activity_at, message_count, compaction_count \
              FROM {}.sessions WHERE session_id LIKE $1 LIMIT 1",
             SCHEMA
         ))
@@ -275,7 +333,7 @@ impl Database {
         channel_id: &str,
     ) -> Result<Vec<StoredSession>> {
         let sessions = sqlx::query_as::<_, StoredSession>(&format!(
-            "SELECT session_id, channel_id, thread_id, project, project_path, container_name, session_type, parent_session_id, created_at, last_activity_at, message_count, compaction_count \
+            "SELECT session_id, channel_id, thread_id, project, project_path, container_name, container_id, session_type, parent_session_id, created_at, last_activity_at, message_count, compaction_count \
              FROM {}.sessions WHERE channel_id = $1 AND session_type != 'worker'",
             SCHEMA
         ))
@@ -304,7 +362,7 @@ impl Database {
 
     pub async fn get_all_sessions(&self) -> Result<Vec<StoredSession>> {
         let sessions = sqlx::query_as::<_, StoredSession>(&format!(
-            "SELECT session_id, channel_id, thread_id, project, project_path, container_name, session_type, parent_session_id, created_at, last_activity_at, message_count, compaction_count \
+            "SELECT session_id, channel_id, thread_id, project, project_path, container_name, container_id, session_type, parent_session_id, created_at, last_activity_at, message_count, compaction_count \
              FROM {}.sessions",
             SCHEMA
         ))
@@ -450,6 +508,151 @@ impl Database {
         .bind(domain)
         .bind(action)
         .bind(approved_by)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    // --- Container operations ---
+
+    /// Create a new container record. Returns the generated ID.
+    pub async fn create_container(
+        &self,
+        repo: &str,
+        branch: &str,
+        container_name: &str,
+        devcontainer_json_hash: Option<&str>,
+    ) -> Result<i64> {
+        let row: (i64,) = sqlx::query_as(&format!(
+            "INSERT INTO {}.containers (repo, branch, container_name, devcontainer_json_hash) \
+             VALUES ($1, $2, $3, $4) RETURNING id",
+            SCHEMA
+        ))
+        .bind(repo)
+        .bind(branch)
+        .bind(container_name)
+        .bind(devcontainer_json_hash)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row.0)
+    }
+
+    /// Get a container by repo and branch.
+    pub async fn get_container_by_repo(
+        &self,
+        repo: &str,
+        branch: &str,
+    ) -> Result<Option<StoredContainer>> {
+        let container = sqlx::query_as::<_, StoredContainer>(&format!(
+            "SELECT id, repo, branch, container_name, state, session_count, last_activity_at, devcontainer_json_hash, created_at \
+             FROM {}.containers WHERE repo = $1 AND branch = $2",
+            SCHEMA
+        ))
+        .bind(repo)
+        .bind(branch)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(container)
+    }
+
+    /// Get all containers in "running" state (for registry sync on startup).
+    pub async fn get_running_containers(&self) -> Result<Vec<StoredContainer>> {
+        let containers = sqlx::query_as::<_, StoredContainer>(&format!(
+            "SELECT id, repo, branch, container_name, state, session_count, last_activity_at, devcontainer_json_hash, created_at \
+             FROM {}.containers WHERE state = 'running'",
+            SCHEMA
+        ))
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(containers)
+    }
+
+    /// Update the session count for a container.
+    pub async fn update_container_session_count(
+        &self,
+        container_id: i64,
+        session_count: i32,
+    ) -> Result<()> {
+        sqlx::query(&format!(
+            "UPDATE {}.containers SET session_count = $1, last_activity_at = NOW() WHERE id = $2",
+            SCHEMA
+        ))
+        .bind(session_count)
+        .bind(container_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Update container state (running, stopping, stopped).
+    pub async fn update_container_state(
+        &self,
+        container_id: i64,
+        state: &str,
+    ) -> Result<()> {
+        sqlx::query(&format!(
+            "UPDATE {}.containers SET state = $1, last_activity_at = NOW() WHERE id = $2",
+            SCHEMA
+        ))
+        .bind(state)
+        .bind(container_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Get all containers (for status display).
+    pub async fn get_all_containers(&self) -> Result<Vec<StoredContainer>> {
+        let containers = sqlx::query_as::<_, StoredContainer>(&format!(
+            "SELECT id, repo, branch, container_name, state, session_count, last_activity_at, devcontainer_json_hash, created_at \
+             FROM {}.containers",
+            SCHEMA
+        ))
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(containers)
+    }
+
+    /// Delete a container record.
+    pub async fn delete_container(&self, container_id: i64) -> Result<()> {
+        sqlx::query(&format!(
+            "DELETE FROM {}.containers WHERE id = $1",
+            SCHEMA
+        ))
+        .bind(container_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Get sessions associated with a specific container.
+    pub async fn get_sessions_by_container_id(
+        &self,
+        container_id: i64,
+    ) -> Result<Vec<StoredSession>> {
+        let sessions = sqlx::query_as::<_, StoredSession>(&format!(
+            "SELECT session_id, channel_id, thread_id, project, project_path, container_name, container_id, session_type, parent_session_id, created_at, last_activity_at, message_count, compaction_count \
+             FROM {}.sessions WHERE container_id = $1",
+            SCHEMA
+        ))
+        .bind(container_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(sessions)
+    }
+
+    /// Link a session to a container.
+    pub async fn set_session_container_id(
+        &self,
+        session_id: &str,
+        container_id: i64,
+    ) -> Result<()> {
+        sqlx::query(&format!(
+            "UPDATE {}.sessions SET container_id = $1 WHERE session_id = $2",
+            SCHEMA
+        ))
+        .bind(container_id)
+        .bind(session_id)
         .execute(&self.pool)
         .await?;
         Ok(())

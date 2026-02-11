@@ -25,6 +25,28 @@ ALTER DEFAULT PRIVILEGES IN SCHEMA session_manager
 -- By default, PostgreSQL grants USAGE on public schema to all roles, so revoke it
 REVOKE ALL ON SCHEMA public FROM session_manager_app;
 
+-- Containers table: tracks devcontainers independently from sessions
+-- Multiple sessions can share a single container (one-container-per-repo model)
+CREATE TABLE IF NOT EXISTS session_manager.containers (
+    id BIGSERIAL PRIMARY KEY,
+    repo TEXT NOT NULL,
+    branch TEXT NOT NULL DEFAULT '',
+    container_name TEXT NOT NULL,
+    state TEXT NOT NULL DEFAULT 'running',
+    session_count INTEGER NOT NULL DEFAULT 0,
+    last_activity_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    devcontainer_json_hash TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(repo, branch)
+);
+
+CREATE INDEX IF NOT EXISTS idx_containers_repo_branch
+    ON session_manager.containers(repo, branch);
+
+-- Migration: add container_id to sessions table
+-- ALTER TABLE session_manager.sessions ADD COLUMN IF NOT EXISTS container_id BIGINT;
+-- CREATE INDEX IF NOT EXISTS idx_sessions_container_id ON session_manager.sessions(container_id);
+
 -- Verify setup
 -- \dn+ session_manager
 -- \du session_manager_app

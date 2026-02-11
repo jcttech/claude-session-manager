@@ -1,5 +1,6 @@
 pub mod config;
 pub mod container;
+pub mod container_registry;
 pub mod database;
 pub mod devcontainer;
 pub mod git;
