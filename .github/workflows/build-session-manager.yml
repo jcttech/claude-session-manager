@@ -13,6 +13,7 @@ jobs:
     permissions:
       contents: write
       packages: write
+      pull-requests: read
     with:
       tag-prefix: 'session-manager/'
       image-name: 'claude-session-manager'
