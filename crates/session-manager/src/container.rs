@@ -450,13 +450,11 @@ impl ContainerManager {
             .map(|e| e.container_name);
 
         // Remove container via SSH
-        if let Some(ref name) = container_name {
-            if let Err(e) = self.remove_container_by_name(name).await {
-                tracing::warn!(
-                    container = %name, repo, branch, error = %e,
-                    "Failed to remove container via SSH (may already be gone)"
-                );
-            }
+        if let Some(ref name) = container_name && let Err(e) = self.remove_container_by_name(name).await {
+            tracing::warn!(
+                container = %name, repo, branch, error = %e,
+                "Failed to remove container via SSH (may already be gone)"
+            );
         }
 
         // Remove from registry and mark stopped in DB
