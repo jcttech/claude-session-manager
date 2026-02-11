@@ -470,6 +470,7 @@ async fn setup_sidebar_category(
 
 /// Start a session: clone/worktree repo, start container, create thread, persist to DB.
 /// Returns session_id on success.
+#[allow(clippy::too_many_arguments)]
 async fn start_session(
     state: &Arc<AppState>,
     channel_id: &str,
@@ -651,17 +652,15 @@ async fn cleanup_session(state: &AppState, session_id: &str, parent_session_id: 
     state.liveness.remove(session_id);
 
     // Unfollow thread for the user who started the session (fire-and-forget)
-    if let Ok(Some(session)) = state.db.get_session_by_id_prefix(&session_id[..8.min(session_id.len())]).await {
-        if let Some(ref uid) = session.user_id {
-            let mm = state.mm.clone();
-            let uid = uid.clone();
-            let tid = session.thread_id.clone();
-            tokio::spawn(async move {
-                if let Err(e) = mm.unfollow_thread(&uid, &tid).await {
-                    tracing::debug!(user_id = %uid, error = %e, "Failed to auto-unfollow thread (non-fatal)");
-                }
-            });
-        }
+    if let Ok(Some(session)) = state.db.get_session_by_id_prefix(&session_id[..8.min(session_id.len())]).await && let Some(ref uid) = session.user_id {
+        let mm = state.mm.clone();
+        let uid = uid.clone();
+        let tid = session.thread_id.clone();
+        tokio::spawn(async move {
+            if let Err(e) = mm.unfollow_thread(&uid, &tid).await {
+                tracing::debug!(user_id = %uid, error = %e, "Failed to auto-unfollow thread (non-fatal)");
+            }
+        });
     }
 
     // Decrement container session count in registry (don't remove the container)
