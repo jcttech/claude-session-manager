@@ -20,6 +20,7 @@ pub struct StoredSession {
     pub container_id: Option<i64>,
     pub session_type: String,
     pub parent_session_id: Option<String>,
+    pub user_id: Option<String>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub last_activity_at: chrono::DateTime<chrono::Utc>,
     pub message_count: i32,
@@ -135,6 +136,14 @@ pub async fn create_schema(pool: &PgPool, schema: &str) -> Result<()> {
     // Migration: add container_id foreign key to sessions table
     sqlx::query(&format!(
         "ALTER TABLE {}.sessions ADD COLUMN IF NOT EXISTS container_id BIGINT",
+        schema
+    ))
+    .execute(pool)
+    .await?;
+
+    // Migration: add user_id column to sessions table (for thread follow/unfollow)
+    sqlx::query(&format!(
+        "ALTER TABLE {}.sessions ADD COLUMN IF NOT EXISTS user_id TEXT",
         schema
     ))
     .execute(pool)
@@ -271,9 +280,10 @@ impl Database {
         container_name: &str,
         session_type: &str,
         parent_session_id: Option<&str>,
+        user_id: Option<&str>,
     ) -> Result<()> {
         sqlx::query(&format!(
-            "INSERT INTO {}.sessions (session_id, channel_id, thread_id, project, project_path, container_name, session_type, parent_session_id) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+            "INSERT INTO {}.sessions (session_id, channel_id, thread_id, project, project_path, container_name, session_type, parent_session_id, user_id) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
             SCHEMA
         ))
         .bind(session_id)
@@ -284,6 +294,7 @@ impl Database {
         .bind(container_name)
         .bind(session_type)
         .bind(parent_session_id)
+        .bind(user_id)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -296,7 +307,7 @@ impl Database {
         thread_id: &str,
     ) -> Result<Option<StoredSession>> {
         let session = sqlx::query_as::<_, StoredSession>(&format!(
-            "SELECT session_id, channel_id, thread_id, project, project_path, container_name, container_id, session_type, parent_session_id, created_at, last_activity_at, message_count, compaction_count \
+            "SELECT session_id, channel_id, thread_id, project, project_path, container_name, container_id, session_type, parent_session_id, user_id, created_at, last_activity_at, message_count, compaction_count \
              FROM {}.sessions WHERE channel_id = $1 AND thread_id = $2",
             SCHEMA
         ))
@@ -316,7 +327,7 @@ impl Database {
         }
 
         let session = sqlx::query_as::<_, StoredSession>(&format!(
-            "SELECT session_id, channel_id, thread_id, project, project_path, container_name, container_id, session_type, parent_session_id, created_at, last_activity_at, message_count, compaction_count \
+            "SELECT session_id, channel_id, thread_id, project, project_path, container_name, container_id, session_type, parent_session_id, user_id, created_at, last_activity_at, message_count, compaction_count \
              FROM {}.sessions WHERE session_id LIKE $1 LIMIT 1",
             SCHEMA
         ))
@@ -333,7 +344,7 @@ impl Database {
         channel_id: &str,
     ) -> Result<Vec<StoredSession>> {
         let sessions = sqlx::query_as::<_, StoredSession>(&format!(
-            "SELECT session_id, channel_id, thread_id, project, project_path, container_name, container_id, session_type, parent_session_id, created_at, last_activity_at, message_count, compaction_count \
+            "SELECT session_id, channel_id, thread_id, project, project_path, container_name, container_id, session_type, parent_session_id, user_id, created_at, last_activity_at, message_count, compaction_count \
              FROM {}.sessions WHERE channel_id = $1 AND session_type != 'worker'",
             SCHEMA
         ))
@@ -362,7 +373,7 @@ impl Database {
 
     pub async fn get_all_sessions(&self) -> Result<Vec<StoredSession>> {
         let sessions = sqlx::query_as::<_, StoredSession>(&format!(
-            "SELECT session_id, channel_id, thread_id, project, project_path, container_name, container_id, session_type, parent_session_id, created_at, last_activity_at, message_count, compaction_count \
+            "SELECT session_id, channel_id, thread_id, project, project_path, container_name, container_id, session_type, parent_session_id, user_id, created_at, last_activity_at, message_count, compaction_count \
              FROM {}.sessions",
             SCHEMA
         ))
@@ -631,7 +642,7 @@ impl Database {
         container_id: i64,
     ) -> Result<Vec<StoredSession>> {
         let sessions = sqlx::query_as::<_, StoredSession>(&format!(
-            "SELECT session_id, channel_id, thread_id, project, project_path, container_name, container_id, session_type, parent_session_id, created_at, last_activity_at, message_count, compaction_count \
+            "SELECT session_id, channel_id, thread_id, project, project_path, container_name, container_id, session_type, parent_session_id, user_id, created_at, last_activity_at, message_count, compaction_count \
              FROM {}.sessions WHERE container_id = $1",
             SCHEMA
         ))
