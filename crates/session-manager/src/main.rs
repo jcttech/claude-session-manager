@@ -687,6 +687,49 @@ async fn handle_messages(state: Arc<AppState>, mut rx: mpsc::Receiver<Post>, can
                         let _ = state.mm.post_in_thread(channel_id, root_id, "Stopped.").await;
                         continue;
                     }
+                    if cmd == "stop --container" {
+                        // Find the container's repo/branch from this session
+                        let container_info = state.containers.get_session_info(&session.session_id)
+                            .map(|_| {
+                                // Get repo/branch from the session's container entry
+                                // We need to look up the session in the DashMap for repo/branch
+                                let parts: Vec<&str> = session.project.splitn(2, '@').collect();
+                                let repo = parts[0].to_string();
+                                let branch = parts.get(1).unwrap_or(&"").to_string();
+                                (repo, branch)
+                            });
+
+                        if let Some((repo, branch)) = container_info {
+                            // Stop all sessions sharing this container
+                            let claimed = state.containers.stop_all_sessions_for_container(&repo, &branch);
+                            let count = claimed.len();
+
+                            // Clean up each claimed session (git locks, worktrees, DB, metrics)
+                            for (sid, claimed_session) in &claimed {
+                                state.git.release_repo_by_session(sid);
+                                if let Some(ref wt_path) = claimed_session.worktree_path {
+                                    state.git.cleanup_worktree_by_path(wt_path).await;
+                                }
+                                if let Err(e) = state.db.delete_session(sid).await {
+                                    tracing::warn!(session_id = %sid, error = %e, "Failed to delete session from database");
+                                }
+                                gauge!("active_sessions").decrement(1.0);
+                            }
+
+                            // Tear down the container
+                            if let Err(e) = state.containers.tear_down_container(&state.db, &repo, &branch).await {
+                                tracing::warn!(repo = %repo, branch = %branch, error = %e, "Failed to tear down container");
+                            }
+
+                            let _ = state.mm.post_in_thread(
+                                channel_id, root_id,
+                                &format!("Container stopped. {} sessions terminated.", count),
+                            ).await;
+                        } else {
+                            let _ = state.mm.post_in_thread(channel_id, root_id, "Could not find container for this session.").await;
+                        }
+                        continue;
+                    }
                     if cmd == "compact" {
                         let _ = state.containers.send(&session.session_id, "/compact").await;
                         let _ = state.mm.post_in_thread(channel_id, root_id, "Compacting context...").await;
@@ -754,6 +797,20 @@ async fn handle_messages(state: Arc<AppState>, mut rx: mpsc::Receiver<Post>, can
                         let info = state.containers.get_session_info(&session.session_id);
                         let plan_mode = info.as_ref().map(|i| i.plan_mode).unwrap_or(false);
                         let claude_sid = info.as_ref().and_then(|i| i.claude_session_id.as_deref().map(|s| format!("`{}`", &s[..8.min(s.len())])));
+
+                        // Look up container info for this session's repo/branch
+                        let parts: Vec<&str> = session.project.splitn(2, '@').collect();
+                        let repo = parts[0];
+                        let branch = parts.get(1).unwrap_or(&"");
+                        let container_entry = state.containers.registry.get_container(repo, branch).await;
+                        let container_line = match container_entry {
+                            Some(entry) => format!(
+                                "| Container | `{}` ({}, {} sessions) |",
+                                entry.container_name, entry.state, entry.session_count,
+                            ),
+                            None => "| Container | _unknown_ |".to_string(),
+                        };
+
                         let msg = format!(
 "**Session Status:**\n\
 | Property | Value |\n\
@@ -762,6 +819,7 @@ async fn handle_messages(state: Arc<AppState>, mut rx: mpsc::Receiver<Post>, can
 | Claude ID | {} |\n\
 | Type | {} |\n\
 | Project | **{}** |\n\
+{}\n\
 | Messages | {} |\n\
 | Compactions | {} |\n\
 | Plan mode | {} |\n\
@@ -771,6 +829,7 @@ async fn handle_messages(state: Arc<AppState>, mut rx: mpsc::Receiver<Post>, can
                             claude_sid.unwrap_or_else(|| "_none_".to_string()),
                             session.session_type,
                             session.project,
+                            container_line,
                             session.message_count,
                             session.compaction_count,
                             if plan_mode { "on" } else { "off" },
@@ -936,13 +995,44 @@ async fn handle_messages(state: Arc<AppState>, mut rx: mpsc::Receiver<Post>, can
                     continue;
                 }
 
-                // --- stop [short-id] ---
+                // --- stop [short-id | --all | --container <id>] ---
                 if cmd_text == "stop" || cmd_text.starts_with("stop ") {
                     let short_id = cmd_text.strip_prefix("stop").unwrap().trim();
 
-                    if short_id.is_empty() {
+                    if short_id == "--all" {
+                        // Stop all sessions and tear down all containers
+                        let containers = state.containers.registry.list_all().await;
+                        let mut total_sessions = 0;
+
+                        for ((repo, branch), _entry) in &containers {
+                            let claimed = state.containers.stop_all_sessions_for_container(repo, branch);
+                            total_sessions += claimed.len();
+
+                            // Clean up each claimed session
+                            for (sid, claimed_session) in &claimed {
+                                state.git.release_repo_by_session(sid);
+                                if let Some(ref wt_path) = claimed_session.worktree_path {
+                                    state.git.cleanup_worktree_by_path(wt_path).await;
+                                }
+                                if let Err(e) = state.db.delete_session(sid).await {
+                                    tracing::warn!(session_id = %sid, error = %e, "Failed to delete session from database");
+                                }
+                                gauge!("active_sessions").decrement(1.0);
+                            }
+
+                            // Tear down the container
+                            if let Err(e) = state.containers.tear_down_container(&state.db, repo, branch).await {
+                                tracing::warn!(repo = %repo, branch = %branch, error = %e, "Failed to tear down container");
+                            }
+                        }
+
+                        let _ = state.mm.post(channel_id, &format!(
+                            "All sessions and containers stopped. ({} sessions, {} containers)",
+                            total_sessions, containers.len(),
+                        )).await;
+                    } else if short_id.is_empty() {
                         // No short-id: show help
-                        let _ = state.mm.post(channel_id, "Usage: `@claude stop <session-id-prefix>` or reply `@claude stop` in a session thread.").await;
+                        let _ = state.mm.post(channel_id, "Usage: `@claude stop <session-id-prefix>`, `@claude stop --all`, or reply `@claude stop` in a session thread.").await;
                     } else {
                         // Stop by ID prefix
                         match state.db.get_session_by_id_prefix(short_id).await {
@@ -975,7 +1065,24 @@ async fn handle_messages(state: Arc<AppState>, mut rx: mpsc::Receiver<Post>, can
                         }
                         Ok(sessions) => {
                             let now = chrono::Utc::now();
-                            let mut msg = String::from("**Active Sessions:**\n");
+
+                            // Show container info first
+                            let containers = state.containers.registry.list_all().await;
+                            let mut msg = String::new();
+                            if !containers.is_empty() {
+                                msg.push_str("**Containers:**\n");
+                                for ((_repo, _branch), entry) in &containers {
+                                    msg.push_str(&format!(
+                                        "- Container: `{}` ({}, {} sessions)\n",
+                                        entry.container_name,
+                                        entry.state,
+                                        entry.session_count,
+                                    ));
+                                }
+                                msg.push('\n');
+                            }
+
+                            msg.push_str("**Active Sessions:**\n");
                             for s in &sessions {
                                 let idle = now - s.last_activity_at;
                                 msg.push_str(&format!(
@@ -1006,12 +1113,14 @@ async fn handle_messages(state: Arc<AppState>, mut rx: mpsc::Receiver<Post>, can
                         - `{trigger} start <repo> --plan` — Start in plan mode (read-only analysis)\n\
                         - `{trigger} orchestrate <org/repo>` — Start an orchestrator session\n\
                         - `{trigger} stop <id-prefix>` — Stop a session by ID prefix\n\
-                        - `{trigger} status` — List all active sessions\n\
+                        - `{trigger} stop --all` — Stop all sessions and tear down all containers\n\
+                        - `{trigger} status` — List all active sessions and containers\n\
                         - `{trigger} help` — Show this message\n\
                         \n\
                         **In a session thread:**\n\
                         - Reply directly to send input\n\
                         - `{trigger} stop` — End the session\n\
+                        - `{trigger} stop --container` — Stop all sessions sharing this container and tear it down\n\
                         - `{trigger} compact` — Compact/summarize context\n\
                         - `{trigger} clear` — Clear conversation history\n\
                         - `{trigger} restart` — Restart Claude conversation\n\

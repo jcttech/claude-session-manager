@@ -408,6 +408,67 @@ impl ContainerManager {
             is_first_message: s.is_first_message.load(Ordering::SeqCst),
         })
     }
+
+    /// Find and claim all sessions that belong to a given (repo, branch) container.
+    /// Returns the list of claimed sessions.
+    pub fn stop_all_sessions_for_container(&self, repo: &str, branch: &str) -> Vec<(String, ClaimedSession)> {
+        // First, collect session IDs that match the repo/branch
+        let matching_ids: Vec<String> = self
+            .sessions
+            .iter()
+            .filter(|entry| entry.value().repo == repo && entry.value().branch == branch)
+            .map(|entry| entry.key().clone())
+            .collect();
+
+        // Then claim each one (atomic removal from DashMap)
+        let mut claimed = Vec::new();
+        for session_id in matching_ids {
+            if let Some((id, session)) = self.sessions.remove(&session_id) {
+                claimed.push((id, ClaimedSession {
+                    name: session.name,
+                    worktree_path: session.worktree_path,
+                    repo: session.repo,
+                    branch: session.branch,
+                }));
+            }
+        }
+        claimed
+    }
+
+    /// Tear down a container: set state to Stopping, remove via SSH, remove from registry, mark stopped in DB.
+    pub async fn tear_down_container(&self, db: &Database, repo: &str, branch: &str) -> Result<()> {
+        // Set state to Stopping
+        self.registry
+            .set_state(db, repo, branch, ContainerState::Stopping)
+            .await?;
+
+        // Get the container name for removal
+        let container_name = self
+            .registry
+            .get_container(repo, branch)
+            .await
+            .map(|e| e.container_name);
+
+        // Remove container via SSH
+        if let Some(ref name) = container_name {
+            if let Err(e) = self.remove_container_by_name(name).await {
+                tracing::warn!(
+                    container = %name, repo, branch, error = %e,
+                    "Failed to remove container via SSH (may already be gone)"
+                );
+            }
+        }
+
+        // Remove from registry and mark stopped in DB
+        self.registry.remove_container(db, repo, branch).await?;
+
+        tracing::info!(
+            repo, branch,
+            container = container_name.as_deref().unwrap_or("unknown"),
+            "Container torn down"
+        );
+        Ok(())
+    }
 }
 
 /// Live runtime info for a session (from ContainerManager)
