@@ -25,13 +25,15 @@ impl std::fmt::Display for ContainerState {
     }
 }
 
-impl ContainerState {
-    pub fn from_str(s: &str) -> Self {
-        match s {
+impl std::str::FromStr for ContainerState {
+    type Err = std::convert::Infallible;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(match s {
             "running" => Self::Running,
             "stopping" => Self::Stopping,
             _ => Self::Stopped,
-        }
+        })
     }
 }
 
@@ -75,7 +77,7 @@ impl ContainerRegistry {
             entries.insert(key, ContainerEntry {
                 container_id: c.id,
                 container_name: c.container_name,
-                state: ContainerState::from_str(&c.state),
+                state: c.state.parse().unwrap_or(ContainerState::Stopped),
                 session_count: c.session_count,
                 last_activity_at: c.last_activity_at,
                 devcontainer_json_hash: c.devcontainer_json_hash,
@@ -328,10 +330,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_container_state_from_str() {
-        assert_eq!(ContainerState::from_str("running"), ContainerState::Running);
-        assert_eq!(ContainerState::from_str("stopping"), ContainerState::Stopping);
-        assert_eq!(ContainerState::from_str("stopped"), ContainerState::Stopped);
-        assert_eq!(ContainerState::from_str("unknown"), ContainerState::Stopped);
+        assert_eq!("running".parse::<ContainerState>().unwrap(), ContainerState::Running);
+        assert_eq!("stopping".parse::<ContainerState>().unwrap(), ContainerState::Stopping);
+        assert_eq!("stopped".parse::<ContainerState>().unwrap(), ContainerState::Stopped);
+        assert_eq!("unknown".parse::<ContainerState>().unwrap(), ContainerState::Stopped);
     }
 
     #[tokio::test]
