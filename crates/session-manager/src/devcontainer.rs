@@ -137,6 +137,27 @@ impl DevcontainerConfig {
     }
 }
 
+/// Compute a SHA-256 hash of the devcontainer.json content on the VM.
+/// Returns `None` if the file doesn't exist or can't be read.
+pub async fn hash_config(project_path: &str) -> Option<String> {
+    use sha2::{Sha256, Digest};
+    let escaped = escape(Cow::Borrowed(project_path));
+
+    // Try both locations
+    let cmd = format!(
+        "cat {}/.devcontainer/devcontainer.json 2>/dev/null || cat {}/.devcontainer.json 2>/dev/null",
+        escaped, escaped
+    );
+    let content = ssh::run_command(&cmd).await.ok()?;
+    if content.is_empty() {
+        return None;
+    }
+
+    let mut hasher = Sha256::new();
+    hasher.update(content.as_bytes());
+    Some(format!("{:x}", hasher.finalize()))
+}
+
 /// Find the start index of a `//` line comment outside of a JSON string.
 /// Returns `None` if no comment found.
 #[cfg(test)]
