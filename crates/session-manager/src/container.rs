@@ -46,7 +46,7 @@ struct Session {
     /// Branch name for container registry lookups
     branch: String,
     /// Session type: "standard", "orchestrator", "worker", "reviewer"
-    session_type: String,
+    _session_type: String,
     /// true → first message (no --resume); false → subsequent (--resume)
     is_first_message: Arc<AtomicBool>,
     /// Claude Code session ID captured from first invocation's init event
@@ -285,7 +285,7 @@ impl ContainerManager {
                 worktree_path: None,
                 repo: repo.to_string(),
                 branch: branch.to_string(),
-                session_type: session_type.to_string(),
+                _session_type: session_type.to_string(),
                 is_first_message,
                 claude_session_id,
                 plan_mode: plan_mode_flag,
@@ -297,6 +297,7 @@ impl ContainerManager {
     /// Reconnect to an existing session after a restart.
     /// Creates in-memory state (channels, message_processor) without running `devcontainer up`.
     /// The container must already be running.
+    #[allow(clippy::too_many_arguments)]
     pub fn reconnect(
         &self,
         session_id: &str,
