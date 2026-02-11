@@ -46,6 +46,9 @@ pub struct ContainerEntry {
     pub session_count: i32,
     pub last_activity_at: DateTime<Utc>,
     pub devcontainer_json_hash: Option<String>,
+    /// Timestamp when session_count last transitioned to 0.
+    /// Used by the idle monitor to determine how long a container has been empty.
+    pub last_session_stopped_at: Option<DateTime<Utc>>,
 }
 
 /// Key for the container registry: (repo, branch).
@@ -74,6 +77,11 @@ impl ContainerRegistry {
         entries.clear();
         for c in containers {
             let key = (c.repo.clone(), c.branch.clone());
+            let last_session_stopped_at = if c.session_count == 0 {
+                Some(c.last_activity_at)
+            } else {
+                None
+            };
             entries.insert(key, ContainerEntry {
                 container_id: c.id,
                 container_name: c.container_name,
@@ -81,6 +89,7 @@ impl ContainerRegistry {
                 session_count: c.session_count,
                 last_activity_at: c.last_activity_at,
                 devcontainer_json_hash: c.devcontainer_json_hash,
+                last_session_stopped_at,
             });
         }
         tracing::info!(count = entries.len(), "Container registry synced from database");
@@ -108,6 +117,7 @@ impl ContainerRegistry {
             session_count: 0,
             last_activity_at: now,
             devcontainer_json_hash: devcontainer_json_hash.map(|s| s.to_string()),
+            last_session_stopped_at: Some(now),
         };
 
         let key = (repo.to_string(), branch.to_string());
@@ -130,6 +140,7 @@ impl ContainerRegistry {
     }
 
     /// Increment session count for a container. Returns the new count.
+    /// Clears `last_session_stopped_at` since the container is no longer idle.
     pub async fn increment_sessions(
         &self,
         db: &Database,
@@ -144,6 +155,7 @@ impl ContainerRegistry {
 
         entry.session_count += 1;
         entry.last_activity_at = Utc::now();
+        entry.last_session_stopped_at = None;
         let new_count = entry.session_count;
         let container_id = entry.container_id;
         drop(entries);
@@ -155,6 +167,7 @@ impl ContainerRegistry {
     }
 
     /// Decrement session count for a container. Returns the new count.
+    /// When the count transitions to 0, records `last_session_stopped_at` for idle monitoring.
     pub async fn decrement_sessions(
         &self,
         db: &Database,
@@ -168,7 +181,11 @@ impl ContainerRegistry {
             .ok_or_else(|| anyhow::anyhow!("Container not found for {}/{}", repo, branch))?;
 
         entry.session_count = (entry.session_count - 1).max(0);
-        entry.last_activity_at = Utc::now();
+        let now = Utc::now();
+        entry.last_activity_at = now;
+        if entry.session_count == 0 {
+            entry.last_session_stopped_at = Some(now);
+        }
         let new_count = entry.session_count;
         let container_id = entry.container_id;
         drop(entries);
@@ -250,6 +267,7 @@ mod tests {
             session_count: sessions,
             last_activity_at: Utc::now(),
             devcontainer_json_hash: None,
+            last_session_stopped_at: if sessions == 0 { Some(Utc::now()) } else { None },
         }
     }
 
