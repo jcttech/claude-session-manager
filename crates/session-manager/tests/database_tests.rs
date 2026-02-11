@@ -728,20 +728,6 @@ async fn test_container_crud() {
     .bind("main")
     .bind("claude-abc123")
     .bind("sha256:abcdef1234567890")
-    .execute(&mut *tx)
-    .await
-    .map(|_| ())
-    .ok();
-
-    let row: (i64,) = sqlx::query_as(&format!(
-        "INSERT INTO {}.containers (repo, branch, container_name, devcontainer_json_hash) \
-         VALUES ($1, $2, $3, $4) RETURNING id",
-        TEST_SCHEMA
-    ))
-    .bind("jcttech/claude-session-manager")
-    .bind("main")
-    .bind("claude-abc123")
-    .bind("sha256:abcdef1234567890")
     .fetch_one(&mut *tx)
     .await
     .expect("Failed to insert container");
