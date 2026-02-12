@@ -111,6 +111,10 @@ pub struct Settings {
     /// Idle timeout in seconds before tearing down empty containers (0 = no auto-teardown)
     #[serde(default = "default_container_idle_timeout_secs")]
     pub container_idle_timeout_secs: u64,
+
+    /// Seconds of inactivity before posting a liveness warning in the thread (0 = disabled)
+    #[serde(default = "default_session_liveness_timeout_secs")]
+    pub session_liveness_timeout_secs: u64,
 }
 
 fn default_vm_user() -> String { "claude".into() }
@@ -136,6 +140,7 @@ fn default_repos_base_path() -> String { "/home/claude/repos".into() }
 fn default_worktrees_path() -> String { "/home/claude/worktrees".into() }
 fn default_container_max_sessions() -> i32 { 5 }
 fn default_container_idle_timeout_secs() -> u64 { 1800 }
+fn default_session_liveness_timeout_secs() -> u64 { 120 }
 
 static SETTINGS: OnceLock<Settings> = OnceLock::new();
 

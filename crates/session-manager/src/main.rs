@@ -17,6 +17,7 @@ use uuid::Uuid;
 use mattermost_client::{sanitize_channel_name, Mattermost, Post};
 use session_manager::config;
 use session_manager::container::ContainerManager;
+use session_manager::liveness::{LivenessState, format_duration_short};
 use session_manager::stream_json::OutputEvent;
 use session_manager::crypto::{sign_request, verify_signature};
 use session_manager::database::{self, Database};
@@ -70,6 +71,7 @@ struct AppState {
     git: GitManager,
     opnsense: OPNsense,
     db: Database,
+    liveness: LivenessState,
 }
 
 #[derive(Deserialize)]
@@ -121,12 +123,15 @@ async fn main() -> Result<()> {
     let git = GitManager::new();
     let db = Database::new().await?;
 
+    let liveness = LivenessState::new();
+
     let state = Arc::new(AppState {
         mm,
         containers,
         git,
         opnsense,
         db,
+        liveness,
     });
 
     // Sync container registry from database
@@ -160,6 +165,13 @@ async fn main() -> Result<()> {
                     &reconnect_branch,
                     &session.session_type,
                     output_tx,
+                );
+
+                // Register for liveness tracking
+                state.liveness.register(
+                    &session.session_id,
+                    &session.channel_id,
+                    &session.thread_id,
                 );
 
                 let state_clone = state.clone();
@@ -223,6 +235,13 @@ async fn main() -> Result<()> {
         cleanup_stale_requests(state_clone, cancel_clone).await;
     });
 
+    // Start liveness monitor
+    let state_clone = state.clone();
+    let cancel_clone = cancel_token.clone();
+    let liveness_handle = tokio::spawn(async move {
+        spawn_liveness_monitor(state_clone, cancel_clone).await;
+    });
+
     // Configure rate limiting
     let s = config::settings();
     let rate_limiter = RateLimitLayer::new(s.rate_limit_rps, s.rate_limit_burst);
@@ -259,6 +278,7 @@ async fn main() -> Result<()> {
         let _ = listener_handle.await;
         let _ = handler_handle.await;
         let _ = cleanup_handle.await;
+        let _ = liveness_handle.await;
         let _ = rate_limit_handle.await;
     })
     .await;
@@ -324,6 +344,39 @@ async fn cleanup_stale_requests(state: Arc<AppState>, cancel_token: Cancellation
             }
             _ = cancel_token.cancelled() => {
                 tracing::info!("Cleanup task cancelled");
+                break;
+            }
+        }
+    }
+}
+
+/// Liveness monitor: periodically checks for sessions with no recent output
+/// and posts a warning in the thread.
+async fn spawn_liveness_monitor(state: Arc<AppState>, cancel_token: CancellationToken) {
+    let mut interval = tokio::time::interval(Duration::from_secs(30));
+    loop {
+        tokio::select! {
+            _ = interval.tick() => {
+                let timeout = config::settings().session_liveness_timeout_secs;
+                if timeout == 0 {
+                    continue;
+                }
+                for stale in state.liveness.get_stale(timeout) {
+                    let msg = format!(
+                        ":warning: No output activity for **{}**. Session may be unresponsive. Use `stop` to end it or wait for it to resume.",
+                        format_duration_short(stale.idle_duration)
+                    );
+                    let _ = state.mm.post_in_thread(&stale.channel_id, &stale.thread_id, &msg).await;
+                    state.liveness.mark_warned(&stale.session_id);
+                    tracing::warn!(
+                        session_id = %stale.session_id,
+                        idle_secs = stale.idle_duration.as_secs(),
+                        "Liveness warning posted"
+                    );
+                }
+            }
+            _ = cancel_token.cancelled() => {
+                tracing::info!("Liveness monitor cancelled");
                 break;
             }
         }
@@ -417,6 +470,7 @@ async fn setup_sidebar_category(
 
 /// Start a session: clone/worktree repo, start container, create thread, persist to DB.
 /// Returns session_id on success.
+#[allow(clippy::too_many_arguments)]
 async fn start_session(
     state: &Arc<AppState>,
     channel_id: &str,
@@ -425,6 +479,7 @@ async fn start_session(
     session_type: &str,
     parent_session_id: Option<&str>,
     plan_mode: bool,
+    user_id: Option<&str>,
 ) -> Result<String> {
     use std::path::PathBuf;
 
@@ -497,6 +552,9 @@ async fn start_session(
                 let _ = state.mm.post_in_thread(channel_id, &thread_id, warning).await;
             }
 
+            // Register liveness tracking
+            state.liveness.register(&session_id, channel_id, &thread_id);
+
             // Persist session to database — if this fails, clean up everything (fix 1b)
             if let Err(e) = state.db.create_session(
                 &session_id,
@@ -507,6 +565,7 @@ async fn start_session(
                 &result.container_name,
                 session_type,
                 parent_session_id,
+                user_id,
             ).await {
                 tracing::error!(
                     session_id = %session_id,
@@ -515,6 +574,18 @@ async fn start_session(
                 );
                 cleanup_session(state, &session_id, parent_session_id).await;
                 return Err(anyhow::anyhow!("Failed to persist session to database: {}", e));
+            }
+
+            // Auto-follow thread for the requesting user (fire-and-forget)
+            if let Some(uid) = user_id {
+                let mm = state.mm.clone();
+                let uid = uid.to_string();
+                let tid = thread_id.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = mm.follow_thread(&uid, &tid).await {
+                        tracing::debug!(user_id = %uid, error = %e, "Failed to auto-follow thread (non-fatal)");
+                    }
+                });
             }
 
             tracing::info!(
@@ -576,6 +647,21 @@ async fn cleanup_session(state: &AppState, session_id: &str, parent_session_id: 
         tracing::debug!(session_id = %session_id, "Session already cleaned up by another path");
         return;
     };
+
+    // Remove from liveness tracking
+    state.liveness.remove(session_id);
+
+    // Unfollow thread for the user who started the session (fire-and-forget)
+    if let Ok(Some(session)) = state.db.get_session_by_id_prefix(&session_id[..8.min(session_id.len())]).await && let Some(ref uid) = session.user_id {
+        let mm = state.mm.clone();
+        let uid = uid.clone();
+        let tid = session.thread_id.clone();
+        tokio::spawn(async move {
+            if let Err(e) = mm.unfollow_thread(&uid, &tid).await {
+                tracing::debug!(user_id = %uid, error = %e, "Failed to auto-unfollow thread (non-fatal)");
+            }
+        });
+    }
 
     // Decrement container session count in registry (don't remove the container)
     match state.containers.release_session(&state.db, &claimed.repo, &claimed.branch).await {
@@ -812,6 +898,18 @@ async fn handle_messages(state: Arc<AppState>, mut rx: mpsc::Receiver<Post>, can
                             None => "| Container | _unknown_ |".to_string(),
                         };
 
+                        // Liveness info
+                        let liveness_info = state.liveness.get_info(&session.session_id);
+                        let last_active_str = match &liveness_info {
+                            Some(li) => format!("{} ago ({})", format_duration_short(li.idle_duration), li.last_event_type),
+                            None => "_unknown_".to_string(),
+                        };
+                        let liveness_str = match &liveness_info {
+                            Some(li) if li.warning_posted => ":warning: warning posted".to_string(),
+                            Some(_) => "ok".to_string(),
+                            None => "_untracked_".to_string(),
+                        };
+
                         let msg = format!(
 "**Session Status:**\n\
 | Property | Value |\n\
@@ -825,7 +923,9 @@ async fn handle_messages(state: Arc<AppState>, mut rx: mpsc::Receiver<Post>, can
 | Compactions | {} |\n\
 | Plan mode | {} |\n\
 | Age | {} |\n\
-| Idle | {} |",
+| Idle | {} |\n\
+| Last active | {} |\n\
+| Liveness | {} |",
                             &session.session_id[..8.min(session.session_id.len())],
                             claude_sid.unwrap_or_else(|| "_none_".to_string()),
                             session.session_type,
@@ -836,6 +936,8 @@ async fn handle_messages(state: Arc<AppState>, mut rx: mpsc::Receiver<Post>, can
                             if plan_mode { "on" } else { "off" },
                             format_duration(age),
                             format_duration(idle),
+                            last_active_str,
+                            liveness_str,
                         );
                         let _ = state.mm.post_in_thread(channel_id, root_id, &msg).await;
                         continue;
@@ -921,6 +1023,7 @@ async fn handle_messages(state: Arc<AppState>, mut rx: mpsc::Receiver<Post>, can
                                     "standard",
                                     None,
                                     plan_mode,
+                                    Some(&post.user_id),
                                 ).await {
                                     Ok(session_id) => {
                                         let _ = state.mm.post(channel_id, &format!(
@@ -976,6 +1079,7 @@ async fn handle_messages(state: Arc<AppState>, mut rx: mpsc::Receiver<Post>, can
                                 "orchestrator",
                                 None,
                                 false,
+                                Some(&post.user_id),
                             ).await {
                                 Ok(session_id) => {
                                     let _ = state.mm.post(channel_id, &format!(
@@ -1232,6 +1336,7 @@ async fn stream_output(
 
                 match event {
                     OutputEvent::ProcessingStarted { input_tokens } => {
+                        state.liveness.update_activity(&session_id, "ProcessingStarted");
                         // Start a new status post (reset from previous turn)
                         status_lines.clear();
                         status_lines.push(format!("_Processing... (context: {} tokens)_", input_tokens));
@@ -1242,6 +1347,7 @@ async fn stream_output(
                         }
                     }
                     OutputEvent::TextLine(line) => {
+                        state.liveness.update_activity(&session_id, "TextLine");
                         // Check for markers — flush batch before processing
                         if let Some(caps) = network_re.captures(&line) {
                             flush_batch(&state, &channel_id, &thread_id, &session_id, &mut batch).await;
@@ -1288,6 +1394,7 @@ async fn stream_output(
                         batch_timer.as_mut().reset(tokio::time::Instant::now() + BATCH_TIMEOUT);
                     }
                     OutputEvent::ToolAction(action) => {
+                        state.liveness.update_activity(&session_id, "ToolAction");
                         // Flush any accumulated text batch before updating status
                         flush_batch(&state, &channel_id, &thread_id, &session_id, &mut batch).await;
                         batch_bytes = 0;
@@ -1304,6 +1411,7 @@ async fn stream_output(
                         }
                     }
                     OutputEvent::TitleGenerated(title) => {
+                        state.liveness.update_activity(&session_id, "TitleGenerated");
                         flush_batch(&state, &channel_id, &thread_id, &session_id, &mut batch).await;
                         batch_bytes = 0;
                         let title = title.trim().trim_matches('"');
@@ -1312,6 +1420,7 @@ async fn stream_output(
                         let _ = state.mm.post_in_thread(&channel_id, &thread_id, "Title updated.").await;
                     }
                     OutputEvent::ResponseComplete { input_tokens, output_tokens } => {
+                        state.liveness.update_activity(&session_id, "ResponseComplete");
                         flush_batch(&state, &channel_id, &thread_id, &session_id, &mut batch).await;
                         batch_bytes = 0;
                         counter!("tokens_input_total").increment(input_tokens);
@@ -1600,6 +1709,9 @@ async fn handle_orchestrator_create_session(
             counter!("sessions_started_total").increment(1);
             gauge!("active_sessions").increment(1.0);
 
+            // Register liveness tracking for worker session
+            state.liveness.register(&session_id, &channel_id, &thread_id);
+
             // Persist session — if this fails, clean up the container (fix 1b)
             if let Err(e) = state.db.create_session(
                 &session_id,
@@ -1610,6 +1722,7 @@ async fn handle_orchestrator_create_session(
                 &result.container_name,
                 session_type,
                 Some(parent_session_id),
+                None, // worker sessions don't have a requesting user
             ).await {
                 tracing::error!(session_id = %session_id, error = %e, "Failed to persist worker session, cleaning up");
                 cleanup_session(state, &session_id, Some(parent_session_id)).await;
@@ -1751,6 +1864,7 @@ async fn stream_output_worker(
 
                 match event {
                     OutputEvent::ProcessingStarted { input_tokens } => {
+                        state.liveness.update_activity(&session_id, "ProcessingStarted");
                         status_lines.clear();
                         status_lines.push(format!("_Processing... (context: {} tokens)_", input_tokens));
                         let msg = status_lines.join("\n");
@@ -1760,6 +1874,7 @@ async fn stream_output_worker(
                         }
                     }
                     OutputEvent::TextLine(line) => {
+                        state.liveness.update_activity(&session_id, "TextLine");
                         // Check for network request markers — flush batch first
                         if let Some(caps) = network_re.captures(&line) {
                             flush_batch(&state, &channel_id, &thread_id, &session_id, &mut batch).await;
@@ -1781,6 +1896,7 @@ async fn stream_output_worker(
                         batch_timer.as_mut().reset(tokio::time::Instant::now() + BATCH_TIMEOUT);
                     }
                     OutputEvent::ToolAction(action) => {
+                        state.liveness.update_activity(&session_id, "ToolAction");
                         flush_batch(&state, &channel_id, &thread_id, &session_id, &mut batch).await;
                         batch_bytes = 0;
                         status_lines.push(format!("> {}", action));
@@ -1795,6 +1911,7 @@ async fn stream_output_worker(
                         // Worker sessions don't support title generation
                     }
                     OutputEvent::ResponseComplete { input_tokens, output_tokens } => {
+                        state.liveness.update_activity(&session_id, "ResponseComplete");
                         flush_batch(&state, &channel_id, &thread_id, &session_id, &mut batch).await;
                         batch_bytes = 0;
                         counter!("tokens_input_total").increment(input_tokens);

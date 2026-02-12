@@ -467,6 +467,50 @@ impl Mattermost {
         Ok(cat.id)
     }
 
+    // --- Thread follow/unfollow ---
+
+    /// Follow a thread on behalf of a user.
+    pub async fn follow_thread(&self, user_id: &str, thread_id: &str) -> Result<()> {
+        let resp = self
+            .client
+            .put(format!(
+                "{}/users/{}/threads/{}/following",
+                self.base_url, user_id, thread_id
+            ))
+            .header("Authorization", self.auth_header())
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(anyhow!("Failed to follow thread: {} {}", status, body));
+        }
+
+        Ok(())
+    }
+
+    /// Unfollow a thread on behalf of a user.
+    pub async fn unfollow_thread(&self, user_id: &str, thread_id: &str) -> Result<()> {
+        let resp = self
+            .client
+            .delete(format!(
+                "{}/users/{}/threads/{}/following",
+                self.base_url, user_id, thread_id
+            ))
+            .header("Authorization", self.auth_header())
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(anyhow!("Failed to unfollow thread: {} {}", status, body));
+        }
+
+        Ok(())
+    }
+
     /// Add a channel to a user's sidebar category
     pub async fn add_channel_to_category(
         &self,

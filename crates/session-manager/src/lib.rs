@@ -5,6 +5,7 @@ pub mod database;
 pub mod devcontainer;
 pub mod git;
 pub mod idle_monitor;
+pub mod liveness;
 pub mod opnsense;
 pub mod orchestrator_prompt;
 pub mod ssh;
