@@ -129,6 +129,11 @@ async fn main() -> Result<()> {
         db,
     });
 
+    // Sync container registry from database
+    if let Err(e) = state.containers.registry.sync_from_db(&state.db).await {
+        tracing::warn!(error = %e, "Failed to sync container registry from database");
+    }
+
     // Reconnect any sessions that survived a restart
     match state.db.get_all_sessions().await {
         Ok(sessions) if !sessions.is_empty() => {
@@ -142,10 +147,17 @@ async fn main() -> Result<()> {
                     continue;
                 }
                 let (output_tx, output_rx) = mpsc::channel::<OutputEvent>(100);
+                // Extract repo/branch from session project for registry tracking
+                let (reconnect_repo, reconnect_branch) = {
+                    let parts: Vec<&str> = session.project.splitn(2, '@').collect();
+                    (parts[0].to_string(), parts.get(1).unwrap_or(&"").to_string())
+                };
                 state.containers.reconnect(
                     &session.session_id,
                     &session.container_name,
                     &session.project_path,
+                    &reconnect_repo,
+                    &reconnect_branch,
                     output_tx,
                 );
 
@@ -461,9 +473,15 @@ async fn start_session(
     let _ = state.mm.post_in_thread(channel_id, &thread_id, "Starting session...").await;
     let session_start_time = std::time::Instant::now();
 
+    let repo_name = repo_ref.full_name();
+    let branch_name = repo_ref.branch.clone().unwrap_or_default();
+
     let (output_tx, output_rx) = mpsc::channel::<OutputEvent>(100);
-    match state.containers.start(&session_id, &project_path, output_tx, plan_mode).await {
-        Ok(name) => {
+    match state.containers.start(
+        &session_id, &project_path, &repo_name, &branch_name,
+        &state.db, output_tx, plan_mode,
+    ).await {
+        Ok(result) => {
             let session_duration = session_start_time.elapsed();
             histogram!("session_start_duration_seconds").record(session_duration.as_secs_f64());
             counter!("sessions_started_total").increment(1);
@@ -473,6 +491,11 @@ async fn start_session(
                 state.containers.set_worktree_path(&session_id, wt_path);
             }
 
+            // Post same-branch warning if applicable
+            if let Some(ref warning) = result.warning {
+                let _ = state.mm.post_in_thread(channel_id, &thread_id, warning).await;
+            }
+
             // Persist session to database — if this fails, clean up everything (fix 1b)
             if let Err(e) = state.db.create_session(
                 &session_id,
@@ -480,7 +503,7 @@ async fn start_session(
                 &thread_id,
                 project_input,
                 &project_path,
-                &name,
+                &result.container_name,
                 session_type,
                 parent_session_id,
             ).await {
@@ -495,17 +518,19 @@ async fn start_session(
 
             tracing::info!(
                 session_id = %session_id,
-                container = %name,
+                container = %result.container_name,
                 project = %project_input,
                 session_type = %session_type,
+                reused = result.reused,
                 "Session started"
             );
 
-            let _ = state.mm.post_in_thread(
-                channel_id,
-                &thread_id,
-                &format!("Ready. Container: `{}`", name),
-            ).await;
+            let ready_msg = if result.reused {
+                format!("Ready. Container: `{}` (reused)", result.container_name)
+            } else {
+                format!("Ready. Container: `{}`", result.container_name)
+            };
+            let _ = state.mm.post_in_thread(channel_id, &thread_id, &ready_msg).await;
 
             // Start output streaming
             let state_clone = state.clone();
@@ -540,6 +565,10 @@ async fn start_session(
 /// Centralized session cleanup. Uses atomic `claim_session()` as a guard:
 /// whichever caller (stop command vs stream-end) claims first does cleanup;
 /// the other is a no-op. This prevents double-decrement of metrics.
+///
+/// With multi-session containers: decrements the container's session count
+/// instead of immediately removing the container. The container stays alive
+/// for other sessions or until the idle timeout expires.
 async fn cleanup_session(state: &AppState, session_id: &str, parent_session_id: Option<&str>) {
     // Atomic claim — only one caller will succeed
     let Some(claimed) = state.containers.claim_session(session_id) else {
@@ -547,9 +576,27 @@ async fn cleanup_session(state: &AppState, session_id: &str, parent_session_id: 
         return;
     };
 
-    // Remove container
-    if let Err(e) = state.containers.remove_container_by_name(&claimed.name).await {
-        tracing::warn!(session_id = %session_id, error = %e, "Failed to remove container");
+    // Decrement container session count in registry (don't remove the container)
+    match state.containers.release_session(&state.db, &claimed.repo, &claimed.branch).await {
+        Ok(remaining) => {
+            tracing::info!(
+                session_id = %session_id,
+                repo = %claimed.repo,
+                branch = %claimed.branch,
+                remaining_sessions = remaining,
+                "Session released from container"
+            );
+        }
+        Err(e) => {
+            tracing::warn!(
+                session_id = %session_id, error = %e,
+                "Failed to decrement container session count, falling back to container removal"
+            );
+            // Fallback: remove container directly if registry decrement fails
+            if let Err(e) = state.containers.remove_container_by_name(&claimed.name).await {
+                tracing::warn!(session_id = %session_id, error = %e, "Failed to remove container");
+            }
+        }
     }
 
     // Release repo lock
@@ -1412,9 +1459,15 @@ async fn handle_orchestrator_create_session(
         }
     };
 
+    let worker_repo_name = repo_ref_worker.full_name();
+    let worker_branch = repo_ref_worker.branch.clone().unwrap_or_default();
+
     let (output_tx, output_rx) = mpsc::channel::<OutputEvent>(100);
-    match state.containers.start(&session_id, &project_path, output_tx, false).await {
-        Ok(name) => {
+    match state.containers.start(
+        &session_id, &project_path, &worker_repo_name, &worker_branch,
+        &state.db, output_tx, false,
+    ).await {
+        Ok(result) => {
             counter!("sessions_started_total").increment(1);
             gauge!("active_sessions").increment(1.0);
 
@@ -1425,7 +1478,7 @@ async fn handle_orchestrator_create_session(
                 &thread_id,
                 &worker_input,
                 &project_path,
-                &name,
+                &result.container_name,
                 session_type,
                 Some(parent_session_id),
             ).await {

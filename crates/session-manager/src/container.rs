@@ -10,6 +10,8 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 
 use crate::config::settings;
+use crate::container_registry::{ContainerRegistry, ContainerState};
+use crate::database::Database;
 use crate::devcontainer;
 use crate::ssh;
 use crate::stream_json::{ContentPart, LineBuffer, OutputEvent, StreamLine, format_tool_action};
@@ -21,13 +23,16 @@ fn shell_escape(s: &str) -> Cow<'_, str> {
 
 pub struct ContainerManager {
     sessions: DashMap<String, Session>,
+    pub registry: ContainerRegistry,
 }
 
 /// Result of attempting to claim a session for cleanup.
-/// If successful, contains the session name and worktree path.
+/// If successful, contains the session name, worktree path, and repo/branch for registry decrement.
 pub struct ClaimedSession {
     pub name: String,
     pub worktree_path: Option<PathBuf>,
+    pub repo: String,
+    pub branch: String,
 }
 
 struct Session {
@@ -35,6 +40,10 @@ struct Session {
     message_tx: mpsc::Sender<String>,
     /// Path to worktree if session is using one (for cleanup)
     worktree_path: Option<PathBuf>,
+    /// Repo identifier (e.g., "org/repo") for container registry lookups
+    repo: String,
+    /// Branch name for container registry lookups
+    branch: String,
     /// true → first message (no --resume); false → subsequent (--resume)
     is_first_message: Arc<AtomicBool>,
     /// Claude Code session ID captured from first invocation's init event
@@ -49,8 +58,18 @@ impl Default for ContainerManager {
     fn default() -> Self {
         Self {
             sessions: DashMap::new(),
+            registry: ContainerRegistry::new(),
         }
     }
+}
+
+/// Return value from `start` indicating whether the container was reused or freshly created.
+pub struct StartResult {
+    pub container_name: String,
+    /// true if an existing container was reused (fast path)
+    pub reused: bool,
+    /// Warning message if same-branch session detected
+    pub warning: Option<String>,
 }
 
 impl ContainerManager {
@@ -58,12 +77,101 @@ impl ContainerManager {
         Self::default()
     }
 
+    /// Start a session, reusing an existing container for the same (repo, branch) if available.
+    /// Falls back to `devcontainer up` for cold start.
+    #[allow(clippy::too_many_arguments)]
     pub async fn start(
         &self,
         session_id: &str,
         project_path: &str,
+        repo: &str,
+        branch: &str,
+        db: &Database,
         output_tx: mpsc::Sender<OutputEvent>,
         plan_mode: bool,
+    ) -> Result<StartResult> {
+        let s = settings();
+        let mut warning: Option<String> = None;
+
+        // Check if a container already exists for this (repo, branch)
+        let existing = self.registry.get_container(repo, branch).await;
+        let container_name = if let Some(ref entry) = existing {
+            if entry.state != ContainerState::Running {
+                return Err(anyhow!(
+                    "Container for {}/{} is in '{}' state, cannot start new session",
+                    repo, branch, entry.state
+                ));
+            }
+
+            // Check max sessions limit
+            if s.container_max_sessions > 0 && entry.session_count >= s.container_max_sessions {
+                return Err(anyhow!(
+                    "Container for {}/{} has reached max sessions ({}). Stop a session first.",
+                    repo, branch, s.container_max_sessions
+                ));
+            }
+
+            // Warn about same-branch concurrent sessions
+            if entry.session_count > 0 {
+                warning = Some(format!(
+                    "Warning: Another session is already active on `{}@{}`. \
+                     Concurrent file writes on the same branch may cause conflicts. \
+                     Consider using `--worktree` for branch isolation.",
+                    repo, branch
+                ));
+                tracing::warn!(
+                    repo, branch, session_count = entry.session_count,
+                    "Same-branch concurrent session started"
+                );
+            }
+
+            // Check devcontainer.json hash for rebuild
+            let current_hash = devcontainer::hash_config(project_path).await;
+            if let (Some(stored_hash), Some(current)) = (&entry.devcontainer_json_hash, &current_hash) && stored_hash != current {
+                tracing::warn!(
+                    repo, branch,
+                    %stored_hash, current_hash = %current,
+                    "devcontainer.json changed — rebuild needed on next cold start"
+                );
+                // For now, we reuse the container and log the warning.
+                // Full drain-and-rebuild is deferred to a future story.
+            }
+
+            // Reuse existing container — increment session count
+            self.registry.increment_sessions(db, repo, branch).await?;
+
+            tracing::info!(
+                session_id, repo, branch,
+                container = %entry.container_name,
+                "Reusing existing container (fast path)"
+            );
+            entry.container_name.clone()
+        } else {
+            // Cold start: no existing container, run devcontainer up
+            self.cold_start(project_path, repo, branch, db).await?
+        };
+
+        // Set up message channel and spawn processor
+        let reused = existing.is_some();
+        self.create_session_internal(
+            session_id, &container_name, project_path, repo, branch,
+            output_tx, plan_mode,
+        );
+
+        Ok(StartResult {
+            container_name,
+            reused,
+            warning,
+        })
+    }
+
+    /// Cold start: generate devcontainer config if needed, run `devcontainer up`, register container.
+    async fn cold_start(
+        &self,
+        project_path: &str,
+        repo: &str,
+        branch: &str,
+        db: &Database,
     ) -> Result<String> {
         let s = settings();
 
@@ -80,7 +188,10 @@ impl ContainerManager {
             );
         }
 
-        // Start container via devcontainer up (honors full devcontainer.json)
+        // Hash the devcontainer.json for future rebuild detection
+        let config_hash = devcontainer::hash_config(project_path).await;
+
+        // Start container via devcontainer up
         let escaped_project_path = shell_escape(project_path);
         let devcontainer_cmd = format!(
             "devcontainer up --docker-path {} --workspace-folder {}",
@@ -105,67 +216,39 @@ impl ContainerManager {
         let output_str = String::from_utf8_lossy(&output.stdout);
         let json: serde_json::Value = serde_json::from_str(output_str.trim())
             .map_err(|e| anyhow!("Failed to parse devcontainer output: {}", e))?;
-        let container_id = json["containerId"].as_str()
+        let container_name = json["containerId"].as_str()
             .ok_or_else(|| anyhow!("No containerId in devcontainer output"))?
             .to_string();
 
-        // Set up message channel for per-message processing
-        let (message_tx, message_rx) = mpsc::channel::<String>(32);
-        let is_first_message = Arc::new(AtomicBool::new(true));
-        let claude_session_id = Arc::new(Mutex::new(None));
-        let plan_mode_flag = Arc::new(AtomicBool::new(plan_mode));
-        let pending_title_flag = Arc::new(AtomicBool::new(false));
+        // Register container in registry and database, with session_count = 1
+        self.registry
+            .register_container(db, repo, branch, &container_name, config_hash.as_deref())
+            .await?;
+        self.registry.increment_sessions(db, repo, branch).await?;
 
-        // Spawn message processor task
-        let project_path_owned = project_path.to_string();
-        let session_id_owned = session_id.to_string();
-        let is_first_clone = Arc::clone(&is_first_message);
-        let claude_sid_clone = Arc::clone(&claude_session_id);
-        let plan_mode_clone = Arc::clone(&plan_mode_flag);
-        let pending_title_clone = Arc::clone(&pending_title_flag);
-        tokio::spawn(async move {
-            message_processor(
-                message_rx,
-                output_tx,
-                project_path_owned,
-                session_id_owned,
-                is_first_clone,
-                claude_sid_clone,
-                plan_mode_clone,
-                pending_title_clone,
-            ).await;
-        });
-
-        self.sessions.insert(
-            session_id.to_string(),
-            Session {
-                name: container_id.clone(),
-                message_tx,
-                worktree_path: None,
-                is_first_message,
-                claude_session_id,
-                plan_mode: plan_mode_flag,
-                pending_title: pending_title_flag,
-            },
+        tracing::info!(
+            repo, branch, container = %container_name,
+            "Cold-started new container"
         );
-
-        Ok(container_id)
+        Ok(container_name)
     }
 
-    /// Reconnect to an existing session after a restart.
-    /// Creates in-memory state (channels, message_processor) without running `devcontainer up`.
-    /// The container must already be running.
-    pub fn reconnect(
+    /// Internal helper to create session state and spawn message processor.
+    #[allow(clippy::too_many_arguments)]
+    fn create_session_internal(
         &self,
         session_id: &str,
         container_name: &str,
         project_path: &str,
+        repo: &str,
+        branch: &str,
         output_tx: mpsc::Sender<OutputEvent>,
+        plan_mode: bool,
     ) {
         let (message_tx, message_rx) = mpsc::channel::<String>(32);
         let is_first_message = Arc::new(AtomicBool::new(true));
         let claude_session_id = Arc::new(Mutex::new(None));
-        let plan_mode_flag = Arc::new(AtomicBool::new(false));
+        let plan_mode_flag = Arc::new(AtomicBool::new(plan_mode));
         let pending_title_flag = Arc::new(AtomicBool::new(false));
 
         let project_path_owned = project_path.to_string();
@@ -193,11 +276,31 @@ impl ContainerManager {
                 name: container_name.to_string(),
                 message_tx,
                 worktree_path: None,
+                repo: repo.to_string(),
+                branch: branch.to_string(),
                 is_first_message,
                 claude_session_id,
                 plan_mode: plan_mode_flag,
                 pending_title: pending_title_flag,
             },
+        );
+    }
+
+    /// Reconnect to an existing session after a restart.
+    /// Creates in-memory state (channels, message_processor) without running `devcontainer up`.
+    /// The container must already be running.
+    pub fn reconnect(
+        &self,
+        session_id: &str,
+        container_name: &str,
+        project_path: &str,
+        repo: &str,
+        branch: &str,
+        output_tx: mpsc::Sender<OutputEvent>,
+    ) {
+        self.create_session_internal(
+            session_id, container_name, project_path, repo, branch,
+            output_tx, false,
         );
 
         tracing::info!(
@@ -228,11 +331,20 @@ impl ContainerManager {
 
     /// Atomically claim a session for cleanup. Returns `Some` if this caller
     /// wins the race (removes the entry), `None` if already claimed by another.
+    /// Includes repo/branch so the caller can decrement the container's session count.
     pub fn claim_session(&self, session_id: &str) -> Option<ClaimedSession> {
         self.sessions.remove(session_id).map(|(_, session)| ClaimedSession {
             name: session.name,
             worktree_path: session.worktree_path,
+            repo: session.repo,
+            branch: session.branch,
         })
+    }
+
+    /// Decrement the session count for a container after a session is stopped.
+    /// If the count reaches zero, the container remains alive for idle timeout.
+    pub async fn release_session(&self, db: &Database, repo: &str, branch: &str) -> Result<i32> {
+        self.registry.decrement_sessions(db, repo, branch).await
     }
 
     /// Remove a container by its name (used after claiming a session)
