@@ -708,3 +708,282 @@ async fn test_session_health_defaults() {
 
     assert!(row.0, "last_activity_at should not be null");
 }
+
+// --- Container table tests ---
+
+#[tokio::test]
+async fn test_container_crud() {
+    let Some(pool) = get_test_db().await else {
+        return;
+    };
+    let mut tx = pool.begin().await.expect("Failed to begin transaction");
+
+    // Insert a container
+    let row: (i64,) = sqlx::query_as(&format!(
+        "INSERT INTO {}.containers (repo, branch, container_name, devcontainer_json_hash) \
+         VALUES ($1, $2, $3, $4) RETURNING id",
+        TEST_SCHEMA
+    ))
+    .bind("jcttech/claude-session-manager")
+    .bind("main")
+    .bind("claude-abc123")
+    .bind("sha256:abcdef1234567890")
+    .fetch_one(&mut *tx)
+    .await
+    .expect("Failed to insert container");
+
+    let container_id = row.0;
+    assert!(container_id > 0);
+
+    // Fetch by repo and branch
+    let fetched: (i64, String, String, String, i32) = sqlx::query_as(&format!(
+        "SELECT id, container_name, state, repo, session_count FROM {}.containers WHERE repo = $1 AND branch = $2",
+        TEST_SCHEMA
+    ))
+    .bind("jcttech/claude-session-manager")
+    .bind("main")
+    .fetch_one(&mut *tx)
+    .await
+    .expect("Failed to fetch container");
+
+    assert_eq!(fetched.0, container_id);
+    assert_eq!(fetched.1, "claude-abc123");
+    assert_eq!(fetched.2, "running");
+    assert_eq!(fetched.3, "jcttech/claude-session-manager");
+    assert_eq!(fetched.4, 0);
+
+    // Update state
+    sqlx::query(&format!(
+        "UPDATE {}.containers SET state = $1 WHERE id = $2",
+        TEST_SCHEMA
+    ))
+    .bind("stopping")
+    .bind(container_id)
+    .execute(&mut *tx)
+    .await
+    .expect("Failed to update container state");
+
+    let state: (String,) = sqlx::query_as(&format!(
+        "SELECT state FROM {}.containers WHERE id = $1",
+        TEST_SCHEMA
+    ))
+    .bind(container_id)
+    .fetch_one(&mut *tx)
+    .await
+    .expect("Failed to fetch state");
+
+    assert_eq!(state.0, "stopping");
+
+    // Delete
+    sqlx::query(&format!(
+        "DELETE FROM {}.containers WHERE id = $1",
+        TEST_SCHEMA
+    ))
+    .bind(container_id)
+    .execute(&mut *tx)
+    .await
+    .expect("Failed to delete container");
+}
+
+#[tokio::test]
+async fn test_container_unique_repo_branch() {
+    let Some(pool) = get_test_db().await else {
+        return;
+    };
+    let mut tx = pool.begin().await.expect("Failed to begin transaction");
+
+    sqlx::query(&format!(
+        "INSERT INTO {}.containers (repo, branch, container_name) VALUES ($1, $2, $3)",
+        TEST_SCHEMA
+    ))
+    .bind("org/repo")
+    .bind("main")
+    .bind("container-1")
+    .execute(&mut *tx)
+    .await
+    .expect("First insert should succeed");
+
+    let result = sqlx::query(&format!(
+        "INSERT INTO {}.containers (repo, branch, container_name) VALUES ($1, $2, $3)",
+        TEST_SCHEMA
+    ))
+    .bind("org/repo")
+    .bind("main")
+    .bind("container-2")
+    .execute(&mut *tx)
+    .await;
+
+    assert!(result.is_err(), "Duplicate (repo, branch) should fail");
+}
+
+#[tokio::test]
+async fn test_container_session_count_update() {
+    let Some(pool) = get_test_db().await else {
+        return;
+    };
+    let mut tx = pool.begin().await.expect("Failed to begin transaction");
+
+    let row: (i64,) = sqlx::query_as(&format!(
+        "INSERT INTO {}.containers (repo, branch, container_name) VALUES ($1, $2, $3) RETURNING id",
+        TEST_SCHEMA
+    ))
+    .bind("org/repo-count")
+    .bind("")
+    .bind("container-count")
+    .fetch_one(&mut *tx)
+    .await
+    .expect("Failed to insert container");
+
+    let container_id = row.0;
+
+    // Increment session count
+    sqlx::query(&format!(
+        "UPDATE {}.containers SET session_count = session_count + 1, last_activity_at = NOW() WHERE id = $1",
+        TEST_SCHEMA
+    ))
+    .bind(container_id)
+    .execute(&mut *tx)
+    .await
+    .expect("Failed to increment session count");
+
+    let count: (i32,) = sqlx::query_as(&format!(
+        "SELECT session_count FROM {}.containers WHERE id = $1",
+        TEST_SCHEMA
+    ))
+    .bind(container_id)
+    .fetch_one(&mut *tx)
+    .await
+    .expect("Failed to fetch count");
+
+    assert_eq!(count.0, 1);
+
+    // Increment again
+    sqlx::query(&format!(
+        "UPDATE {}.containers SET session_count = session_count + 1 WHERE id = $1",
+        TEST_SCHEMA
+    ))
+    .bind(container_id)
+    .execute(&mut *tx)
+    .await
+    .expect("Failed to increment again");
+
+    let count: (i32,) = sqlx::query_as(&format!(
+        "SELECT session_count FROM {}.containers WHERE id = $1",
+        TEST_SCHEMA
+    ))
+    .bind(container_id)
+    .fetch_one(&mut *tx)
+    .await
+    .expect("Failed to fetch count");
+
+    assert_eq!(count.0, 2);
+}
+
+#[tokio::test]
+async fn test_session_container_id_link() {
+    let Some(pool) = get_test_db().await else {
+        return;
+    };
+    let mut tx = pool.begin().await.expect("Failed to begin transaction");
+
+    // Create a container
+    let row: (i64,) = sqlx::query_as(&format!(
+        "INSERT INTO {}.containers (repo, branch, container_name) VALUES ($1, $2, $3) RETURNING id",
+        TEST_SCHEMA
+    ))
+    .bind("org/repo-link")
+    .bind("main")
+    .bind("container-link")
+    .fetch_one(&mut *tx)
+    .await
+    .expect("Failed to insert container");
+
+    let container_id = row.0;
+
+    // Create a session and link it
+    sqlx::query(&format!(
+        "INSERT INTO {}.sessions (session_id, channel_id, thread_id, project, container_name, container_id) VALUES ($1, $2, $3, $4, $5, $6)",
+        TEST_SCHEMA
+    ))
+    .bind("linked-session")
+    .bind("chan-link")
+    .bind("thread-link")
+    .bind("org/repo-link")
+    .bind("container-link")
+    .bind(container_id)
+    .execute(&mut *tx)
+    .await
+    .expect("Failed to insert session with container_id");
+
+    // Verify the link
+    let row: (Option<i64>,) = sqlx::query_as(&format!(
+        "SELECT container_id FROM {}.sessions WHERE session_id = $1",
+        TEST_SCHEMA
+    ))
+    .bind("linked-session")
+    .fetch_one(&mut *tx)
+    .await
+    .expect("Failed to fetch session");
+
+    assert_eq!(row.0, Some(container_id));
+
+    // Fetch sessions by container_id
+    let sessions: Vec<(String,)> = sqlx::query_as(&format!(
+        "SELECT session_id FROM {}.sessions WHERE container_id = $1",
+        TEST_SCHEMA
+    ))
+    .bind(container_id)
+    .fetch_all(&mut *tx)
+    .await
+    .expect("Failed to fetch sessions by container_id");
+
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0].0, "linked-session");
+}
+
+#[tokio::test]
+async fn test_container_running_filter() {
+    let Some(pool) = get_test_db().await else {
+        return;
+    };
+    let mut tx = pool.begin().await.expect("Failed to begin transaction");
+
+    // Insert running container
+    sqlx::query(&format!(
+        "INSERT INTO {}.containers (repo, branch, container_name, state) VALUES ($1, $2, $3, $4)",
+        TEST_SCHEMA
+    ))
+    .bind("org/running-repo")
+    .bind("main")
+    .bind("running-container")
+    .bind("running")
+    .execute(&mut *tx)
+    .await
+    .expect("Failed to insert running container");
+
+    // Insert stopped container
+    sqlx::query(&format!(
+        "INSERT INTO {}.containers (repo, branch, container_name, state) VALUES ($1, $2, $3, $4)",
+        TEST_SCHEMA
+    ))
+    .bind("org/stopped-repo")
+    .bind("main")
+    .bind("stopped-container")
+    .bind("stopped")
+    .execute(&mut *tx)
+    .await
+    .expect("Failed to insert stopped container");
+
+    // Query running only
+    let running: Vec<(String,)> = sqlx::query_as(&format!(
+        "SELECT container_name FROM {}.containers WHERE state = 'running'",
+        TEST_SCHEMA
+    ))
+    .fetch_all(&mut *tx)
+    .await
+    .expect("Failed to fetch running containers");
+
+    let names: Vec<&str> = running.iter().map(|r| r.0.as_str()).collect();
+    assert!(names.contains(&"running-container"));
+    assert!(!names.contains(&"stopped-container"));
+}

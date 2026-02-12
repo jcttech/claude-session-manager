@@ -1141,9 +1141,8 @@ async fn stream_output(
                             let _ = state.mm.update_post(post_id, &msg).await;
                         } else {
                             // No status post yet — create one
-                            match state.mm.post_in_thread(&channel_id, &thread_id, &msg).await {
-                                Ok(post_id) => { status_post_id = Some(post_id); }
-                                Err(_) => {}
+                            if let Ok(post_id) = state.mm.post_in_thread(&channel_id, &thread_id, &msg).await {
+                                status_post_id = Some(post_id);
                             }
                         }
                     }
@@ -1606,11 +1605,8 @@ async fn stream_output_worker(
                         let msg = status_lines.join("\n");
                         if let Some(ref post_id) = status_post_id {
                             let _ = state.mm.update_post(post_id, &msg).await;
-                        } else {
-                            match state.mm.post_in_thread(&channel_id, &thread_id, &msg).await {
-                                Ok(post_id) => { status_post_id = Some(post_id); }
-                                Err(_) => {}
-                            }
+                        } else if let Ok(post_id) = state.mm.post_in_thread(&channel_id, &thread_id, &msg).await {
+                            status_post_id = Some(post_id);
                         }
                     }
                     OutputEvent::TitleGenerated(_) => {
