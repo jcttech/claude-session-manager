@@ -4,12 +4,13 @@ on:
   push:
     tags: ['session-manager/v*']
 
+permissions:
+  contents: write
+  packages: write
+
 jobs:
   release:
     uses: jcttech/.github/.github/workflows/rust-pipeline.yml@v1
-    permissions:
-      contents: write
-      packages: write
     with:
       tag-prefix: 'session-manager/'
       image-name: 'claude-session-manager'

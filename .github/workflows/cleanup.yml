@@ -5,11 +5,12 @@ on:
     - cron: '0 0 * * 0'  # Weekly on Sunday at midnight
   workflow_dispatch:
 
+permissions:
+  packages: write
+
 jobs:
   cleanup-session-manager:
     uses: jcttech/.github/.github/workflows/cleanup-docker.yml@v1
     with:
       image-name: claude-session-manager
-    permissions:
-      packages: write
     secrets: inherit

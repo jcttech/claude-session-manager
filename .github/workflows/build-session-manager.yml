@@ -3,12 +3,13 @@ name: CI
 on:
   workflow_dispatch:
 
+permissions:
+  contents: read
+  pull-requests: read
+
 jobs:
   ci:
     uses: jcttech/.github/.github/workflows/rust-pipeline.yml@v1
-    permissions:
-      contents: read
-      pull-requests: read
     with:
       code-paths: |
         crates/**
