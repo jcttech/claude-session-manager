@@ -4,6 +4,7 @@ pub mod container_registry;
 pub mod database;
 pub mod devcontainer;
 pub mod git;
+pub mod idle_monitor;
 pub mod opnsense;
 pub mod ssh;
 pub mod stream_json;
