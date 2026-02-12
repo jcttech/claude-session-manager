@@ -14,6 +14,8 @@ pub enum OutputEvent {
     ResponseComplete { input_tokens: u64, output_tokens: u64 },
     /// Generated thread title (from `title` command)
     TitleGenerated(String),
+    /// Process died unexpectedly (non-zero exit, not user-initiated)
+    ProcessDied { exit_code: Option<i32>, signal: Option<String> },
 }
 
 // -- NDJSON deserialization types for `claude -p --verbose --output-format stream-json` --
@@ -73,6 +75,19 @@ pub enum ContentPart {
     },
     #[serde(other)]
     Other,
+}
+
+/// Map common fatal exit codes to human-readable signal names.
+/// Exit codes above 128 typically indicate the process was killed by a signal,
+/// where the signal number is (exit_code - 128).
+pub fn signal_name(code: i32) -> &'static str {
+    match code {
+        134 => "SIGABRT",
+        137 => "SIGKILL (possibly OOM)",
+        139 => "SIGSEGV (segmentation fault)",
+        143 => "SIGTERM",
+        _ => "unknown signal",
+    }
 }
 
 /// Format a tool_use block as a concise status line for Mattermost display.
@@ -454,5 +469,34 @@ mod tests {
     fn format_task_action() {
         let input = serde_json::json!({"description": "explore codebase"});
         assert_eq!(format_tool_action("Task", &input), "**Task** _explore codebase_");
+    }
+
+    // -- signal_name tests --
+
+    #[test]
+    fn signal_name_sigkill() {
+        assert_eq!(signal_name(137), "SIGKILL (possibly OOM)");
+    }
+
+    #[test]
+    fn signal_name_sigsegv() {
+        assert_eq!(signal_name(139), "SIGSEGV (segmentation fault)");
+    }
+
+    #[test]
+    fn signal_name_sigabrt() {
+        assert_eq!(signal_name(134), "SIGABRT");
+    }
+
+    #[test]
+    fn signal_name_sigterm() {
+        assert_eq!(signal_name(143), "SIGTERM");
+    }
+
+    #[test]
+    fn signal_name_unknown() {
+        assert_eq!(signal_name(1), "unknown signal");
+        assert_eq!(signal_name(255), "unknown signal");
+        assert_eq!(signal_name(0), "unknown signal");
     }
 }

@@ -14,7 +14,7 @@ use crate::container_registry::{ContainerRegistry, ContainerState};
 use crate::database::Database;
 use crate::devcontainer;
 use crate::ssh;
-use crate::stream_json::{ContentPart, LineBuffer, OutputEvent, StreamLine, format_tool_action};
+use crate::stream_json::{ContentPart, LineBuffer, OutputEvent, StreamLine, format_tool_action, signal_name};
 
 /// Escape a string for safe use in shell commands
 fn shell_escape(s: &str) -> Cow<'_, str> {
@@ -711,12 +711,36 @@ async fn message_processor(
         let status = child.wait().await;
         let _ = stderr_handle.await;
 
+        // Determine if this was a user-initiated stop (output channel was closed
+        // by the receiver, meaning the session was stopped from the Mattermost side)
+        // vs an unexpected process death (non-zero exit while output channel is still open).
+        let user_initiated_stop = output_closed;
+
         match &status {
             Ok(s) if !s.success() => {
                 tracing::warn!(session_id = %session_id, status = ?s, "claude -p exited with error");
+
+                // Only emit ProcessDied if this was NOT a user-initiated stop
+                if !user_initiated_stop {
+                    let exit_code = s.code();
+                    let signal = exit_code
+                        .filter(|&c| c > 128)
+                        .map(|c| signal_name(c).to_string());
+                    let _ = output_tx.send(OutputEvent::ProcessDied {
+                        exit_code,
+                        signal,
+                    }).await;
+                }
             }
             Err(e) => {
                 tracing::warn!(session_id = %session_id, error = %e, "Failed to wait for claude -p");
+
+                if !user_initiated_stop {
+                    let _ = output_tx.send(OutputEvent::ProcessDied {
+                        exit_code: None,
+                        signal: None,
+                    }).await;
+                }
             }
             _ => {}
         }

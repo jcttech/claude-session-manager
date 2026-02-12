@@ -1325,6 +1325,25 @@ async fn stream_output(
                             let _ = state.mm.post_in_thread(&channel_id, &thread_id, &msg).await;
                         }
                     }
+                    OutputEvent::ProcessDied { exit_code, signal } => {
+                        flush_batch(&state, &channel_id, &thread_id, &session_id, &mut batch).await;
+                        batch_bytes = 0;
+                        let code_str = exit_code
+                            .map(|c| c.to_string())
+                            .unwrap_or_else(|| "unknown".to_string());
+                        let msg = match signal {
+                            Some(ref sig) => format!(
+                                ":warning: Session process died unexpectedly (exit code {}, {}). Use `start` to begin a new session.",
+                                code_str, sig
+                            ),
+                            None => format!(
+                                ":warning: Session process died unexpectedly (exit code {}). Use `start` to begin a new session.",
+                                code_str
+                            ),
+                        };
+                        // Fire-and-forget notification
+                        let _ = state.mm.post_in_thread(&channel_id, &thread_id, &msg).await;
+                    }
                 }
             }
             _ = &mut batch_timer => {
@@ -1788,6 +1807,24 @@ async fn stream_output_worker(
                             );
                             let _ = state.mm.post_in_thread(&channel_id, &thread_id, &msg).await;
                         }
+                    }
+                    OutputEvent::ProcessDied { exit_code, signal } => {
+                        flush_batch(&state, &channel_id, &thread_id, &session_id, &mut batch).await;
+                        batch_bytes = 0;
+                        let code_str = exit_code
+                            .map(|c| c.to_string())
+                            .unwrap_or_else(|| "unknown".to_string());
+                        let msg = match signal {
+                            Some(ref sig) => format!(
+                                ":warning: Session process died unexpectedly (exit code {}, {}). Use `start` to begin a new session.",
+                                code_str, sig
+                            ),
+                            None => format!(
+                                ":warning: Session process died unexpectedly (exit code {}). Use `start` to begin a new session.",
+                                code_str
+                            ),
+                        };
+                        let _ = state.mm.post_in_thread(&channel_id, &thread_id, &msg).await;
                     }
                 }
             }
