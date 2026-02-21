@@ -154,6 +154,14 @@ impl ContainerManager {
             self.cold_start(project_path, repo, branch, db).await?
         };
 
+        // Ensure the agent worker is running (starts via SSH if needed).
+        // On cold start, devcontainer up's postStartCommand handles this,
+        // but on fast path (reuse), the worker may have crashed or never started.
+        if existing.is_some() {
+            let grpc_addr = format!("http://{}:{}", s.vm_host, s.grpc_port_start);
+            ensure_worker_running(&container_name, &grpc_addr).await?;
+        }
+
         // Set up message channel and spawn processor
         let reused = existing.is_some();
         self.create_session_internal(
@@ -262,6 +270,7 @@ impl ContainerManager {
 
         let session_id_owned = session_id.to_string();
         let session_type_owned = session_type.to_string();
+        let container_name_owned = container_name.to_string();
         let is_first_clone = Arc::clone(&is_first_message);
         let claude_sid_clone = Arc::clone(&claude_session_id);
         let plan_mode_clone = Arc::clone(&plan_mode_flag);
@@ -272,6 +281,7 @@ impl ContainerManager {
                 output_tx,
                 session_id_owned,
                 session_type_owned,
+                container_name_owned,
                 is_first_clone,
                 claude_sid_clone,
                 plan_mode_clone,
@@ -488,6 +498,31 @@ pub struct SessionInfo {
     pub is_first_message: bool,
 }
 
+/// Check if the agent worker is healthy; if not, start it via SSH and wait.
+/// Used on the fast path (container reuse) and as a retry fallback in message_processor.
+async fn ensure_worker_running(container_name: &str, grpc_addr: &str) -> Result<()> {
+    // Quick health check — don't wait long
+    if let Ok(mut executor) = GrpcExecutor::connect(grpc_addr).await
+        && let Ok((true, _)) = executor.health().await
+    {
+        return Ok(());
+    }
+
+    tracing::warn!(container_name, "Agent worker not responding, starting via SSH");
+
+    let s = settings();
+    let start_cmd = format!(
+        "devcontainer exec --docker-path {} --container-id {} \
+         sh -c 'nohup python -m agent_worker --port 50051 > /tmp/agent-worker.log 2>&1 &'",
+        shell_escape(&s.container_runtime),
+        shell_escape(container_name),
+    );
+    ssh::run_command(&start_cmd).await?;
+
+    // Wait for it to become healthy (15 retries, 1s each)
+    crate::grpc::wait_for_health(grpc_addr, 15, Duration::from_secs(1)).await
+}
+
 /// Per-message processor task. Reads messages from the channel and for each one:
 /// 1. Connects to the gRPC worker via GrpcExecutor
 /// 2. Calls Execute (first message) or SendMessage (subsequent) on the worker
@@ -498,6 +533,7 @@ async fn message_processor(
     output_tx: mpsc::Sender<OutputEvent>,
     session_id: String,
     _session_type: String,
+    container_name: String,
     is_first_message: Arc<AtomicBool>,
     claude_session_id: Arc<Mutex<Option<String>>>,
     plan_mode: Arc<AtomicBool>,
@@ -508,13 +544,30 @@ async fn message_processor(
 
     let mut executor = match GrpcExecutor::connect(&grpc_addr).await {
         Ok(e) => e,
-        Err(e) => {
-            tracing::error!(session_id = %session_id, error = %e, "Failed to connect to gRPC worker");
-            let _ = output_tx.send(OutputEvent::ProcessDied {
-                exit_code: Some(1),
-                signal: Some(format!("gRPC connection failed: {}", e)),
-            }).await;
-            return;
+        Err(_) => {
+            // Worker may have crashed — try restarting it once
+            tracing::warn!(session_id = %session_id, "Initial gRPC connect failed, attempting worker restart");
+            match ensure_worker_running(&container_name, &grpc_addr).await {
+                Ok(()) => match GrpcExecutor::connect(&grpc_addr).await {
+                    Ok(e) => e,
+                    Err(e) => {
+                        tracing::error!(session_id = %session_id, error = %e, "Failed to connect after worker restart");
+                        let _ = output_tx.send(OutputEvent::ProcessDied {
+                            exit_code: Some(1),
+                            signal: Some(format!("gRPC connection failed after restart: {}", e)),
+                        }).await;
+                        return;
+                    }
+                },
+                Err(e) => {
+                    tracing::error!(session_id = %session_id, error = %e, "Failed to restart worker");
+                    let _ = output_tx.send(OutputEvent::ProcessDied {
+                        exit_code: Some(1),
+                        signal: Some(format!("Worker restart failed: {}", e)),
+                    }).await;
+                    return;
+                }
+            }
         }
     };
 
