@@ -115,7 +115,7 @@ spec:
         - name: SM_MATTERMOST_TEAM_ID
           value: "your-team-id"
         - name: SM_VM_HOST
-          value: "192.168.12.10"
+          value: "your-vm-host-ip"
         - name: SM_OPNSENSE_URL
           value: "https://opnsense.example.com"
         livenessProbe:
