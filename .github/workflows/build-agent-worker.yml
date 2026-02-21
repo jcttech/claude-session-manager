@@ -16,5 +16,11 @@ jobs:
         pyproject.toml
       package-dir: packages/agent-worker
       python-version: '3.13'
+      setup-command: >-
+        uv run python -m grpc_tools.protoc
+        -I../../proto
+        --python_out=src/agent_worker
+        --grpc_python_out=src/agent_worker
+        ../../proto/agent.proto
       enable-docker: false
       enable-release: false

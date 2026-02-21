@@ -14,6 +14,12 @@ jobs:
     with:
       tag-prefix: 'agent-worker/'
       package-dir: packages/agent-worker
+      setup-command: >-
+        uv run python -m grpc_tools.protoc
+        -I../../proto
+        --python_out=src/agent_worker
+        --grpc_python_out=src/agent_worker
+        ../../proto/agent.proto
       code-paths: |
         packages/agent-worker/**
         proto/**
