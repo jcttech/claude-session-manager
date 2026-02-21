@@ -1,0 +1,16 @@
+# Workspace root — not a package itself.
+# Enables `uv sync` / `uv run` from the repo root for CI.
+
+[tool.uv.workspace]
+members = ["packages/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["packages/agent-worker/tests"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W"]

@@ -36,9 +36,6 @@ pub struct Settings {
     /// Fallback container network used when a repo has no devcontainer.json
     #[serde(default = "default_container_network")]
     pub container_network: String,
-    #[serde(default = "default_claude_command")]
-    pub claude_command: String,
-
     /// Timeout for devcontainer up operations (image pull + feature install + lifecycle hooks)
     #[serde(default = "default_devcontainer_timeout_secs")]
     pub devcontainer_timeout_secs: u64,
@@ -126,7 +123,6 @@ fn default_ssh_key_path() -> String { "/secrets/ssh/id_ed25519".into() }
 fn default_container_runtime() -> String { "podman".into() }
 fn default_container_image() -> String { "claude-code:latest".into() }
 fn default_container_network() -> String { "isolated".into() }
-fn default_claude_command() -> String { "claude --dangerously-skip-permissions".into() }
 fn default_devcontainer_timeout_secs() -> u64 { 120 }
 fn default_orchestrator_compact_threshold() -> i32 { 50 }
 fn default_channel_category() -> String { "CLAUDE-SESSIONS".into() }

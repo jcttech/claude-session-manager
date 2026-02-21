@@ -421,50 +421,6 @@ mod channel_naming {
     }
 }
 
-/// Test orchestrator output marker regex patterns
-mod orchestrator_markers {
-    use regex::Regex;
-
-    #[test]
-    fn test_create_session_marker() {
-        let re = Regex::new(r"\[CREATE_SESSION:\s*([^\]]+)\]").unwrap();
-
-        let caps = re.captures("[CREATE_SESSION: org/repo --worktree]").unwrap();
-        assert_eq!(caps[1].trim(), "org/repo --worktree");
-
-        assert!(re.captures("[CREATE_SESSION: repo-name]").is_some());
-        assert!(re.captures("no marker here").is_none());
-    }
-
-    #[test]
-    fn test_stop_session_marker() {
-        let re = Regex::new(r"\[STOP_SESSION:\s*([^\]]+)\]").unwrap();
-
-        let caps = re.captures("[STOP_SESSION: abcdef12]").unwrap();
-        assert_eq!(caps[1].trim(), "abcdef12");
-
-        assert!(re.captures("[STOP_SESSION:]").is_none()); // empty
-    }
-
-    #[test]
-    fn test_session_status_marker() {
-        let re = Regex::new(r"\[SESSION_STATUS\]").unwrap();
-        assert!(re.is_match("[SESSION_STATUS]"));
-        assert!(!re.is_match("[SESSION_STATUS: extra]"));
-    }
-
-    #[test]
-    fn test_create_reviewer_marker() {
-        let re = Regex::new(r"\[CREATE_REVIEWER:\s*([^\]]+)\]").unwrap();
-
-        let caps = re.captures("[CREATE_REVIEWER: org/repo@branch]").unwrap();
-        assert_eq!(caps[1].trim(), "org/repo@branch");
-
-        assert!(re.captures("[CREATE_REVIEWER: ]").is_some()); // whitespace-only content
-        assert!(re.captures("[CREATE_REVIEWER:]").is_none()); // no content
-    }
-}
-
 /// Test network request regex matching
 mod network_request_parsing {
     use regex::Regex;

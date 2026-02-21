@@ -46,7 +46,7 @@ struct Session {
     branch: String,
     /// Session type: "standard", "orchestrator", "worker", "reviewer"
     _session_type: String,
-    /// true → first message (no --resume); false → subsequent (--resume)
+    /// true → first message (gRPC Execute); false → subsequent (gRPC SendMessage)
     is_first_message: Arc<AtomicBool>,
     /// Claude session ID captured from gRPC SessionInit event
     claude_session_id: Arc<Mutex<Option<String>>>,
