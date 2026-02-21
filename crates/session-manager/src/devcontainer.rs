@@ -30,7 +30,7 @@ pub fn generate_default_config(image: &str, network: &str) -> String {
         "ANTHROPIC_API_KEY": "${{localEnv:ANTHROPIC_API_KEY}}"
     }},
     "forwardPorts": [50051],
-    "postStartCommand": "python -m agent_worker --port 50051 &",
+    "postStartCommand": "python3 -m agent_worker --port 50051 &",
     "runArgs": ["--network={}"]
 }}"#,
         image, network

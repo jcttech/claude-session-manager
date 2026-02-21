@@ -7,7 +7,7 @@ import asyncio
 import logging
 import time
 
-from claude_agent_sdk import (
+from claude_agent_sdk.types import (
     AssistantMessage,
     ResultMessage,
     StreamEvent,

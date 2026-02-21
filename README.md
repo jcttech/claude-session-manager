@@ -237,7 +237,7 @@ Projects should provide a `.devcontainer/devcontainer.json` (JSONC supported):
 {
     "image": "ghcr.io/myorg/devcontainer-rust:latest",
     "forwardPorts": [50051],
-    "postStartCommand": "python -m agent_worker.server --port 50051 &",
+    "postStartCommand": "python3 -m agent_worker --port 50051 &",
     "mounts": [
         "source=claude-config-shared,target=/home/vscode/.claude,type=volume",
         "source=claude-mem-shared,target=/home/vscode/.claude-mem,type=volume"

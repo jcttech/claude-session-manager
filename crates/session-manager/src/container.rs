@@ -513,7 +513,7 @@ async fn ensure_worker_running(container_name: &str, grpc_addr: &str) -> Result<
     let s = settings();
     let start_cmd = format!(
         "devcontainer exec --docker-path {} --container-id {} \
-         sh -c 'nohup python -m agent_worker --port 50051 > /tmp/agent-worker.log 2>&1 &'",
+         sh -c 'nohup python3 -m agent_worker --port 50051 > /tmp/agent-worker.log 2>&1 &'",
         shell_escape(&s.container_runtime),
         shell_escape(container_name),
     );

@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING
 from . import agent_pb2
 
 if TYPE_CHECKING:
-    from claude_agent_sdk import (
+    from claude_agent_sdk.types import (
         AssistantMessage,
         ResultMessage,
         StreamEvent,
@@ -35,7 +35,7 @@ def map_assistant_message(msg: AssistantMessage) -> list[agent_pb2.AgentEvent]:
 
     Each content block (text, tool_use, tool_result) becomes a separate event.
     """
-    from claude_agent_sdk import TextBlock, ToolResultBlock, ToolUseBlock
+    from claude_agent_sdk.types import TextBlock, ToolResultBlock, ToolUseBlock
 
     events = []
     for block in msg.content:
