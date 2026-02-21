@@ -25,6 +25,7 @@ dev = [
 source = "vcs"
 tag-pattern = "agent-worker/v(?P<version>.*)"
 root = "../.."
+fallback-version = "0.0.0+dev"
 
 [tool.hatch.build.hooks.custom]
 path = "build_hook.py"
