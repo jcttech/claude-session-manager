@@ -135,15 +135,15 @@ async fn test_session_types_and_parent() {
         "INSERT INTO {}.sessions (session_id, channel_id, thread_id, project, container_name, session_type) VALUES ($1, $2, $3, $4, $5, $6)",
         TEST_SCHEMA
     ))
-    .bind("orch-session")
+    .bind("parent-session")
     .bind("chan-1")
     .bind("thread-1")
     .bind("org/repo")
-    .bind("claude-orch1234")
-    .bind("orchestrator")
+    .bind("claude-parent1234")
+    .bind("standard")
     .execute(&mut *tx)
     .await
-    .expect("Failed to insert orchestrator session");
+    .expect("Failed to insert parent session");
 
     sqlx::query(&format!(
         "INSERT INTO {}.sessions (session_id, channel_id, thread_id, project, container_name, session_type, parent_session_id) VALUES ($1, $2, $3, $4, $5, $6, $7)",
@@ -155,28 +155,28 @@ async fn test_session_types_and_parent() {
     .bind("org/repo --worktree")
     .bind("claude-work1234")
     .bind("worker")
-    .bind("orch-session")
+    .bind("parent-session")
     .execute(&mut *tx)
     .await
     .expect("Failed to insert worker session");
 
     let row: (String, String) = sqlx::query_as(&format!(
-        "SELECT session_id, session_type FROM {}.sessions WHERE channel_id = $1 AND session_type = 'orchestrator'",
+        "SELECT session_id, session_type FROM {}.sessions WHERE channel_id = $1 AND session_type = 'standard'",
         TEST_SCHEMA
     ))
     .bind("chan-1")
     .fetch_one(&mut *tx)
     .await
-    .expect("Failed to fetch orchestrator");
+    .expect("Failed to fetch parent session");
 
-    assert_eq!(row.0, "orch-session");
-    assert_eq!(row.1, "orchestrator");
+    assert_eq!(row.0, "parent-session");
+    assert_eq!(row.1, "standard");
 
     let children: Vec<(String, String)> = sqlx::query_as(&format!(
         "SELECT session_id, session_type FROM {}.sessions WHERE parent_session_id = $1",
         TEST_SCHEMA
     ))
-    .bind("orch-session")
+    .bind("parent-session")
     .fetch_all(&mut *tx)
     .await
     .expect("Failed to fetch children");

@@ -150,7 +150,6 @@ async fn main() -> Result<()> {
                 let session_id = session.session_id.clone();
                 let session_type = session.session_type.clone();
                 let project = session.project.clone();
-                let parent_session_id = session.parent_session_id.clone();
                 tokio::spawn(async move {
                     stream_output(
                         state_clone,
@@ -159,7 +158,6 @@ async fn main() -> Result<()> {
                         session_id,
                         session_type,
                         project,
-                        parent_session_id,
                         output_rx,
                     ).await;
                 });
@@ -447,7 +445,6 @@ async fn start_session(
     project_input: &str,
     repo_ref: &RepoRef,
     session_type: &str,
-    parent_session_id: Option<&str>,
     plan_mode: bool,
     user_id: Option<&str>,
 ) -> Result<String> {
@@ -489,7 +486,6 @@ async fn start_session(
 
     // Post root message to create thread anchor
     let root_msg = match session_type {
-        "orchestrator" => format!("**Orchestrator session** for **{}**", repo_ref.full_name()),
         "worker" => format!("**Worker session** for **{}**", repo_ref.full_name()),
         "reviewer" => format!("**Reviewer session** for **{}**", repo_ref.full_name()),
         _ => format!("**Session** for **{}**", repo_ref.full_name()),
@@ -534,7 +530,7 @@ async fn start_session(
                 &project_path,
                 &result.container_name,
                 session_type,
-                parent_session_id,
+                None, // parent_session_id reserved for future use
                 user_id,
             ).await {
                 tracing::error!(
@@ -542,7 +538,7 @@ async fn start_session(
                     error = %e,
                     "Failed to persist session, cleaning up container"
                 );
-                cleanup_session(state, &session_id, parent_session_id).await;
+                cleanup_session(state, &session_id).await;
                 return Err(anyhow::anyhow!("Failed to persist session to database: {}", e));
             }
 
@@ -581,7 +577,6 @@ async fn start_session(
             let session_id_clone = session_id.clone();
             let session_type_clone = session_type.to_string();
             let project_clone = repo_ref.full_name();
-            let parent_session_id_clone = parent_session_id.map(|s| s.to_string());
             tokio::spawn(async move {
                 stream_output(
                     state_clone,
@@ -590,7 +585,6 @@ async fn start_session(
                     session_id_clone,
                     session_type_clone,
                     project_clone,
-                    parent_session_id_clone,
                     output_rx,
                 ).await;
             });
@@ -611,7 +605,7 @@ async fn start_session(
 /// With multi-session containers: decrements the container's session count
 /// instead of immediately removing the container. The container stays alive
 /// for other sessions or until the idle timeout expires.
-async fn cleanup_session(state: &AppState, session_id: &str, parent_session_id: Option<&str>) {
+async fn cleanup_session(state: &AppState, session_id: &str) {
     // Atomic claim — only one caller will succeed
     let Some(claimed) = state.containers.claim_session(session_id) else {
         tracing::debug!(session_id = %session_id, "Session already cleaned up by another path");
@@ -672,18 +666,11 @@ async fn cleanup_session(state: &AppState, session_id: &str, parent_session_id: 
     gauge!("active_sessions").decrement(1.0);
     tracing::info!(session_id = %session_id, "Session cleaned up");
 
-    // Notify parent orchestrator if this is a child session
-    if let Some(parent_id) = parent_session_id {
-        let _ = state.containers.send(
-            parent_id,
-            &format!("[SESSION_ENDED: {}]", session_id),
-        ).await;
-    }
 }
 
 /// Stop a session by ID, cleaning up container and database.
 async fn stop_session(state: &Arc<AppState>, session: &database::StoredSession) {
-    cleanup_session(state, &session.session_id, session.parent_session_id.as_deref()).await;
+    cleanup_session(state, &session.session_id).await;
 }
 
 /// Format a chrono::Duration as a human-readable string (e.g. "2h 15m", "5m", "30s")
@@ -705,7 +692,6 @@ fn format_duration(d: chrono::Duration) -> String {
 /// Format the root post label for a session thread (e.g. "**Session** for **org/repo**")
 fn format_root_label(session_type: &str, project: &str) -> String {
     match session_type {
-        "orchestrator" => format!("**Orchestrator session** for **{}**", project),
         "worker" => format!("**Worker session** for **{}**", project),
         "reviewer" => format!("**Reviewer session** for **{}**", project),
         _ => format!("**Session** for **{}**", project),
@@ -927,23 +913,7 @@ async fn handle_messages(state: Arc<AppState>, mut rx: mpsc::Receiver<Post>, can
                     );
                 }
                 // Track activity
-                if let Ok(msg_count) = state.db.touch_session(&session.session_id).await {
-                    // Auto-compact orchestrator sessions
-                    let s = config::settings();
-                    if session.session_type == "orchestrator"
-                        && s.orchestrator_compact_threshold > 0
-                        && msg_count > 0
-                        && msg_count % s.orchestrator_compact_threshold == 0
-                    {
-                        let _ = state.containers.send(&session.session_id, "/compact").await;
-                        let _ = state.db.record_compaction(&session.session_id).await;
-                        tracing::info!(
-                            session_id = %session.session_id,
-                            message_count = msg_count,
-                            "Auto-compacted orchestrator session"
-                        );
-                    }
-                }
+                let _ = state.db.touch_session(&session.session_id).await;
             } else if text.starts_with(bot_trigger) {
                 let _ = state.mm.post_in_thread(
                     channel_id,
@@ -991,7 +961,6 @@ async fn handle_messages(state: Arc<AppState>, mut rx: mpsc::Receiver<Post>, can
                                     project_input,
                                     &repo_ref,
                                     "standard",
-                                    None,
                                     plan_mode,
                                     Some(&post.user_id),
                                 ).await {
@@ -1027,44 +996,6 @@ async fn handle_messages(state: Arc<AppState>, mut rx: mpsc::Receiver<Post>, can
                                     project_input,
                                 )).await;
                             }
-                        }
-                    }
-                    continue;
-                }
-
-                // --- orchestrate <project> ---
-                if let Some(project_input) = cmd_text.strip_prefix("orchestrate ").map(|s| s.trim()) {
-                    if project_input.is_empty() {
-                        let _ = state.mm.post(channel_id, "Usage: `@claude orchestrate <org/repo>` or `@claude orchestrate <repo>`").await;
-                        continue;
-                    }
-
-                    match resolve_project_channel(&state, project_input, &post.user_id).await {
-                        Ok((proj_channel_id, channel_name, repo_ref)) => {
-                            match start_session(
-                                &state,
-                                &proj_channel_id,
-                                project_input,
-                                &repo_ref,
-                                "orchestrator",
-                                None,
-                                false,
-                                Some(&post.user_id),
-                            ).await {
-                                Ok(session_id) => {
-                                    let _ = state.mm.post(channel_id, &format!(
-                                        "Orchestrator `{}` started in ~{}",
-                                        &session_id[..8],
-                                        channel_name,
-                                    )).await;
-                                }
-                                Err(e) => {
-                                    let _ = state.mm.post(channel_id, &format!("Failed: {}", e)).await;
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            let _ = state.mm.post(channel_id, &format!("Failed: {}", e)).await;
                         }
                     }
                     continue;
@@ -1186,7 +1117,6 @@ async fn handle_messages(state: Arc<AppState>, mut rx: mpsc::Receiver<Post>, can
                         - `{trigger} start <org/repo>` — Start a standard session\n\
                         - `{trigger} start <repo> --worktree` — Start with isolated worktree\n\
                         - `{trigger} start <repo> --plan` — Start in plan mode (read-only analysis)\n\
-                        - `{trigger} orchestrate <org/repo>` — Start an orchestrator session\n\
                         - `{trigger} stop <id-prefix>` — Stop a session by ID prefix\n\
                         - `{trigger} stop --all` — Stop all sessions and tear down all containers\n\
                         - `{trigger} status` — List all active sessions and containers\n\
@@ -1280,7 +1210,6 @@ async fn stream_output(
     session_id: String,
     session_type: String,
     project: String,
-    parent_session_id: Option<String>,
     mut rx: mpsc::Receiver<OutputEvent>,
 ) {
     let network_re = network_request_regex();
@@ -1413,7 +1342,7 @@ async fn stream_output(
     }
 
     // Stream ended — use centralized cleanup (atomic, prevents double-decrement)
-    cleanup_session(&state, &session_id, parent_session_id.as_deref()).await;
+    cleanup_session(&state, &session_id).await;
 
     tracing::info!(
         session_id = %session_id,

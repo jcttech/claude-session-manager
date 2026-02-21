@@ -44,7 +44,7 @@ struct Session {
     repo: String,
     /// Branch name for container registry lookups
     branch: String,
-    /// Session type: "standard", "orchestrator", "worker", "reviewer"
+    /// Session type: "standard", "worker", "reviewer"
     _session_type: String,
     /// true → first message (gRPC Execute); false → subsequent (gRPC SendMessage)
     is_first_message: Arc<AtomicBool>,

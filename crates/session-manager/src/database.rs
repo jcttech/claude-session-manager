@@ -337,7 +337,7 @@ impl Database {
         Ok(session)
     }
 
-    /// Find non-worker sessions in a channel (standard + orchestrator).
+    /// Find non-worker sessions in a channel.
     /// Used for top-level message routing.
     pub async fn get_non_worker_sessions_by_channel(
         &self,

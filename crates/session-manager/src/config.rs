@@ -40,10 +40,6 @@ pub struct Settings {
     #[serde(default = "default_devcontainer_timeout_secs")]
     pub devcontainer_timeout_secs: u64,
 
-    /// Message count threshold for auto-compacting orchestrator sessions (0 = disabled)
-    #[serde(default = "default_orchestrator_compact_threshold")]
-    pub orchestrator_compact_threshold: i32,
-
     pub opnsense_url: String,
     pub opnsense_key: String,
     pub opnsense_secret: String,
@@ -124,7 +120,6 @@ fn default_container_runtime() -> String { "podman".into() }
 fn default_container_image() -> String { "claude-code:latest".into() }
 fn default_container_network() -> String { "isolated".into() }
 fn default_devcontainer_timeout_secs() -> u64 { 120 }
-fn default_orchestrator_compact_threshold() -> i32 { 50 }
 fn default_channel_category() -> String { "CLAUDE-SESSIONS".into() }
 fn default_opnsense_alias() -> String { "llm_approved_domains".into() }
 fn default_opnsense_verify_tls() -> bool { true }
