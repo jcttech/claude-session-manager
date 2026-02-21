@@ -39,6 +39,7 @@ asyncio_mode = "auto"
 [tool.ruff]
 line-length = 100
 target-version = "py313"
+exclude = ["src/agent_worker/agent_pb2.py", "src/agent_worker/agent_pb2_grpc.py"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "W"]

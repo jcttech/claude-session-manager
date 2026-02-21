@@ -14,7 +14,6 @@ import asyncio
 import sys
 from pathlib import Path
 
-import grpc
 from grpc import aio as grpc_aio
 
 # Ensure generated proto stubs are importable

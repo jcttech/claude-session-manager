@@ -7,15 +7,13 @@ import asyncio
 import logging
 import time
 
-import grpc
-from grpc import aio as grpc_aio
-
 from claude_agent_sdk import (
     AssistantMessage,
     ResultMessage,
     StreamEvent,
     SystemMessage,
 )
+from grpc import aio as grpc_aio
 
 from . import agent_pb2, agent_pb2_grpc
 from .event_mapper import (

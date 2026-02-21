@@ -561,15 +561,13 @@ async fn message_processor(
         match result {
             Ok(new_session_id) => {
                 // Capture session ID from first Execute
-                if let Some(sid) = new_session_id {
-                    if stored_sid.is_none() {
-                        tracing::info!(
-                            session_id = %session_id,
-                            claude_session_id = %sid,
-                            "Captured Claude session ID from gRPC"
-                        );
-                        *claude_session_id.lock().unwrap() = Some(sid);
-                    }
+                if let Some(sid) = new_session_id && stored_sid.is_none() {
+                    tracing::info!(
+                        session_id = %session_id,
+                        claude_session_id = %sid,
+                        "Captured Claude session ID from gRPC"
+                    );
+                    *claude_session_id.lock().unwrap() = Some(sid);
                 }
                 is_first_message.store(false, Ordering::SeqCst);
             }
