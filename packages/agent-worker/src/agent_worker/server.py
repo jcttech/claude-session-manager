@@ -79,9 +79,15 @@ class AgentWorkerServicer(agent_pb2_grpc.AgentWorkerServicer):
                     if event is not None:
                         yield event
 
+        except GeneratorExit:
+            pass
         except Exception as exc:
-            logger.exception("Execute failed")
-            yield error_event(str(exc), "execute_error")
+            # MessageParseError for unknown types (e.g. rate_limit_event) is non-fatal
+            if "Unknown message type" in str(exc):
+                logger.warning("Ignoring unknown message type: %s", exc)
+            else:
+                logger.exception("Execute failed")
+                yield error_event(str(exc), "execute_error")
 
     async def SendMessage(self, request, context):
         """Send a follow-up message to an existing session."""
@@ -113,9 +119,14 @@ class AgentWorkerServicer(agent_pb2_grpc.AgentWorkerServicer):
                     if event is not None:
                         yield event
 
+        except GeneratorExit:
+            pass
         except Exception as exc:
-            logger.exception("SendMessage failed")
-            yield error_event(str(exc), "send_message_error")
+            if "Unknown message type" in str(exc):
+                logger.warning("Ignoring unknown message type: %s", exc)
+            else:
+                logger.exception("SendMessage failed")
+                yield error_event(str(exc), "send_message_error")
 
     async def Interrupt(self, request, context):
         """Interrupt a running session."""

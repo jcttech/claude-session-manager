@@ -175,6 +175,7 @@ mod tests {
             container_name: "test-container".to_string(),
             state,
             session_count: sessions,
+            grpc_port: 0,
             last_activity_at: Utc::now(),
             devcontainer_json_hash: None,
             last_session_stopped_at,

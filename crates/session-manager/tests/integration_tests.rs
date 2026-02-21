@@ -7,7 +7,7 @@ use std::borrow::Cow;
 
 // Direct imports from the library crate
 use session_manager::crypto::{sign_request, verify_signature};
-use session_manager::devcontainer::{DevcontainerConfig, generate_default_config};
+use session_manager::devcontainer::{DevcontainerConfig, generate_default_config, build_override_config};
 use session_manager::git::{RepoRef, WorktreeMode};
 use mattermost_client::sanitize_channel_name;
 use session_manager::opnsense::validate_domain;
@@ -581,26 +581,41 @@ mod devcontainer_parsing {
 
     #[test]
     fn test_generate_default_config_contains_required_fields() {
-        let config = generate_default_config("myimage:latest", "isolated");
+        let config = generate_default_config("myimage:latest", "isolated", 50051);
         assert!(config.contains("myimage:latest"));
         assert!(config.contains("isolated"));
         assert!(config.contains("claude-config-shared"));
         assert!(config.contains("claude-mem-shared"));
         assert!(config.contains("ANTHROPIC_API_KEY"));
+        assert!(config.contains("postStartCommand"));
+        assert!(config.contains("50051:50051"));
     }
 
     #[test]
     fn test_generate_default_config_is_valid_json() {
-        let config = generate_default_config("test:v1", "bridge");
+        let config = generate_default_config("test:v1", "bridge", 50051);
         let parsed = DevcontainerConfig::parse(&config);
         assert_eq!(parsed.image.as_deref(), Some("test:v1"));
     }
 
     #[test]
     fn test_generate_default_config_special_chars_in_image() {
-        let config = generate_default_config("ghcr.io/org/image:sha-abc123", "custom-net");
+        let config = generate_default_config("ghcr.io/org/image:sha-abc123", "custom-net", 50052);
         let parsed = DevcontainerConfig::parse(&config);
         assert_eq!(parsed.image.as_deref(), Some("ghcr.io/org/image:sha-abc123"));
+    }
+
+    #[test]
+    fn test_build_override_preserves_original_and_adds_port() {
+        let original = r#"{ "image": "test:v1", "name": "myrepo" }"#;
+        let result = build_override_config(original, 50053).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["image"].as_str(), Some("test:v1"));
+        assert_eq!(parsed["name"].as_str(), Some("myrepo"));
+        assert!(parsed["postStartCommand"].as_str().unwrap().contains("agent_worker"));
+        let run_args: Vec<&str> = parsed["runArgs"].as_array().unwrap()
+            .iter().filter_map(|v| v.as_str()).collect();
+        assert!(run_args.contains(&"50053:50051"));
     }
 }
 
@@ -724,15 +739,16 @@ mod e2e_workflows {
     #[test]
     fn test_default_devcontainer_fallback_workflow() {
         // When a project has no devcontainer.json, we generate a default one
-        let config_str = generate_default_config("claude-code:latest", "isolated");
+        let config_str = generate_default_config("claude-code:latest", "isolated", 50051);
 
         // The generated config should be valid and parseable
         let config = DevcontainerConfig::parse(&config_str);
         assert_eq!(config.image.as_deref(), Some("claude-code:latest"));
 
-        // It should include claude-mem volume mount
+        // It should include claude-mem volume mount and port mapping
         assert!(config_str.contains("claude-mem-shared"));
         assert!(config_str.contains("claude-config-shared"));
+        assert!(config_str.contains("50051:50051"));
     }
 }
 

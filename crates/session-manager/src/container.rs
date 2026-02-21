@@ -98,7 +98,7 @@ impl ContainerManager {
 
         // Check if a container already exists for this (repo, branch)
         let existing = self.registry.get_container(repo, branch).await;
-        let container_name = if let Some(ref entry) = existing {
+        let (container_name, grpc_port) = if let Some(ref entry) = existing {
             if entry.state != ContainerState::Running {
                 return Err(anyhow!(
                     "Container for {}/{} is in '{}' state, cannot start new session",
@@ -146,9 +146,12 @@ impl ContainerManager {
             tracing::info!(
                 session_id, repo, branch,
                 container = %entry.container_name,
+                grpc_port = entry.grpc_port,
                 "Reusing existing container (fast path)"
             );
-            entry.container_name.clone()
+            // grpc_port=0 means pre-migration container — fall back to config default
+            let port = if entry.grpc_port == 0 { s.grpc_port_start } else { entry.grpc_port };
+            (entry.container_name.clone(), port)
         } else {
             // Cold start: no existing container, run devcontainer up
             self.cold_start(project_path, repo, branch, db).await?
@@ -158,7 +161,7 @@ impl ContainerManager {
         // On cold start, devcontainer up's postStartCommand handles this,
         // but on fast path (reuse), the worker may have crashed or never started.
         if existing.is_some() {
-            let grpc_addr = format!("http://{}:{}", s.vm_host, s.grpc_port_start);
+            let grpc_addr = format!("http://{}:{}", s.vm_host, grpc_port);
             ensure_worker_running(&container_name, &grpc_addr).await?;
         }
 
@@ -166,7 +169,7 @@ impl ContainerManager {
         let reused = existing.is_some();
         self.create_session_internal(
             session_id, &container_name, project_path, repo, branch,
-            output_tx, plan_mode, session_type,
+            output_tx, plan_mode, session_type, grpc_port,
         );
 
         Ok(StartResult {
@@ -176,40 +179,70 @@ impl ContainerManager {
         })
     }
 
-    /// Cold start: generate devcontainer config if needed, run `devcontainer up`,
+    /// Cold start: allocate port, generate devcontainer config if needed,
+    /// write override config, run `devcontainer up` with --override-config,
     /// wait for worker health check, register container.
+    /// Returns (container_name, grpc_port).
     async fn cold_start(
         &self,
         project_path: &str,
         repo: &str,
         branch: &str,
         db: &Database,
-    ) -> Result<String> {
+    ) -> Result<(String, u16)> {
         let s = settings();
 
-        // If project has no devcontainer.json, generate a default one
-        if !devcontainer::has_devcontainer_config(project_path).await {
+        // Allocate a unique port for this container
+        let grpc_port = self.registry.allocate_port(s.grpc_port_start).await;
+
+        // Read existing devcontainer.json content (if any)
+        let existing_config = devcontainer::read_config_content(project_path).await;
+
+        if existing_config.is_none() {
+            // No devcontainer.json — generate a complete default one with port mapping
             let default_config = devcontainer::generate_default_config(
                 &s.container_image,
                 &s.container_network,
+                grpc_port,
             );
             devcontainer::write_default_config(project_path, &default_config).await?;
             tracing::info!(
-                project_path = %project_path,
+                project_path = %project_path, grpc_port,
                 "Generated default devcontainer.json (no existing config found)"
             );
         }
 
+        // Build override config by merging our settings into the existing config.
+        // For repos with their own devcontainer.json, this adds port mapping and worker startup.
+        // For repos with our generated default, this is a no-op merge (same settings).
+        let override_path = if let Some(ref content) = existing_config {
+            let merged = devcontainer::build_override_config(content, grpc_port)?;
+            let path = devcontainer::write_override_config(grpc_port, &merged).await?;
+            Some(path)
+        } else {
+            None
+        };
+
         // Hash the devcontainer.json for future rebuild detection
         let config_hash = devcontainer::hash_config(project_path).await;
 
-        // Start container via devcontainer up
+        // Start container via devcontainer up, with override config if repo has its own
         let escaped_project_path = shell_escape(project_path);
-        let devcontainer_cmd = format!(
-            "devcontainer up --docker-path {} --workspace-folder {}",
-            shell_escape(&s.container_runtime),
-            escaped_project_path,
-        );
+        let devcontainer_cmd = if let Some(ref override_path) = override_path {
+            let escaped_override_path = shell_escape(override_path);
+            format!(
+                "devcontainer up --docker-path {} --workspace-folder {} --override-config {}",
+                shell_escape(&s.container_runtime),
+                escaped_project_path,
+                escaped_override_path,
+            )
+        } else {
+            format!(
+                "devcontainer up --docker-path {} --workspace-folder {}",
+                shell_escape(&s.container_runtime),
+                escaped_project_path,
+            )
+        };
 
         let timeout = Duration::from_secs(s.devcontainer_timeout_secs);
         let output_future = ssh::command()?
@@ -232,21 +265,29 @@ impl ContainerManager {
             .ok_or_else(|| anyhow!("No containerId in devcontainer output"))?
             .to_string();
 
-        // Wait for worker health check
-        let grpc_addr = format!("http://{}:{}", s.vm_host, s.grpc_port_start);
-        crate::grpc::wait_for_health(&grpc_addr, 30, Duration::from_secs(1)).await?;
+        // Wait for worker health check on the allocated port.
+        // If postStartCommand didn't start the worker (e.g. override config merge issue),
+        // fall back to starting it via SSH.
+        let grpc_addr = format!("http://{}:{}", s.vm_host, grpc_port);
+        if crate::grpc::wait_for_health(&grpc_addr, 10, Duration::from_secs(1)).await.is_err() {
+            tracing::warn!(
+                repo, branch, grpc_port,
+                "postStartCommand worker not responding, starting via SSH fallback"
+            );
+            ensure_worker_running(&container_name, &grpc_addr).await?;
+        }
 
         // Register container in registry and database, with session_count = 1
         self.registry
-            .register_container(db, repo, branch, &container_name, config_hash.as_deref())
+            .register_container(db, repo, branch, &container_name, config_hash.as_deref(), grpc_port)
             .await?;
         self.registry.increment_sessions(db, repo, branch).await?;
 
         tracing::info!(
-            repo, branch, container = %container_name,
+            repo, branch, container = %container_name, grpc_port,
             "Cold-started new container"
         );
-        Ok(container_name)
+        Ok((container_name, grpc_port))
     }
 
     /// Internal helper to create session state and spawn message processor.
@@ -261,6 +302,7 @@ impl ContainerManager {
         output_tx: mpsc::Sender<OutputEvent>,
         plan_mode: bool,
         session_type: &str,
+        grpc_port: u16,
     ) {
         let (message_tx, message_rx) = mpsc::channel::<String>(32);
         let is_first_message = Arc::new(AtomicBool::new(true));
@@ -286,6 +328,7 @@ impl ContainerManager {
                 claude_sid_clone,
                 plan_mode_clone,
                 pending_title_clone,
+                grpc_port,
             ).await;
         });
 
@@ -319,15 +362,17 @@ impl ContainerManager {
         branch: &str,
         session_type: &str,
         output_tx: mpsc::Sender<OutputEvent>,
+        grpc_port: u16,
     ) {
         self.create_session_internal(
             session_id, container_name, project_path, repo, branch,
-            output_tx, false, session_type,
+            output_tx, false, session_type, grpc_port,
         );
 
         tracing::info!(
             session_id = %session_id,
             container = %container_name,
+            grpc_port,
             "Reconnected session (fresh conversation)"
         );
     }
@@ -538,9 +583,10 @@ async fn message_processor(
     claude_session_id: Arc<Mutex<Option<String>>>,
     plan_mode: Arc<AtomicBool>,
     pending_title: Arc<AtomicBool>,
+    grpc_port: u16,
 ) {
     let s = settings();
-    let grpc_addr = format!("http://{}:{}", s.vm_host, s.grpc_port_start);
+    let grpc_addr = format!("http://{}:{}", s.vm_host, grpc_port);
 
     let mut executor = match GrpcExecutor::connect(&grpc_addr).await {
         Ok(e) => e,

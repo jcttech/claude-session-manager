@@ -44,6 +44,7 @@ pub struct ContainerEntry {
     pub container_name: String,
     pub state: ContainerState,
     pub session_count: i32,
+    pub grpc_port: u16,
     pub last_activity_at: DateTime<Utc>,
     pub devcontainer_json_hash: Option<String>,
     /// Timestamp when session_count last transitioned to 0.
@@ -87,6 +88,7 @@ impl ContainerRegistry {
                 container_name: c.container_name,
                 state: c.state.parse().unwrap_or(ContainerState::Stopped),
                 session_count: c.session_count,
+                grpc_port: c.grpc_port as u16,
                 last_activity_at: c.last_activity_at,
                 devcontainer_json_hash: c.devcontainer_json_hash,
                 last_session_stopped_at,
@@ -104,9 +106,10 @@ impl ContainerRegistry {
         branch: &str,
         container_name: &str,
         devcontainer_json_hash: Option<&str>,
+        grpc_port: u16,
     ) -> Result<i64> {
         let container_id = db
-            .create_container(repo, branch, container_name, devcontainer_json_hash)
+            .create_container(repo, branch, container_name, devcontainer_json_hash, grpc_port)
             .await?;
 
         let now = Utc::now();
@@ -115,6 +118,7 @@ impl ContainerRegistry {
             container_name: container_name.to_string(),
             state: ContainerState::Running,
             session_count: 0,
+            grpc_port,
             last_activity_at: now,
             devcontainer_json_hash: devcontainer_json_hash.map(|s| s.to_string()),
             last_session_stopped_at: Some(now),
@@ -137,6 +141,21 @@ impl ContainerRegistry {
     pub async fn get_container(&self, repo: &str, branch: &str) -> Option<ContainerEntry> {
         let key = (repo.to_string(), branch.to_string());
         self.entries.read().await.get(&key).cloned()
+    }
+
+    /// Allocate the lowest available port starting from `port_start`.
+    /// Examines all currently registered containers to find used ports.
+    pub async fn allocate_port(&self, port_start: u16) -> u16 {
+        let entries = self.entries.read().await;
+        let used_ports: std::collections::HashSet<u16> = entries
+            .values()
+            .map(|e| e.grpc_port)
+            .collect();
+        let mut port = port_start;
+        while used_ports.contains(&port) {
+            port += 1;
+        }
+        port
     }
 
     /// Increment session count for a container. Returns the new count.
@@ -265,6 +284,20 @@ mod tests {
             container_name: name.to_string(),
             state: ContainerState::Running,
             session_count: sessions,
+            grpc_port: 0,
+            last_activity_at: Utc::now(),
+            devcontainer_json_hash: None,
+            last_session_stopped_at: if sessions == 0 { Some(Utc::now()) } else { None },
+        }
+    }
+
+    fn make_entry_with_port(id: i64, name: &str, sessions: i32, port: u16) -> ContainerEntry {
+        ContainerEntry {
+            container_id: id,
+            container_name: name.to_string(),
+            state: ContainerState::Running,
+            session_count: sessions,
+            grpc_port: port,
             last_activity_at: Utc::now(),
             devcontainer_json_hash: None,
             last_session_stopped_at: if sessions == 0 { Some(Utc::now()) } else { None },
@@ -405,5 +438,49 @@ mod tests {
     async fn test_default_impl() {
         let registry = ContainerRegistry::default();
         assert_eq!(registry.count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn test_allocate_port_empty_registry() {
+        let registry = ContainerRegistry::new();
+        let port = registry.allocate_port(50051).await;
+        assert_eq!(port, 50051);
+    }
+
+    #[tokio::test]
+    async fn test_allocate_port_skips_used() {
+        let registry = ContainerRegistry::new();
+        {
+            let mut entries = registry.entries.write().await;
+            entries.insert(
+                ("org/repo1".to_string(), "main".to_string()),
+                make_entry_with_port(1, "c1", 1, 50051),
+            );
+            entries.insert(
+                ("org/repo2".to_string(), "main".to_string()),
+                make_entry_with_port(2, "c2", 1, 50052),
+            );
+        }
+        let port = registry.allocate_port(50051).await;
+        assert_eq!(port, 50053);
+    }
+
+    #[tokio::test]
+    async fn test_allocate_port_fills_gap() {
+        let registry = ContainerRegistry::new();
+        {
+            let mut entries = registry.entries.write().await;
+            entries.insert(
+                ("org/repo1".to_string(), "main".to_string()),
+                make_entry_with_port(1, "c1", 1, 50051),
+            );
+            entries.insert(
+                ("org/repo2".to_string(), "main".to_string()),
+                make_entry_with_port(2, "c2", 1, 50053),
+            );
+        }
+        let port = registry.allocate_port(50051).await;
+        // Should fill the gap at 50052
+        assert_eq!(port, 50052);
     }
 }

@@ -127,6 +127,13 @@ async fn main() -> Result<()> {
                     let parts: Vec<&str> = session.project.splitn(2, '@').collect();
                     (parts[0].to_string(), parts.get(1).unwrap_or(&"").to_string())
                 };
+                // Get grpc_port from registry (synced from DB on startup)
+                // grpc_port=0 means pre-migration container — fall back to config default
+                let reconnect_grpc_port = state.containers.registry
+                    .get_container(&reconnect_repo, &reconnect_branch)
+                    .await
+                    .map(|e| if e.grpc_port == 0 { config::settings().grpc_port_start } else { e.grpc_port })
+                    .unwrap_or(config::settings().grpc_port_start);
                 state.containers.reconnect(
                     &session.session_id,
                     &session.container_name,
@@ -135,6 +142,7 @@ async fn main() -> Result<()> {
                     &reconnect_branch,
                     &session.session_type,
                     output_tx,
+                    reconnect_grpc_port,
                 );
 
                 // Register for liveness tracking

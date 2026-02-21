@@ -17,8 +17,8 @@ pub async fn has_devcontainer_config(project_path: &str) -> bool {
 
 /// Generate a minimal devcontainer.json for projects that don't have one.
 /// Uses the fallback container image and network from config.
-/// Includes forwardPorts for gRPC worker and postStartCommand to auto-start the worker.
-pub fn generate_default_config(image: &str, network: &str) -> String {
+/// Includes postStartCommand for agent worker and port mapping via runArgs.
+pub fn generate_default_config(image: &str, network: &str, port: u16) -> String {
     format!(
         r#"{{
     "image": "{}",
@@ -29,12 +29,90 @@ pub fn generate_default_config(image: &str, network: &str) -> String {
     "containerEnv": {{
         "ANTHROPIC_API_KEY": "${{localEnv:ANTHROPIC_API_KEY}}"
     }},
-    "forwardPorts": [50051],
     "postStartCommand": "python3 -m agent_worker --port 50051 &",
-    "runArgs": ["--network={}"]
+    "runArgs": ["--network={}", "-p", "{}:50051"]
 }}"#,
-        image, network
+        image, network, port
     )
+}
+
+/// Read the raw devcontainer.json content from a project on the VM.
+/// Returns `None` if the file doesn't exist or can't be read.
+pub async fn read_config_content(project_path: &str) -> Option<String> {
+    let escaped = escape(Cow::Borrowed(project_path));
+    let cmd = format!(
+        "cat {}/.devcontainer/devcontainer.json 2>/dev/null || cat {}/.devcontainer.json 2>/dev/null",
+        escaped, escaped
+    );
+    let content = ssh::run_command(&cmd).await.ok()?;
+    if content.is_empty() {
+        return None;
+    }
+    Some(content)
+}
+
+/// Build a complete override config by reading the existing devcontainer.json,
+/// stripping JSONC comments, and merging in our port mapping and worker startup.
+/// The override config replaces the entire config, so it must include all original properties.
+/// Only injects port mapping and postStartCommand — preserves the repo's network settings.
+pub fn build_override_config(original_content: &str, port: u16) -> anyhow::Result<String> {
+    let stripped = strip_jsonc_comments(original_content);
+    let mut config: serde_json::Value = serde_json::from_str(&stripped)
+        .map_err(|e| anyhow::anyhow!("Failed to parse devcontainer.json: {}", e))?;
+
+    let obj = config.as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("devcontainer.json is not a JSON object"))?;
+
+    // Set postStartCommand for agent worker
+    obj.insert(
+        "postStartCommand".to_string(),
+        serde_json::Value::String("python3 -m agent_worker --port 50051 &".to_string()),
+    );
+
+    // Add port mapping to runArgs, preserving all existing args (including network)
+    let mut run_args: Vec<serde_json::Value> = obj
+        .get("runArgs")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    // Remove any existing -p port:50051 args (we'll add ours with the allocated port)
+    // Walk backwards to handle -p and its value as adjacent elements
+    let mut i = 0;
+    while i < run_args.len() {
+        let s = run_args[i].as_str().unwrap_or("");
+        if s == "-p" && i + 1 < run_args.len()
+            && run_args[i + 1].as_str().unwrap_or("").contains(":50051")
+        {
+            run_args.remove(i + 1);
+            run_args.remove(i);
+        } else if s.contains(":50051") {
+            run_args.remove(i);
+        } else {
+            i += 1;
+        }
+    }
+
+    run_args.push(serde_json::Value::String("-p".to_string()));
+    run_args.push(serde_json::Value::String(format!("{}:50051", port)));
+
+    obj.insert("runArgs".to_string(), serde_json::Value::Array(run_args));
+
+    serde_json::to_string_pretty(&config)
+        .map_err(|e| anyhow::anyhow!("Failed to serialize override config: {}", e))
+}
+
+/// Write an override config file to the VM via SSH.
+/// Returns the path on the VM for use with `--override-config`.
+pub async fn write_override_config(port: u16, config: &str) -> anyhow::Result<String> {
+    let path = format!("/tmp/sm-override-{}.json", port);
+    let escaped_path = escape(Cow::Borrowed(&path));
+    let write_cmd = format!(
+        "cat > {} << 'OCEOF'\n{}\nOCEOF",
+        escaped_path, config
+    );
+    ssh::run_command(&write_cmd).await?;
+    Ok(path)
 }
 
 /// Write a default devcontainer.json to a project directory on the VM.
@@ -289,11 +367,70 @@ mod tests {
 
     #[test]
     fn test_generate_default_config() {
-        let config = generate_default_config("myimage:latest", "isolated");
+        let config = generate_default_config("myimage:latest", "isolated", 50051);
         assert!(config.contains("myimage:latest"));
         assert!(config.contains("isolated"));
         assert!(config.contains("claude-config-shared"));
         assert!(config.contains("claude-mem-shared"));
         assert!(config.contains("ANTHROPIC_API_KEY"));
+        assert!(config.contains("postStartCommand"));
+        assert!(config.contains("50051:50051"));
+    }
+
+    #[test]
+    fn test_generate_default_config_custom_port() {
+        let config = generate_default_config("myimage:latest", "isolated", 50053);
+        assert!(config.contains("50053:50051"));
+        assert!(!config.contains("50051:50051"));
+    }
+
+    #[test]
+    fn test_build_override_config_merges_properties() {
+        let original = r#"{
+            "image": "ghcr.io/org/repo:latest",
+            "containerEnv": { "FOO": "bar" }
+        }"#;
+        let result = build_override_config(original, 50053).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        // Preserves original properties
+        assert_eq!(parsed["image"].as_str(), Some("ghcr.io/org/repo:latest"));
+        assert_eq!(parsed["containerEnv"]["FOO"].as_str(), Some("bar"));
+        // Adds our properties
+        assert!(parsed["postStartCommand"].as_str().unwrap().contains("agent_worker"));
+        let run_args: Vec<&str> = parsed["runArgs"].as_array().unwrap()
+            .iter().filter_map(|v| v.as_str()).collect();
+        assert!(run_args.contains(&"-p"));
+        assert!(run_args.contains(&"50053:50051"));
+    }
+
+    #[test]
+    fn test_build_override_config_replaces_existing_port() {
+        let original = r#"{
+            "image": "test:v1",
+            "runArgs": ["--network=old-net", "-p", "50051:50051", "--cap-add=SYS_PTRACE"]
+        }"#;
+        let result = build_override_config(original, 50055).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        let run_args: Vec<&str> = parsed["runArgs"].as_array().unwrap()
+            .iter().filter_map(|v| v.as_str()).collect();
+        // Existing network preserved, old port replaced, custom args preserved
+        assert!(run_args.contains(&"--network=old-net"));
+        assert!(run_args.contains(&"50055:50051"));
+        assert!(run_args.contains(&"--cap-add=SYS_PTRACE"));
+        assert!(!run_args.contains(&"50051:50051"));
+    }
+
+    #[test]
+    fn test_build_override_config_handles_jsonc() {
+        let jsonc = r#"{
+            // This repo uses a custom image
+            "image": "myimage:v2",
+            /* block comment */
+            "name": "test"
+        }"#;
+        let result = build_override_config(jsonc, 50052).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["image"].as_str(), Some("myimage:v2"));
+        assert!(parsed["postStartCommand"].as_str().is_some());
     }
 }

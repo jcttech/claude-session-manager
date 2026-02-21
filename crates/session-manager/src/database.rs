@@ -36,6 +36,7 @@ pub struct StoredContainer {
     pub container_name: String,
     pub state: String,
     pub session_count: i32,
+    pub grpc_port: i32,
     pub last_activity_at: chrono::DateTime<chrono::Utc>,
     pub devcontainer_json_hash: Option<String>,
     pub created_at: chrono::DateTime<chrono::Utc>,
@@ -128,6 +129,14 @@ pub async fn create_schema(pool: &PgPool, schema: &str) -> Result<()> {
             UNIQUE(repo, branch)
         )
         "#,
+        schema
+    ))
+    .execute(pool)
+    .await?;
+
+    // Migration: add grpc_port column to containers table
+    sqlx::query(&format!(
+        "ALTER TABLE {}.containers ADD COLUMN IF NOT EXISTS grpc_port INTEGER NOT NULL DEFAULT 0",
         schema
     ))
     .execute(pool)
@@ -533,16 +542,18 @@ impl Database {
         branch: &str,
         container_name: &str,
         devcontainer_json_hash: Option<&str>,
+        grpc_port: u16,
     ) -> Result<i64> {
         let row: (i64,) = sqlx::query_as(&format!(
-            "INSERT INTO {}.containers (repo, branch, container_name, devcontainer_json_hash) \
-             VALUES ($1, $2, $3, $4) RETURNING id",
+            "INSERT INTO {}.containers (repo, branch, container_name, devcontainer_json_hash, grpc_port) \
+             VALUES ($1, $2, $3, $4, $5) RETURNING id",
             SCHEMA
         ))
         .bind(repo)
         .bind(branch)
         .bind(container_name)
         .bind(devcontainer_json_hash)
+        .bind(grpc_port as i32)
         .fetch_one(&self.pool)
         .await?;
         Ok(row.0)
@@ -555,7 +566,7 @@ impl Database {
         branch: &str,
     ) -> Result<Option<StoredContainer>> {
         let container = sqlx::query_as::<_, StoredContainer>(&format!(
-            "SELECT id, repo, branch, container_name, state, session_count, last_activity_at, devcontainer_json_hash, created_at \
+            "SELECT id, repo, branch, container_name, state, session_count, grpc_port, last_activity_at, devcontainer_json_hash, created_at \
              FROM {}.containers WHERE repo = $1 AND branch = $2",
             SCHEMA
         ))
@@ -569,7 +580,7 @@ impl Database {
     /// Get all containers in "running" state (for registry sync on startup).
     pub async fn get_running_containers(&self) -> Result<Vec<StoredContainer>> {
         let containers = sqlx::query_as::<_, StoredContainer>(&format!(
-            "SELECT id, repo, branch, container_name, state, session_count, last_activity_at, devcontainer_json_hash, created_at \
+            "SELECT id, repo, branch, container_name, state, session_count, grpc_port, last_activity_at, devcontainer_json_hash, created_at \
              FROM {}.containers WHERE state = 'running'",
             SCHEMA
         ))
@@ -615,7 +626,7 @@ impl Database {
     /// Get all containers (for status display).
     pub async fn get_all_containers(&self) -> Result<Vec<StoredContainer>> {
         let containers = sqlx::query_as::<_, StoredContainer>(&format!(
-            "SELECT id, repo, branch, container_name, state, session_count, last_activity_at, devcontainer_json_hash, created_at \
+            "SELECT id, repo, branch, container_name, state, session_count, grpc_port, last_activity_at, devcontainer_json_hash, created_at \
              FROM {}.containers",
             SCHEMA
         ))

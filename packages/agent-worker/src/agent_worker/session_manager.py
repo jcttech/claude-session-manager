@@ -38,12 +38,15 @@ class SessionManager:
             setting_sources=["project"],
             permission_mode=permission_mode or "bypassPermissions",
             env=env or {},
-            include_partial_messages=True,
             max_turns=max_turns,
         )
 
         client = ClaudeSDKClient(options)
-        await client.connect(prompt)
+        # connect() without a string prompt to initialize the transport,
+        # then query() to actually send the prompt via stream-json stdin.
+        # Passing a string directly to connect() doesn't send it.
+        await client.connect()
+        await client.query(prompt)
         return client
 
     def register(self, session_id: str, client: ClaudeSDKClient) -> None:
