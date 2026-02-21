@@ -20,6 +20,7 @@ jobs:
         --python_out=src/agent_worker
         --grpc_python_out=src/agent_worker
         ../../proto/agent.proto
+        && sed -i 's/^import agent_pb2/from . import agent_pb2/' src/agent_worker/agent_pb2_grpc.py
       code-paths: |
         packages/agent-worker/**
         proto/**

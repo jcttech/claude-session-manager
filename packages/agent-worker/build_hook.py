@@ -29,3 +29,13 @@ class CustomBuildHook(BuildHookInterface):
                 str(proto_file),
             ]
         )
+
+        # Fix grpc_tools generating bare imports instead of relative imports
+        grpc_stub = output_dir / "agent_pb2_grpc.py"
+        if grpc_stub.exists():
+            content = grpc_stub.read_text()
+            content = content.replace(
+                "import agent_pb2 as agent__pb2",
+                "from . import agent_pb2 as agent__pb2",
+            )
+            grpc_stub.write_text(content)
