@@ -77,7 +77,17 @@ mock_sdk.SystemMessage = SystemMessage
 mock_sdk.AssistantMessage = AssistantMessage
 mock_sdk.ResultMessage = ResultMessage
 mock_sdk.StreamEvent = StreamEvent
+mock_sdk_types = type(sys)("claude_agent_sdk.types")
+mock_sdk_types.TextBlock = TextBlock
+mock_sdk_types.ToolUseBlock = ToolUseBlock
+mock_sdk_types.ToolResultBlock = ToolResultBlock
+mock_sdk_types.SystemMessage = SystemMessage
+mock_sdk_types.AssistantMessage = AssistantMessage
+mock_sdk_types.ResultMessage = ResultMessage
+mock_sdk_types.StreamEvent = StreamEvent
+mock_sdk.types = mock_sdk_types
 sys.modules["claude_agent_sdk"] = mock_sdk
+sys.modules["claude_agent_sdk.types"] = mock_sdk_types
 
 from agent_worker.event_mapper import (  # noqa: E402
     error_event,
