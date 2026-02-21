@@ -39,6 +39,7 @@ class SessionManager:
             permission_mode=permission_mode or "bypassPermissions",
             env=env or {},
             max_turns=max_turns,
+            include_partial_messages=True,
         )
 
         client = ClaudeSDKClient(options)

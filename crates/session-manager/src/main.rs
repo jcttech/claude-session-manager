@@ -1192,8 +1192,15 @@ async fn flush_batch(
     if batch.is_empty() {
         return;
     }
+    let line_count = batch.len();
     let content = batch.join("\n");
     batch.clear();
+    tracing::debug!(
+        session_id = %session_id,
+        line_count,
+        content_len = content.len(),
+        "Flushing batch to Mattermost"
+    );
     if let Err(e) = state.mm.post_in_thread(channel_id, thread_id, &content).await {
         tracing::warn!(
             session_id = %session_id,
@@ -1209,6 +1216,124 @@ const BATCH_MAX_BYTES: usize = 14 * 1024;
 const BATCH_MAX_LINES: usize = 80;
 /// Batch timeout before flushing accumulated output
 const BATCH_TIMEOUT: Duration = Duration::from_millis(200);
+/// Minimum interval between live card updates (avoid Mattermost rate limits)
+const CARD_UPDATE_MIN_INTERVAL: Duration = Duration::from_millis(500);
+/// Maximum number of tool lines shown in the live card before collapsing
+const CARD_MAX_TOOL_LINES: usize = 20;
+
+/// Live card state — a single updatable Mattermost post that shows processing status.
+struct LiveCard {
+    post_id: Option<String>,
+    header: String,
+    tool_lines: Vec<String>,
+    last_update: tokio::time::Instant,
+    /// Whether the card has unsent changes (dirty flag for throttled updates)
+    dirty: bool,
+}
+
+impl LiveCard {
+    fn new() -> Self {
+        Self {
+            post_id: None,
+            header: String::new(),
+            tool_lines: Vec::new(),
+            last_update: tokio::time::Instant::now(),
+            dirty: false,
+        }
+    }
+
+    /// Reset for a new processing turn.
+    fn start_processing(&mut self) {
+        self.header = ":hourglass_flowing_sand: Processing...".to_string();
+        self.tool_lines.clear();
+        self.dirty = true;
+    }
+
+    /// Append a tool action line to the card.
+    fn add_tool_action(&mut self, action: &str) {
+        self.tool_lines.push(format!("> {}", action));
+        self.dirty = true;
+    }
+
+    /// Finalize the card with completion stats.
+    fn finalize(&mut self, input_tokens: u64, output_tokens: u64) {
+        let input_k = format_token_count(input_tokens);
+        let output_k = format_token_count(output_tokens);
+        self.header = format!(":white_check_mark: Done ({} in / {} out)", input_k, output_k);
+        self.dirty = true;
+    }
+
+    /// Finalize the card with an error.
+    fn finalize_error(&mut self, exit_code: Option<i32>, signal: &Option<String>) {
+        let code_str = exit_code
+            .map(|c| c.to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        self.header = match signal {
+            Some(sig) => format!(":warning: Process died (exit {}, {})", code_str, sig),
+            None => format!(":warning: Process died (exit {})", code_str),
+        };
+        self.dirty = true;
+    }
+
+    /// Render the card as a single markdown string.
+    fn render(&self) -> String {
+        let mut parts = Vec::with_capacity(2 + self.tool_lines.len());
+        parts.push(self.header.clone());
+
+        if self.tool_lines.len() > CARD_MAX_TOOL_LINES {
+            // Collapse older tools, show first 3 and last (MAX - 4)
+            let show_tail = CARD_MAX_TOOL_LINES - 4;
+            for line in &self.tool_lines[..3] {
+                parts.push(line.clone());
+            }
+            let hidden = self.tool_lines.len() - 3 - show_tail;
+            parts.push(format!("> _... {} more tools ..._", hidden));
+            for line in &self.tool_lines[self.tool_lines.len() - show_tail..] {
+                parts.push(line.clone());
+            }
+        } else {
+            for line in &self.tool_lines {
+                parts.push(line.clone());
+            }
+        }
+
+        parts.join("\n")
+    }
+
+    /// Whether enough time has passed since the last update to allow a new one.
+    fn can_update_now(&self) -> bool {
+        self.last_update.elapsed() >= CARD_UPDATE_MIN_INTERVAL
+    }
+
+    /// Send the card to Mattermost (create or update).
+    async fn flush(&mut self, state: &AppState, channel_id: &str, thread_id: &str) {
+        if !self.dirty {
+            return;
+        }
+        let msg = self.render();
+        if let Some(ref post_id) = self.post_id {
+            let _ = state.mm.update_post(post_id, &msg).await;
+        } else {
+            match state.mm.post_in_thread(channel_id, thread_id, &msg).await {
+                Ok(post_id) => { self.post_id = Some(post_id); }
+                Err(e) => {
+                    tracing::warn!(error = %e, "Failed to create live card post");
+                }
+            }
+        }
+        self.last_update = tokio::time::Instant::now();
+        self.dirty = false;
+    }
+}
+
+/// Format token count in a human-readable way (e.g. "15.2k", "832")
+fn format_token_count(tokens: u64) -> String {
+    if tokens >= 1000 {
+        format!("{:.1}k", tokens as f64 / 1000.0)
+    } else {
+        tokens.to_string()
+    }
+}
 
 #[allow(clippy::too_many_arguments)]
 async fn stream_output(
@@ -1227,34 +1352,32 @@ async fn stream_output(
     let batch_timer = tokio::time::sleep(BATCH_TIMEOUT);
     tokio::pin!(batch_timer);
 
-    // Single status post that accumulates processing info and tool actions
-    let mut status_post_id: Option<String> = None;
-    let mut status_lines: Vec<String> = Vec::new();
+    let mut card = LiveCard::new();
+
+    tracing::info!(session_id = %session_id, "stream_output: started");
 
     loop {
         tokio::select! {
             event_opt = rx.recv() => {
                 let Some(event) = event_opt else {
-                    // Channel closed — flush remaining batch and exit
+                    // Channel closed — flush remaining batch and card, then exit
+                    tracing::info!(session_id = %session_id, batch_len = batch.len(), "stream_output: channel closed, flushing");
                     flush_batch(&state, &channel_id, &thread_id, &session_id, &mut batch).await;
+                    card.flush(&state, &channel_id, &thread_id).await;
                     break;
                 };
 
                 match event {
-                    OutputEvent::ProcessingStarted { input_tokens } => {
+                    OutputEvent::ProcessingStarted { .. } => {
                         state.liveness.update_activity(&session_id, "ProcessingStarted");
-                        // Start a new status post (reset from previous turn)
-                        status_lines.clear();
-                        status_lines.push(format!("_Processing... (context: {} tokens)_", input_tokens));
-                        let msg = status_lines.join("\n");
-                        match state.mm.post_in_thread(&channel_id, &thread_id, &msg).await {
-                            Ok(post_id) => { status_post_id = Some(post_id); }
-                            Err(_) => { status_post_id = None; }
-                        }
+                        tracing::info!(session_id = %session_id, "stream_output: ProcessingStarted");
+                        // Start a new live card for this turn
+                        card.start_processing();
+                        card.flush(&state, &channel_id, &thread_id).await;
                     }
                     OutputEvent::TextLine(line) => {
                         state.liveness.update_activity(&session_id, "TextLine");
-                        // Check for markers — flush batch before processing
+                        // Check for network request markers
                         if let Some(caps) = network_re.captures(&line) {
                             flush_batch(&state, &channel_id, &thread_id, &session_id, &mut batch).await;
                             batch_bytes = 0;
@@ -1278,19 +1401,14 @@ async fn stream_output(
                     }
                     OutputEvent::ToolAction(action) => {
                         state.liveness.update_activity(&session_id, "ToolAction");
-                        // Flush any accumulated text batch before updating status
+                        tracing::info!(session_id = %session_id, action = %action, "stream_output: ToolAction");
+                        // Flush any accumulated text batch before updating card
                         flush_batch(&state, &channel_id, &thread_id, &session_id, &mut batch).await;
                         batch_bytes = 0;
-                        // Append tool action to the status post
-                        status_lines.push(format!("> {}", action));
-                        let msg = status_lines.join("\n");
-                        if let Some(ref post_id) = status_post_id {
-                            let _ = state.mm.update_post(post_id, &msg).await;
-                        } else {
-                            // No status post yet — create one
-                            if let Ok(post_id) = state.mm.post_in_thread(&channel_id, &thread_id, &msg).await {
-                                status_post_id = Some(post_id);
-                            }
+                        // Append tool action to the live card
+                        card.add_tool_action(&action);
+                        if card.can_update_now() {
+                            card.flush(&state, &channel_id, &thread_id).await;
                         }
                     }
                     OutputEvent::TitleGenerated(title) => {
@@ -1304,13 +1422,27 @@ async fn stream_output(
                     }
                     OutputEvent::ResponseComplete { input_tokens, output_tokens } => {
                         state.liveness.update_activity(&session_id, "ResponseComplete");
+                        tracing::info!(
+                            session_id = %session_id,
+                            input_tokens, output_tokens,
+                            batch_len = batch.len(),
+                            "stream_output: ResponseComplete"
+                        );
+                        // Flush remaining text, then finalize the card
                         flush_batch(&state, &channel_id, &thread_id, &session_id, &mut batch).await;
                         batch_bytes = 0;
+
+                        card.finalize(input_tokens, output_tokens);
+                        card.flush(&state, &channel_id, &thread_id).await;
+                        // Reset card post_id so next turn creates a fresh card
+                        card.post_id = None;
+
                         counter!("tokens_input_total").increment(input_tokens);
                         counter!("tokens_output_total").increment(output_tokens);
+
                         // Warn when context window is getting full (>80% of 200k)
-                        let usage_pct = (input_tokens as f64 / 200_000.0 * 100.0) as u64;
                         if input_tokens > 160_000 {
+                            let usage_pct = (input_tokens as f64 / 200_000.0 * 100.0) as u64;
                             let msg = format!(
                                 ":warning: **Context window {}% full** ({} / 200k tokens) — consider using `compact` or `clear`",
                                 usage_pct, input_tokens
@@ -1319,32 +1451,29 @@ async fn stream_output(
                         }
                     }
                     OutputEvent::ProcessDied { exit_code, signal } => {
+                        tracing::warn!(session_id = %session_id, ?exit_code, ?signal, "stream_output: ProcessDied");
                         flush_batch(&state, &channel_id, &thread_id, &session_id, &mut batch).await;
                         batch_bytes = 0;
-                        let code_str = exit_code
-                            .map(|c| c.to_string())
-                            .unwrap_or_else(|| "unknown".to_string());
-                        let msg = match signal {
-                            Some(ref sig) => format!(
-                                ":warning: Session process died unexpectedly (exit code {}, {}). Use `start` to begin a new session.",
-                                code_str, sig
-                            ),
-                            None => format!(
-                                ":warning: Session process died unexpectedly (exit code {}). Use `start` to begin a new session.",
-                                code_str
-                            ),
-                        };
-                        // Fire-and-forget notification
-                        let _ = state.mm.post_in_thread(&channel_id, &thread_id, &msg).await;
+
+                        card.finalize_error(exit_code, &signal);
+                        card.flush(&state, &channel_id, &thread_id).await;
+                        card.post_id = None;
                     }
                 }
             }
             _ = &mut batch_timer => {
-                // Timer expired — flush accumulated batch
+                // Timer expired — flush accumulated text batch and any dirty card updates
+                if !batch.is_empty() {
+                    tracing::debug!(session_id = %session_id, batch_len = batch.len(), "stream_output: timer flush");
+                }
                 flush_batch(&state, &channel_id, &thread_id, &session_id, &mut batch).await;
                 batch_bytes = 0;
-                // Reset timer far into the future (only re-armed when lines arrive)
-                batch_timer.as_mut().reset(tokio::time::Instant::now() + Duration::from_secs(86400));
+                // Also flush any pending card updates that were throttled
+                if card.dirty {
+                    card.flush(&state, &channel_id, &thread_id).await;
+                }
+                // Reset timer
+                batch_timer.as_mut().reset(tokio::time::Instant::now() + BATCH_TIMEOUT);
             }
         }
     }

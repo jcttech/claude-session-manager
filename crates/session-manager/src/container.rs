@@ -636,6 +636,12 @@ async fn message_processor(
             "Sending message via gRPC"
         );
 
+        // Emit ProcessingStarted immediately so the UI shows feedback right away.
+        // input_tokens=0 is a placeholder; real token counts arrive with ResponseComplete.
+        let _ = output_tx
+            .send(OutputEvent::ProcessingStarted { input_tokens: 0 })
+            .await;
+
         // If pending_title is set, we'll capture the response as a title
         let is_title_request = pending_title.swap(false, Ordering::SeqCst);
 
@@ -659,6 +665,11 @@ async fn message_processor(
 
         match result {
             Ok(new_session_id) => {
+                tracing::info!(
+                    session_id = %session_id,
+                    is_first,
+                    "gRPC call completed successfully"
+                );
                 // Capture session ID from first Execute
                 if let Some(sid) = new_session_id && stored_sid.is_none() {
                     tracing::info!(

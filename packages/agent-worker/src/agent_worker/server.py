@@ -12,6 +12,7 @@ from claude_agent_sdk.types import (
     ResultMessage,
     StreamEvent,
     SystemMessage,
+    UserMessage,
 )
 from grpc import aio as grpc_aio
 
@@ -57,7 +58,18 @@ class AgentWorkerServicer(agent_pb2_grpc.AgentWorkerServicer):
             )
 
             session_id = None
-            async for message in client.receive_messages():
+            # Manually iterate so we can catch per-message parse errors
+            # (e.g. "Unknown message type") without killing the whole stream.
+            msg_iter = client.receive_messages().__aiter__()
+            while True:
+                try:
+                    message = await msg_iter.__anext__()
+                except StopAsyncIteration:
+                    break
+                except Exception as parse_exc:
+                    logger.warning("Skipping unparseable message: %s", parse_exc)
+                    continue
+
                 if isinstance(message, SystemMessage):
                     event = map_system_message(message)
                     if event is not None:
@@ -79,15 +91,17 @@ class AgentWorkerServicer(agent_pb2_grpc.AgentWorkerServicer):
                     if event is not None:
                         yield event
 
+                elif isinstance(message, UserMessage):
+                    pass  # Tool results flowing back — not surfaced to chat
+
+                else:
+                    logger.warning("Unhandled message type: %s", type(message).__name__)
+
         except GeneratorExit:
             pass
         except Exception as exc:
-            # MessageParseError for unknown types (e.g. rate_limit_event) is non-fatal
-            if "Unknown message type" in str(exc):
-                logger.warning("Ignoring unknown message type: %s", exc)
-            else:
-                logger.exception("Execute failed")
-                yield error_event(str(exc), "execute_error")
+            logger.exception("Execute failed")
+            yield error_event(str(exc), "execute_error")
 
     async def SendMessage(self, request, context):
         """Send a follow-up message to an existing session."""
@@ -105,7 +119,18 @@ class AgentWorkerServicer(agent_pb2_grpc.AgentWorkerServicer):
         try:
             await client.query(request.prompt)
 
-            async for message in client.receive_response():
+            # Manually iterate so we can catch per-message parse errors
+            # without killing the whole stream.
+            msg_iter = client.receive_response().__aiter__()
+            while True:
+                try:
+                    message = await msg_iter.__anext__()
+                except StopAsyncIteration:
+                    break
+                except Exception as parse_exc:
+                    logger.warning("Skipping unparseable message: %s", parse_exc)
+                    continue
+
                 if isinstance(message, AssistantMessage):
                     for event in map_assistant_message(message):
                         yield event
@@ -119,14 +144,17 @@ class AgentWorkerServicer(agent_pb2_grpc.AgentWorkerServicer):
                     if event is not None:
                         yield event
 
+                elif isinstance(message, UserMessage):
+                    pass  # Tool results flowing back — not surfaced to chat
+
+                else:
+                    logger.warning("Unhandled message type: %s", type(message).__name__)
+
         except GeneratorExit:
             pass
         except Exception as exc:
-            if "Unknown message type" in str(exc):
-                logger.warning("Ignoring unknown message type: %s", exc)
-            else:
-                logger.exception("SendMessage failed")
-                yield error_event(str(exc), "send_message_error")
+            logger.exception("SendMessage failed")
+            yield error_event(str(exc), "send_message_error")
 
     async def Interrupt(self, request, context):
         """Interrupt a running session."""
