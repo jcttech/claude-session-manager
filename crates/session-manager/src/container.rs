@@ -46,12 +46,14 @@ struct Session {
     branch: String,
     /// Session type: "standard", "worker", "reviewer"
     _session_type: String,
-    /// true → first message (gRPC Execute); false → subsequent (gRPC SendMessage)
+    /// true → first message (gRPC CreateSession); false → subsequent (gRPC FollowUp)
     is_first_message: Arc<AtomicBool>,
     /// Claude session ID captured from gRPC SessionInit event
     claude_session_id: Arc<Mutex<Option<String>>>,
     /// Whether plan mode is enabled for this session
     plan_mode: Arc<AtomicBool>,
+    /// Whether extended thinking is enabled for this session
+    thinking_mode: Arc<AtomicBool>,
     /// Whether the next response should be captured as a thread title
     pending_title: Arc<AtomicBool>,
 }
@@ -91,6 +93,7 @@ impl ContainerManager {
         db: &Database,
         output_tx: mpsc::Sender<OutputEvent>,
         plan_mode: bool,
+        thinking_mode: bool,
         session_type: &str,
     ) -> Result<StartResult> {
         let s = settings();
@@ -169,7 +172,7 @@ impl ContainerManager {
         let reused = existing.is_some();
         self.create_session_internal(
             session_id, &container_name, project_path, repo, branch,
-            output_tx, plan_mode, session_type, grpc_port,
+            output_tx, plan_mode, thinking_mode, session_type, grpc_port,
         );
 
         Ok(StartResult {
@@ -301,6 +304,7 @@ impl ContainerManager {
         branch: &str,
         output_tx: mpsc::Sender<OutputEvent>,
         plan_mode: bool,
+        thinking_mode: bool,
         session_type: &str,
         grpc_port: u16,
     ) {
@@ -308,6 +312,7 @@ impl ContainerManager {
         let is_first_message = Arc::new(AtomicBool::new(true));
         let claude_session_id = Arc::new(Mutex::new(None));
         let plan_mode_flag = Arc::new(AtomicBool::new(plan_mode));
+        let thinking_mode_flag = Arc::new(AtomicBool::new(thinking_mode));
         let pending_title_flag = Arc::new(AtomicBool::new(false));
 
         let session_id_owned = session_id.to_string();
@@ -316,6 +321,7 @@ impl ContainerManager {
         let is_first_clone = Arc::clone(&is_first_message);
         let claude_sid_clone = Arc::clone(&claude_session_id);
         let plan_mode_clone = Arc::clone(&plan_mode_flag);
+        let thinking_mode_clone = Arc::clone(&thinking_mode_flag);
         let pending_title_clone = Arc::clone(&pending_title_flag);
         tokio::spawn(async move {
             message_processor(
@@ -327,6 +333,7 @@ impl ContainerManager {
                 is_first_clone,
                 claude_sid_clone,
                 plan_mode_clone,
+                thinking_mode_clone,
                 pending_title_clone,
                 grpc_port,
             ).await;
@@ -344,6 +351,7 @@ impl ContainerManager {
                 is_first_message,
                 claude_session_id,
                 plan_mode: plan_mode_flag,
+                thinking_mode: thinking_mode_flag,
                 pending_title: pending_title_flag,
             },
         );
@@ -366,7 +374,7 @@ impl ContainerManager {
     ) {
         self.create_session_internal(
             session_id, container_name, project_path, repo, branch,
-            output_tx, false, session_type, grpc_port,
+            output_tx, false, false, session_type, grpc_port,
         );
 
         tracing::info!(
@@ -467,11 +475,27 @@ impl ContainerManager {
             .unwrap_or(false)
     }
 
+    /// Set thinking mode for a session
+    pub fn set_thinking_mode(&self, session_id: &str, enabled: bool) {
+        if let Some(session) = self.sessions.get(session_id) {
+            session.thinking_mode.store(enabled, Ordering::SeqCst);
+        }
+    }
+
+    /// Get thinking mode status for a session
+    pub fn get_thinking_mode(&self, session_id: &str) -> bool {
+        self.sessions
+            .get(session_id)
+            .map(|s| s.thinking_mode.load(Ordering::SeqCst))
+            .unwrap_or(false)
+    }
+
     /// Get live runtime info for a session
     pub fn get_session_info(&self, session_id: &str) -> Option<SessionInfo> {
         self.sessions.get(session_id).map(|s| SessionInfo {
             claude_session_id: s.claude_session_id.lock().unwrap().clone(),
             plan_mode: s.plan_mode.load(Ordering::SeqCst),
+            thinking_mode: s.thinking_mode.load(Ordering::SeqCst),
             is_first_message: s.is_first_message.load(Ordering::SeqCst),
         })
     }
@@ -540,6 +564,7 @@ impl ContainerManager {
 pub struct SessionInfo {
     pub claude_session_id: Option<String>,
     pub plan_mode: bool,
+    pub thinking_mode: bool,
     pub is_first_message: bool,
 }
 
@@ -568,10 +593,9 @@ async fn ensure_worker_running(container_name: &str, grpc_addr: &str) -> Result<
     crate::grpc::wait_for_health(grpc_addr, 15, Duration::from_secs(1)).await
 }
 
-/// Per-message processor task. Reads messages from the channel and for each one:
-/// 1. Connects to the gRPC worker via GrpcExecutor
-/// 2. Calls Execute (first message) or SendMessage (subsequent) on the worker
-/// 3. Streams AgentEvent → OutputEvent to the output channel
+/// Per-message processor task. Opens a single bidirectional gRPC Session stream,
+/// then for each user message sends CreateSession (first) or FollowUp (subsequent)
+/// and processes the turn's events until SessionResult.
 #[allow(clippy::too_many_arguments)]
 async fn message_processor(
     mut message_rx: mpsc::Receiver<String>,
@@ -582,6 +606,7 @@ async fn message_processor(
     is_first_message: Arc<AtomicBool>,
     claude_session_id: Arc<Mutex<Option<String>>>,
     plan_mode: Arc<AtomicBool>,
+    thinking_mode: Arc<AtomicBool>,
     pending_title: Arc<AtomicBool>,
     grpc_port: u16,
 ) {
@@ -617,6 +642,18 @@ async fn message_processor(
         }
     };
 
+    let mut session = match executor.open_session().await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!(session_id = %session_id, error = %e, "Failed to open gRPC session");
+            let _ = output_tx.send(OutputEvent::ProcessDied {
+                exit_code: Some(1),
+                signal: Some(format!("Failed to open gRPC session: {}", e)),
+            }).await;
+            return;
+        }
+    };
+
     while let Some(message) = message_rx.recv().await {
         let stored_sid = claude_session_id.lock().unwrap().clone();
         let is_first = is_first_message.load(Ordering::SeqCst);
@@ -628,50 +665,60 @@ async fn message_processor(
             "bypassPermissions"
         };
 
+        let thinking_tokens = if thinking_mode.load(Ordering::SeqCst) { 10000 } else { 0 };
+
         tracing::info!(
             session_id = %session_id,
             is_first,
             has_session_id = stored_sid.is_some(),
             permission_mode,
+            thinking_tokens,
             "Sending message via gRPC"
         );
 
         // Emit ProcessingStarted immediately so the UI shows feedback right away.
-        // input_tokens=0 is a placeholder; real token counts arrive with ResponseComplete.
         let _ = output_tx
             .send(OutputEvent::ProcessingStarted { input_tokens: 0 })
             .await;
 
         // If pending_title is set, we'll capture the response as a title
-        let is_title_request = pending_title.swap(false, Ordering::SeqCst);
+        let _is_title_request = pending_title.swap(false, Ordering::SeqCst);
 
-        let result = if is_first || stored_sid.is_none() {
-            // First message: Execute (creates new session)
-            executor.execute(
+        // Send appropriate request type
+        let send_result = if is_first || stored_sid.is_none() {
+            session.create(
                 &message,
-                "",
                 permission_mode,
                 std::collections::HashMap::new(),
-                &output_tx,
+                "",
+                thinking_tokens,
             ).await
         } else {
-            // Subsequent message: SendMessage (continues session)
-            executor.send_message(
-                stored_sid.as_deref().unwrap(),
-                &message,
-                &output_tx,
-            ).await
+            session.follow_up(&message).await
         };
 
-        match result {
-            Ok(new_session_id) => {
+        if let Err(e) = send_result {
+            tracing::error!(
+                session_id = %session_id,
+                error = %e,
+                "Failed to send gRPC request"
+            );
+            let _ = output_tx.send(OutputEvent::ProcessDied {
+                exit_code: Some(1),
+                signal: Some(format!("gRPC send error: {}", e)),
+            }).await;
+            break; // Stream broken — exit processor
+        }
+
+        // Process events for this turn
+        match session.process_turn_events(&output_tx).await {
+            Ok(new_sid) => {
                 tracing::info!(
                     session_id = %session_id,
                     is_first,
-                    "gRPC call completed successfully"
+                    "gRPC turn completed successfully"
                 );
-                // Capture session ID from first Execute
-                if let Some(sid) = new_session_id && stored_sid.is_none() {
+                if let Some(sid) = new_sid && stored_sid.is_none() {
                     tracing::info!(
                         session_id = %session_id,
                         claude_session_id = %sid,
@@ -685,24 +732,14 @@ async fn message_processor(
                 tracing::error!(
                     session_id = %session_id,
                     error = %e,
-                    "gRPC call failed"
+                    "gRPC turn failed"
                 );
-                if output_tx.send(OutputEvent::ProcessDied {
+                let _ = output_tx.send(OutputEvent::ProcessDied {
                     exit_code: Some(1),
                     signal: Some(format!("gRPC error: {}", e)),
-                }).await.is_err() {
-                    break;
-                }
+                }).await;
+                break; // Stream broken — exit processor
             }
-        }
-
-        // If this was a title request, emit TitleGenerated
-        // (The actual title text was already streamed as TextLine events,
-        //  the stream_output handler will have captured it)
-        if is_title_request {
-            // Title requests are handled by the `title` command in main.rs
-            // which sends a specific prompt and captures the response.
-            // The TextLine events already went through.
         }
     }
 

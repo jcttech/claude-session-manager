@@ -3,7 +3,8 @@
 Usage:
     python -m tests.test_client --port 50051 --prompt "What is 2+2?"
 
-This sends a single Execute request and prints all events received.
+This opens a bidirectional Session stream, sends a CreateSession request,
+prints all events, then sends a FollowUp message and prints those events.
 Useful for manual validation of the worker before Rust integration.
 """
 
@@ -20,6 +21,28 @@ from grpc import aio as grpc_aio
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from agent_worker import agent_pb2, agent_pb2_grpc  # noqa: E402
+
+
+async def request_generator(prompt: str, session_id: str | None):
+    """Generate SessionInput messages for the bidirectional stream."""
+    # First: CreateSession
+    yield agent_pb2.SessionInput(
+        create=agent_pb2.CreateSession(
+            prompt=prompt,
+            permission_mode="bypassPermissions",
+        )
+    )
+
+    # Wait a bit for the first turn to complete, then send follow-up
+    # In practice, the Rust side coordinates this based on SessionResult events
+    await asyncio.sleep(2)
+
+    if session_id:
+        yield agent_pb2.SessionInput(
+            follow_up=agent_pb2.FollowUp(
+                prompt="What did I just ask you?",
+            )
+        )
 
 
 async def run_test(port: int, prompt: str) -> None:
@@ -39,17 +62,33 @@ async def run_test(port: int, prompt: str) -> None:
             print("Worker not ready, aborting.")
             return
 
-        # Execute
-        print(f"\nExecuting: {prompt!r}")
+        # Session (bidirectional stream)
+        print(f"\nStarting session with: {prompt!r}")
         print("-" * 60)
 
-        request = agent_pb2.ExecuteRequest(
-            prompt=prompt,
-            permission_mode="bypassPermissions",
-        )
+        # We need to coordinate sending requests with receiving events.
+        # Use a queue to send requests from the event processing loop.
+        request_queue = asyncio.Queue()
+
+        # Send initial CreateSession
+        await request_queue.put(agent_pb2.SessionInput(
+            create=agent_pb2.CreateSession(
+                prompt=prompt,
+                permission_mode="bypassPermissions",
+            )
+        ))
+
+        async def request_iter():
+            while True:
+                req = await request_queue.get()
+                if req is None:
+                    break
+                yield req
 
         session_id = None
-        async for event in stub.Execute(request):
+        turn = 0
+
+        async for event in stub.Session(request_iter()):
             field = event.WhichOneof("event")
 
             if field == "session_init":
@@ -80,27 +119,23 @@ async def run_test(port: int, prompt: str) -> None:
                 print(f"  duration: {r.duration_ms}ms")
                 print(f"  error: {r.is_error}")
 
+                turn += 1
+                if turn == 1 and session_id:
+                    # Send follow-up after first turn
+                    print(f"\n{'=' * 60}")
+                    print("Sending FollowUp...")
+                    print("-" * 60)
+                    await request_queue.put(agent_pb2.SessionInput(
+                        follow_up=agent_pb2.FollowUp(
+                            prompt="What did I just ask you?",
+                        )
+                    ))
+                else:
+                    # Done — close the request stream
+                    await request_queue.put(None)
+
             elif field == "error":
                 print(f"[ERROR] {event.error.error_type}: {event.error.message}")
-
-        # Test SendMessage if we got a session
-        if session_id:
-            print(f"\n{'=' * 60}")
-            print(f"Testing SendMessage with session_id={session_id}")
-            print("-" * 60)
-
-            send_request = agent_pb2.SendMessageRequest(
-                session_id=session_id,
-                prompt="What did I just ask you?",
-            )
-            async for event in stub.SendMessage(send_request):
-                field = event.WhichOneof("event")
-                if field == "text" and not event.text.is_partial:
-                    print(f"[Text] {event.text.text}")
-                elif field == "result":
-                    print(f"[Result] turns={event.result.num_turns}")
-                elif field == "error":
-                    print(f"[ERROR] {event.error.message}")
 
         print("\nDone.")
 

@@ -34,14 +34,9 @@ class AgentWorkerStub(object):
         Args:
             channel: A grpc.Channel.
         """
-        self.Execute = channel.unary_stream(
-                '/claude_agent.AgentWorker/Execute',
-                request_serializer=agent__pb2.ExecuteRequest.SerializeToString,
-                response_deserializer=agent__pb2.AgentEvent.FromString,
-                _registered_method=True)
-        self.SendMessage = channel.unary_stream(
-                '/claude_agent.AgentWorker/SendMessage',
-                request_serializer=agent__pb2.SendMessageRequest.SerializeToString,
+        self.Session = channel.stream_stream(
+                '/claude_agent.AgentWorker/Session',
+                request_serializer=agent__pb2.SessionInput.SerializeToString,
                 response_deserializer=agent__pb2.AgentEvent.FromString,
                 _registered_method=True)
         self.Interrupt = channel.unary_unary(
@@ -59,14 +54,9 @@ class AgentWorkerStub(object):
 class AgentWorkerServicer(object):
     """Missing associated documentation comment in .proto file."""
 
-    def Execute(self, request, context):
-        """Missing associated documentation comment in .proto file."""
-        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
-        context.set_details('Method not implemented!')
-        raise NotImplementedError('Method not implemented!')
-
-    def SendMessage(self, request, context):
-        """Missing associated documentation comment in .proto file."""
+    def Session(self, request_iterator, context):
+        """One bidirectional stream per session — replaces Execute + SendMessage
+        """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
@@ -86,14 +76,9 @@ class AgentWorkerServicer(object):
 
 def add_AgentWorkerServicer_to_server(servicer, server):
     rpc_method_handlers = {
-            'Execute': grpc.unary_stream_rpc_method_handler(
-                    servicer.Execute,
-                    request_deserializer=agent__pb2.ExecuteRequest.FromString,
-                    response_serializer=agent__pb2.AgentEvent.SerializeToString,
-            ),
-            'SendMessage': grpc.unary_stream_rpc_method_handler(
-                    servicer.SendMessage,
-                    request_deserializer=agent__pb2.SendMessageRequest.FromString,
+            'Session': grpc.stream_stream_rpc_method_handler(
+                    servicer.Session,
+                    request_deserializer=agent__pb2.SessionInput.FromString,
                     response_serializer=agent__pb2.AgentEvent.SerializeToString,
             ),
             'Interrupt': grpc.unary_unary_rpc_method_handler(
@@ -118,7 +103,7 @@ class AgentWorker(object):
     """Missing associated documentation comment in .proto file."""
 
     @staticmethod
-    def Execute(request,
+    def Session(request_iterator,
             target,
             options=(),
             channel_credentials=None,
@@ -128,38 +113,11 @@ class AgentWorker(object):
             wait_for_ready=None,
             timeout=None,
             metadata=None):
-        return grpc.experimental.unary_stream(
-            request,
+        return grpc.experimental.stream_stream(
+            request_iterator,
             target,
-            '/claude_agent.AgentWorker/Execute',
-            agent__pb2.ExecuteRequest.SerializeToString,
-            agent__pb2.AgentEvent.FromString,
-            options,
-            channel_credentials,
-            insecure,
-            call_credentials,
-            compression,
-            wait_for_ready,
-            timeout,
-            metadata,
-            _registered_method=True)
-
-    @staticmethod
-    def SendMessage(request,
-            target,
-            options=(),
-            channel_credentials=None,
-            call_credentials=None,
-            insecure=False,
-            compression=None,
-            wait_for_ready=None,
-            timeout=None,
-            metadata=None):
-        return grpc.experimental.unary_stream(
-            request,
-            target,
-            '/claude_agent.AgentWorker/SendMessage',
-            agent__pb2.SendMessageRequest.SerializeToString,
+            '/claude_agent.AgentWorker/Session',
+            agent__pb2.SessionInput.SerializeToString,
             agent__pb2.AgentEvent.FromString,
             options,
             channel_credentials,

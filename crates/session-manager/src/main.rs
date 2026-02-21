@@ -454,6 +454,7 @@ async fn start_session(
     repo_ref: &RepoRef,
     session_type: &str,
     plan_mode: bool,
+    thinking_mode: bool,
     user_id: Option<&str>,
 ) -> Result<String> {
     use std::path::PathBuf;
@@ -509,7 +510,7 @@ async fn start_session(
     let (output_tx, output_rx) = mpsc::channel::<OutputEvent>(100);
     match state.containers.start(
         &session_id, &project_path, &repo_name, &branch_name,
-        &state.db, output_tx, plan_mode, session_type,
+        &state.db, output_tx, plan_mode, thinking_mode, session_type,
     ).await {
         Ok(result) => {
             let session_duration = session_start_time.elapsed();
@@ -824,6 +825,26 @@ async fn handle_messages(state: Arc<AppState>, mut rx: mpsc::Receiver<Post>, can
                         let _ = state.mm.post_in_thread(channel_id, root_id, msg).await;
                         continue;
                     }
+                    if cmd == "thinking" || cmd.starts_with("thinking ") {
+                        let arg = cmd.strip_prefix("thinking").unwrap().trim();
+                        let new_state = match arg {
+                            "on" => true,
+                            "off" => false,
+                            "" => !state.containers.get_thinking_mode(&session.session_id),
+                            _ => {
+                                let _ = state.mm.post_in_thread(channel_id, root_id, "Usage: `@claude thinking` (toggle), `@claude thinking on`, `@claude thinking off`").await;
+                                continue;
+                            }
+                        };
+                        state.containers.set_thinking_mode(&session.session_id, new_state);
+                        let msg = if new_state {
+                            "Thinking mode **enabled**. Takes effect on `restart`."
+                        } else {
+                            "Thinking mode **disabled**. Takes effect on `restart`."
+                        };
+                        let _ = state.mm.post_in_thread(channel_id, root_id, msg).await;
+                        continue;
+                    }
                     if cmd == "title" || cmd.starts_with("title ") {
                         let arg = cmd.strip_prefix("title").unwrap().trim();
                         if arg.is_empty() {
@@ -847,6 +868,7 @@ async fn handle_messages(state: Arc<AppState>, mut rx: mpsc::Receiver<Post>, can
                         let idle = chrono::Utc::now() - session.last_activity_at;
                         let info = state.containers.get_session_info(&session.session_id);
                         let plan_mode = info.as_ref().map(|i| i.plan_mode).unwrap_or(false);
+                        let thinking_mode = info.as_ref().map(|i| i.thinking_mode).unwrap_or(false);
                         let claude_sid = info.as_ref().and_then(|i| i.claude_session_id.as_deref().map(|s| format!("`{}`", &s[..8.min(s.len())])));
 
                         // Look up container info for this session's repo/branch
@@ -886,6 +908,7 @@ async fn handle_messages(state: Arc<AppState>, mut rx: mpsc::Receiver<Post>, can
 | Messages | {} |\n\
 | Compactions | {} |\n\
 | Plan mode | {} |\n\
+| Thinking | {} |\n\
 | Age | {} |\n\
 | Idle | {} |\n\
 | Last active | {} |\n\
@@ -898,6 +921,7 @@ async fn handle_messages(state: Arc<AppState>, mut rx: mpsc::Receiver<Post>, can
                             session.message_count,
                             session.compaction_count,
                             if plan_mode { "on" } else { "off" },
+                            if thinking_mode { "on" } else { "off" },
                             format_duration(age),
                             format_duration(idle),
                             last_active_str,
@@ -944,10 +968,11 @@ async fn handle_messages(state: Arc<AppState>, mut rx: mpsc::Receiver<Post>, can
                         continue;
                     }
 
-                    // Parse --plan flag from input
+                    // Parse --plan and --thinking flags from input
                     let plan_mode = project_input.split_whitespace().any(|w| w == "--plan");
+                    let thinking_mode = project_input.split_whitespace().any(|w| w == "--thinking");
                     let project_input_clean = project_input.split_whitespace()
-                        .filter(|w| *w != "--plan")
+                        .filter(|w| *w != "--plan" && *w != "--thinking")
                         .collect::<Vec<_>>()
                         .join(" ");
                     let project_input = project_input_clean.as_str();
@@ -970,6 +995,7 @@ async fn handle_messages(state: Arc<AppState>, mut rx: mpsc::Receiver<Post>, can
                                     &repo_ref,
                                     "standard",
                                     plan_mode,
+                                    thinking_mode,
                                     Some(&post.user_id),
                                 ).await {
                                     Ok(session_id) => {
@@ -1125,6 +1151,7 @@ async fn handle_messages(state: Arc<AppState>, mut rx: mpsc::Receiver<Post>, can
                         - `{trigger} start <org/repo>` — Start a standard session\n\
                         - `{trigger} start <repo> --worktree` — Start with isolated worktree\n\
                         - `{trigger} start <repo> --plan` — Start in plan mode (read-only analysis)\n\
+                        - `{trigger} start <repo> --thinking` — Start with extended thinking enabled\n\
                         - `{trigger} stop <id-prefix>` — Stop a session by ID prefix\n\
                         - `{trigger} stop --all` — Stop all sessions and tear down all containers\n\
                         - `{trigger} status` — List all active sessions and containers\n\
@@ -1138,6 +1165,7 @@ async fn handle_messages(state: Arc<AppState>, mut rx: mpsc::Receiver<Post>, can
                         - `{trigger} clear` — Clear conversation history\n\
                         - `{trigger} restart` — Restart Claude conversation\n\
                         - `{trigger} plan` — Toggle plan mode (read-only analysis)\n\
+                        - `{trigger} thinking` — Toggle extended thinking (takes effect on restart)\n\
                         - `{trigger} title [text]` — Set thread title (auto-generate if no text)\n\
                         - `{trigger} status` — Show session status and context health",
                         trigger = bot_trigger,
@@ -1221,12 +1249,17 @@ const CARD_UPDATE_MIN_INTERVAL: Duration = Duration::from_millis(500);
 /// Maximum number of tool lines shown in the live card before collapsing
 const CARD_MAX_TOOL_LINES: usize = 20;
 
+/// Heartbeat interval for updating the elapsed timer on the live card
+const CARD_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
+
 /// Live card state — a single updatable Mattermost post that shows processing status.
 struct LiveCard {
     post_id: Option<String>,
     header: String,
     tool_lines: Vec<String>,
     last_update: tokio::time::Instant,
+    /// When processing started (for elapsed timer), cleared on finalize
+    started_at: Option<tokio::time::Instant>,
     /// Whether the card has unsent changes (dirty flag for throttled updates)
     dirty: bool,
 }
@@ -1238,6 +1271,7 @@ impl LiveCard {
             header: String::new(),
             tool_lines: Vec::new(),
             last_update: tokio::time::Instant::now(),
+            started_at: None,
             dirty: false,
         }
     }
@@ -1246,6 +1280,7 @@ impl LiveCard {
     fn start_processing(&mut self) {
         self.header = ":hourglass_flowing_sand: Processing...".to_string();
         self.tool_lines.clear();
+        self.started_at = Some(tokio::time::Instant::now());
         self.dirty = true;
     }
 
@@ -1260,6 +1295,7 @@ impl LiveCard {
         let input_k = format_token_count(input_tokens);
         let output_k = format_token_count(output_tokens);
         self.header = format!(":white_check_mark: Done ({} in / {} out)", input_k, output_k);
+        self.started_at = None;
         self.dirty = true;
     }
 
@@ -1272,7 +1308,23 @@ impl LiveCard {
             Some(sig) => format!(":warning: Process died (exit {}, {})", code_str, sig),
             None => format!(":warning: Process died (exit {})", code_str),
         };
+        self.started_at = None;
         self.dirty = true;
+    }
+
+    /// Update the header with elapsed time (for heartbeat ticks).
+    fn update_elapsed(&mut self) {
+        if let Some(started) = self.started_at {
+            let elapsed = started.elapsed();
+            let secs = elapsed.as_secs();
+            let elapsed_str = if secs >= 60 {
+                format!("{}m {}s", secs / 60, secs % 60)
+            } else {
+                format!("{}s", secs)
+            };
+            self.header = format!(":hourglass_flowing_sand: Processing... ({})", elapsed_str);
+            self.dirty = true;
+        }
     }
 
     /// Render the card as a single markdown string.
@@ -1351,6 +1403,9 @@ async fn stream_output(
     let mut batch_bytes: usize = 0;
     let batch_timer = tokio::time::sleep(BATCH_TIMEOUT);
     tokio::pin!(batch_timer);
+
+    let heartbeat_timer = tokio::time::sleep(CARD_HEARTBEAT_INTERVAL);
+    tokio::pin!(heartbeat_timer);
 
     let mut card = LiveCard::new();
 
@@ -1474,6 +1529,16 @@ async fn stream_output(
                 }
                 // Reset timer
                 batch_timer.as_mut().reset(tokio::time::Instant::now() + BATCH_TIMEOUT);
+            }
+            _ = &mut heartbeat_timer => {
+                // Heartbeat: update elapsed time on live card during silent periods
+                if card.started_at.is_some() {
+                    card.update_elapsed();
+                    if card.can_update_now() {
+                        card.flush(&state, &channel_id, &thread_id).await;
+                    }
+                }
+                heartbeat_timer.as_mut().reset(tokio::time::Instant::now() + CARD_HEARTBEAT_INTERVAL);
             }
         }
     }

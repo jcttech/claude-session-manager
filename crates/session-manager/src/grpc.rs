@@ -1,4 +1,5 @@
 use anyhow::{anyhow, Result};
+use std::collections::HashMap;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tonic::transport::Channel;
@@ -11,14 +12,18 @@ pub mod proto {
 }
 
 use proto::agent_worker_client::AgentWorkerClient;
-use proto::{
-    agent_event, ExecuteRequest, HealthRequest, InterruptRequest, SendMessageRequest,
-};
+use proto::{agent_event, HealthRequest, InterruptRequest};
 
 /// gRPC client that communicates with the Python Agent SDK worker.
-/// Maps `AgentEvent` stream to the existing `OutputEvent` enum.
 pub struct GrpcExecutor {
     client: AgentWorkerClient<Channel>,
+}
+
+/// A bidirectional gRPC session. One stream = one SDK session lifetime.
+/// Send CreateSession or FollowUp requests, then process turn events.
+pub struct GrpcSession {
+    request_tx: mpsc::Sender<proto::SessionInput>,
+    response_stream: tonic::Streaming<proto::AgentEvent>,
 }
 
 impl GrpcExecutor {
@@ -37,55 +42,20 @@ impl GrpcExecutor {
         })
     }
 
-    /// Execute a new prompt (first message in a session).
-    /// Streams events to `output_tx` and returns the captured session_id.
-    pub async fn execute(
-        &mut self,
-        prompt: &str,
-        system_prompt_append: &str,
-        permission_mode: &str,
-        env: std::collections::HashMap<String, String>,
-        output_tx: &mpsc::Sender<OutputEvent>,
-    ) -> Result<Option<String>> {
-        let request = ExecuteRequest {
-            prompt: prompt.to_string(),
-            permission_mode: permission_mode.to_string(),
-            env,
-            system_prompt_append: system_prompt_append.to_string(),
-            max_turns: 0,
-        };
-
+    /// Open a bidirectional Session stream. Returns handles for sending
+    /// requests and processing events.
+    pub async fn open_session(&mut self) -> Result<GrpcSession> {
+        let (tx, rx) = mpsc::channel(16);
+        let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
         let response = self
             .client
-            .execute(request)
+            .session(stream)
             .await
-            .map_err(|e| anyhow!("Execute RPC failed: {}", e))?;
-
-        self.process_event_stream(response.into_inner(), output_tx)
-            .await
-    }
-
-    /// Send a follow-up message to an existing session.
-    /// Streams events to `output_tx`.
-    pub async fn send_message(
-        &mut self,
-        session_id: &str,
-        prompt: &str,
-        output_tx: &mpsc::Sender<OutputEvent>,
-    ) -> Result<Option<String>> {
-        let request = SendMessageRequest {
-            session_id: session_id.to_string(),
-            prompt: prompt.to_string(),
-        };
-
-        let response = self
-            .client
-            .send_message(request)
-            .await
-            .map_err(|e| anyhow!("SendMessage RPC failed: {}", e))?;
-
-        self.process_event_stream(response.into_inner(), output_tx)
-            .await
+            .map_err(|e| anyhow!("Session RPC failed: {}", e))?;
+        Ok(GrpcSession {
+            request_tx: tx,
+            response_stream: response.into_inner(),
+        })
     }
 
     /// Interrupt a running session.
@@ -114,12 +84,51 @@ impl GrpcExecutor {
         let resp = response.into_inner();
         Ok((resp.ready, resp.worker_version))
     }
+}
 
-    /// Process a stream of AgentEvents, mapping each to OutputEvent and sending to the channel.
-    /// Returns the captured session_id (from SessionInit).
-    async fn process_event_stream(
-        &self,
-        mut stream: tonic::Streaming<proto::AgentEvent>,
+impl GrpcSession {
+    /// Send a CreateSession request (first message).
+    pub async fn create(
+        &mut self,
+        prompt: &str,
+        permission_mode: &str,
+        env: HashMap<String, String>,
+        system_prompt_append: &str,
+        max_thinking_tokens: i32,
+    ) -> Result<()> {
+        let input = proto::SessionInput {
+            input: Some(proto::session_input::Input::Create(proto::CreateSession {
+                prompt: prompt.to_string(),
+                permission_mode: permission_mode.to_string(),
+                env,
+                system_prompt_append: system_prompt_append.to_string(),
+                max_turns: 0,
+                max_thinking_tokens,
+            })),
+        };
+        self.request_tx
+            .send(input)
+            .await
+            .map_err(|_| anyhow!("Session request channel closed"))
+    }
+
+    /// Send a FollowUp request (subsequent messages).
+    pub async fn follow_up(&mut self, prompt: &str) -> Result<()> {
+        let input = proto::SessionInput {
+            input: Some(proto::session_input::Input::FollowUp(proto::FollowUp {
+                prompt: prompt.to_string(),
+            })),
+        };
+        self.request_tx
+            .send(input)
+            .await
+            .map_err(|_| anyhow!("Session request channel closed"))
+    }
+
+    /// Read events from the response stream until SessionResult.
+    /// Returns captured session_id. Stream stays open for next turn.
+    pub async fn process_turn_events(
+        &mut self,
         output_tx: &mpsc::Sender<OutputEvent>,
     ) -> Result<Option<String>> {
         let mut session_id: Option<String> = None;
@@ -127,155 +136,164 @@ impl GrpcExecutor {
         // Buffer for accumulating partial text deltas into complete lines
         let mut partial_buf = String::new();
 
-        tracing::debug!("gRPC: Starting event stream processing");
+        tracing::debug!("gRPC: Starting turn event processing");
 
-        while let Some(event) = stream
-            .message()
-            .await
-            .map_err(|e| anyhow!("gRPC stream error: {}", e))?
-        {
-            event_count += 1;
-            let Some(event_variant) = event.event else {
-                tracing::debug!(event_count, "gRPC: Empty event (no variant)");
-                continue;
-            };
+        loop {
+            match self.response_stream.message().await {
+                Ok(Some(event)) => {
+                    event_count += 1;
+                    let Some(event_variant) = event.event else {
+                        tracing::debug!(event_count, "gRPC: Empty event (no variant)");
+                        continue;
+                    };
 
-            match event_variant {
-                agent_event::Event::SessionInit(init) => {
-                    session_id = Some(init.session_id.clone());
-                    tracing::info!(session_id = %init.session_id, "gRPC: SessionInit received");
-                }
-                agent_event::Event::Text(text) => {
-                    if text.is_partial {
-                        // Accumulate partial text and emit complete lines in real-time
-                        partial_buf.push_str(&text.text);
-                        // Emit any complete lines from the buffer
-                        while let Some(newline_pos) = partial_buf.find('\n') {
-                            let line = partial_buf[..newline_pos].to_string();
-                            partial_buf = partial_buf[newline_pos + 1..].to_string();
+                    match event_variant {
+                        agent_event::Event::SessionInit(init) => {
+                            session_id = Some(init.session_id.clone());
+                            tracing::info!(session_id = %init.session_id, "gRPC: SessionInit received");
+                        }
+                        agent_event::Event::Text(text) => {
+                            if text.is_partial {
+                                // Accumulate partial text and emit complete lines in real-time
+                                partial_buf.push_str(&text.text);
+                                while let Some(newline_pos) = partial_buf.find('\n') {
+                                    let line = partial_buf[..newline_pos].to_string();
+                                    partial_buf = partial_buf[newline_pos + 1..].to_string();
+                                    if output_tx
+                                        .send(OutputEvent::TextLine(line))
+                                        .await
+                                        .is_err()
+                                    {
+                                        tracing::warn!(event_count, "gRPC: output_tx closed during partial text");
+                                        return Ok(session_id);
+                                    }
+                                }
+                            } else {
+                                // Complete text — flush any remaining partial buffer first
+                                if !partial_buf.is_empty()
+                                    && output_tx
+                                        .send(OutputEvent::TextLine(std::mem::take(&mut partial_buf)))
+                                        .await
+                                        .is_err()
+                                {
+                                    return Ok(session_id);
+                                }
+                                let line_count = text.text.lines().count();
+                                tracing::info!(event_count, line_count, "gRPC: Complete text received");
+                                for line in text.text.lines() {
+                                    if output_tx
+                                        .send(OutputEvent::TextLine(line.to_string()))
+                                        .await
+                                        .is_err()
+                                    {
+                                        tracing::warn!(event_count, "gRPC: output_tx closed during complete text");
+                                        return Ok(session_id);
+                                    }
+                                }
+                            }
+                        }
+                        agent_event::Event::ToolUse(tool) => {
+                            // Flush any remaining partial text before tool action
+                            if !partial_buf.is_empty() {
+                                let _ = output_tx
+                                    .send(OutputEvent::TextLine(std::mem::take(&mut partial_buf)))
+                                    .await;
+                            }
+                            tracing::info!(event_count, tool = %tool.tool_name, "gRPC: ToolUse received");
+                            let action = format_grpc_tool_action(&tool.tool_name, &tool.input_json);
                             if output_tx
-                                .send(OutputEvent::TextLine(line))
+                                .send(OutputEvent::ToolAction(action))
                                 .await
                                 .is_err()
                             {
-                                tracing::warn!(event_count, "gRPC: output_tx closed during partial text");
+                                tracing::warn!(event_count, "gRPC: output_tx closed during tool action");
                                 return Ok(session_id);
                             }
                         }
-                    } else {
-                        // Complete text — flush any remaining partial buffer first
-                        if !partial_buf.is_empty() {
-                            if output_tx
-                                .send(OutputEvent::TextLine(std::mem::take(&mut partial_buf)))
-                                .await
-                                .is_err()
-                            {
-                                return Ok(session_id);
-                            }
+                        agent_event::Event::ToolResult(_) => {
+                            // Tool results are informational; not surfaced to chat
                         }
-                        // Split complete text into lines for OutputEvent::TextLine
-                        let line_count = text.text.lines().count();
-                        tracing::info!(event_count, line_count, "gRPC: Complete text received");
-                        for line in text.text.lines() {
-                            if output_tx
-                                .send(OutputEvent::TextLine(line.to_string()))
-                                .await
-                                .is_err()
-                            {
-                                tracing::warn!(event_count, "gRPC: output_tx closed during complete text");
-                                return Ok(session_id);
+                        agent_event::Event::Subagent(sub) => {
+                            let action = if sub.is_start { "started" } else { "finished" };
+                            tracing::debug!(
+                                agent = %sub.agent_name,
+                                parent_tool = %sub.parent_tool_use_id,
+                                action,
+                                "Subagent event"
+                            );
+                        }
+                        agent_event::Event::Result(result) => {
+                            // Flush any remaining partial text
+                            if !partial_buf.is_empty() {
+                                let _ = output_tx
+                                    .send(OutputEvent::TextLine(std::mem::take(&mut partial_buf)))
+                                    .await;
                             }
+                            let input_tokens = result.input_tokens;
+                            let output_tokens = result.output_tokens;
+                            tracing::info!(
+                                event_count,
+                                input_tokens,
+                                output_tokens,
+                                is_error = result.is_error,
+                                result_text_len = result.result_text.len(),
+                                "gRPC: Result received (turn complete)"
+                            );
+
+                            if result.is_error {
+                                let _ = output_tx
+                                    .send(OutputEvent::ProcessDied {
+                                        exit_code: Some(1),
+                                        signal: None,
+                                    })
+                                    .await;
+                            } else {
+                                let _ = output_tx
+                                    .send(OutputEvent::ResponseComplete {
+                                        input_tokens,
+                                        output_tokens,
+                                    })
+                                    .await;
+                            }
+                            // Turn is complete — return but keep stream open
+                            tracing::info!(event_count, "gRPC: Turn event processing complete");
+                            return Ok(session_id);
+                        }
+                        agent_event::Event::Error(err) => {
+                            tracing::error!(
+                                event_count,
+                                error_type = %err.error_type,
+                                message = %err.message,
+                                "gRPC: Agent error"
+                            );
+                            let _ = output_tx
+                                .send(OutputEvent::ProcessDied {
+                                    exit_code: Some(1),
+                                    signal: Some(format!("{}: {}", err.error_type, err.message)),
+                                })
+                                .await;
+                            // Error terminates the turn
+                            return Ok(session_id);
                         }
                     }
                 }
-                agent_event::Event::ToolUse(tool) => {
-                    // Flush any remaining partial text before tool action
-                    if !partial_buf.is_empty() {
-                        let _ = output_tx
-                            .send(OutputEvent::TextLine(std::mem::take(&mut partial_buf)))
-                            .await;
-                    }
-                    tracing::info!(event_count, tool = %tool.tool_name, "gRPC: ToolUse received");
-                    let action = format_grpc_tool_action(&tool.tool_name, &tool.input_json);
-                    if output_tx
-                        .send(OutputEvent::ToolAction(action))
-                        .await
-                        .is_err()
-                    {
-                        tracing::warn!(event_count, "gRPC: output_tx closed during tool action");
-                        return Ok(session_id);
-                    }
-                }
-                agent_event::Event::ToolResult(_) => {
-                    // Tool results are informational; not surfaced to chat
-                }
-                agent_event::Event::Subagent(sub) => {
-                    let action = if sub.is_start { "started" } else { "finished" };
-                    tracing::debug!(
-                        agent = %sub.agent_name,
-                        parent_tool = %sub.parent_tool_use_id,
-                        action,
-                        "Subagent event"
-                    );
-                }
-                agent_event::Event::Result(result) => {
+                Ok(None) => {
+                    // Stream ended (server closed)
+                    tracing::info!(event_count, "gRPC: Response stream ended (server closed)");
                     // Flush any remaining partial text
                     if !partial_buf.is_empty() {
                         let _ = output_tx
                             .send(OutputEvent::TextLine(std::mem::take(&mut partial_buf)))
                             .await;
                     }
-                    let input_tokens = result.input_tokens;
-                    let output_tokens = result.output_tokens;
-                    tracing::info!(
-                        event_count,
-                        input_tokens,
-                        output_tokens,
-                        is_error = result.is_error,
-                        result_text_len = result.result_text.len(),
-                        "gRPC: Result received"
-                    );
-
-                    // NOTE: result_text is NOT emitted here. With include_partial_messages
-                    // enabled, text arrives via StreamEvent (partial) and AssistantMessage
-                    // (complete). Emitting result_text would cause duplicate output.
-                    // If partial messages are ever disabled, AssistantMessage still covers it.
-
-                    if result.is_error {
-                        let _ = output_tx
-                            .send(OutputEvent::ProcessDied {
-                                exit_code: Some(1),
-                                signal: None,
-                            })
-                            .await;
-                    } else {
-                        let _ = output_tx
-                            .send(OutputEvent::ResponseComplete {
-                                input_tokens,
-                                output_tokens,
-                            })
-                            .await;
-                    }
+                    return Err(anyhow!("gRPC stream closed by server before SessionResult"));
                 }
-                agent_event::Event::Error(err) => {
-                    tracing::error!(
-                        event_count,
-                        error_type = %err.error_type,
-                        message = %err.message,
-                        "gRPC: Agent error"
-                    );
-                    let _ = output_tx
-                        .send(OutputEvent::ProcessDied {
-                            exit_code: Some(1),
-                            signal: Some(format!("{}: {}", err.error_type, err.message)),
-                        })
-                        .await;
+                Err(e) => {
+                    tracing::error!(event_count, error = %e, "gRPC: Stream error");
+                    return Err(anyhow!("gRPC stream error: {}", e));
                 }
             }
         }
-
-        tracing::info!(event_count, "gRPC: Event stream ended");
-        Ok(session_id)
     }
 }
 

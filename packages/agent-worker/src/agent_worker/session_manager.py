@@ -27,6 +27,7 @@ class SessionManager:
         env: dict[str, str] | None = None,
         system_prompt_append: str = "",
         max_turns: int | None = None,
+        max_thinking_tokens: int | None = None,
     ) -> ClaudeSDKClient:
         """Create a new ClaudeSDKClient and start an execution.
 
@@ -40,6 +41,7 @@ class SessionManager:
             env=env or {},
             max_turns=max_turns,
             include_partial_messages=True,
+            max_thinking_tokens=max_thinking_tokens or None,
         )
 
         client = ClaudeSDKClient(options)

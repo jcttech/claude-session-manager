@@ -38,6 +38,7 @@ dotenvy = "0.15"
 # gRPC
 tonic = "0.12"
 prost = "0.13"
+tokio-stream = "0.1"
 
 # Observability
 metrics = "0.24"

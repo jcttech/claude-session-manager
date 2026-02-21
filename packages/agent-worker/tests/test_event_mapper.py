@@ -91,6 +91,7 @@ sys.modules["claude_agent_sdk.types"] = mock_sdk_types
 
 from agent_worker.event_mapper import (  # noqa: E402
     error_event,
+    fallback_result_event,
     map_assistant_message,
     map_result_message,
     map_stream_event,
@@ -250,10 +251,86 @@ class TestMapStreamEvent:
         assert result.HasField("subagent")
         assert result.subagent.is_start is False
 
+    def test_tool_use_start(self):
+        event = StreamEvent(
+            event={
+                "type": "content_block_start",
+                "content_block": {
+                    "type": "tool_use",
+                    "id": "tool-42",
+                    "name": "Read",
+                },
+            }
+        )
+        result = map_stream_event(event)
+        assert result is not None
+        assert result.HasField("tool_use")
+        assert result.tool_use.tool_name == "Read"
+        assert result.tool_use.tool_use_id == "tool-42"
+        assert result.tool_use.input_json == "{}"
+
+    def test_content_block_start_text_ignored(self):
+        """content_block_start for text blocks should not produce an event."""
+        event = StreamEvent(
+            event={
+                "type": "content_block_start",
+                "content_block": {"type": "text", "text": ""},
+            }
+        )
+        result = map_stream_event(event)
+        assert result is None
+
     def test_irrelevant_event(self):
         event = StreamEvent(event={"type": "ping"})
         result = map_stream_event(event)
         assert result is None
+
+    def test_message_stop_without_parent(self):
+        event = StreamEvent(event={"type": "message_stop"})
+        result = map_stream_event(event)
+        assert result is None
+
+    def test_content_block_stop_ignored(self):
+        event = StreamEvent(event={"type": "content_block_stop"})
+        result = map_stream_event(event)
+        assert result is None
+
+
+class TestFallbackResultEvent:
+    def test_full_data(self):
+        raw = {
+            "type": "result",
+            "session_id": "sess-123",
+            "usage": {"input_tokens": 500, "output_tokens": 200},
+            "total_cost_usd": 0.03,
+            "num_turns": 2,
+            "is_error": False,
+            "result": "Done successfully",
+        }
+        event = fallback_result_event(raw, start_time=0)
+        assert event.HasField("result")
+        assert event.result.session_id == "sess-123"
+        assert event.result.input_tokens == 500
+        assert event.result.output_tokens == 200
+        assert event.result.cost_usd == pytest.approx(0.03)
+        assert event.result.num_turns == 2
+        assert event.result.is_error is False
+        assert event.result.result_text == "Done successfully"
+        assert event.result.duration_ms > 0
+
+    def test_minimal_data(self):
+        raw = {"type": "result"}
+        event = fallback_result_event(raw, start_time=0)
+        assert event.HasField("result")
+        assert event.result.session_id == ""
+        assert event.result.input_tokens == 0
+        assert event.result.output_tokens == 0
+        assert event.result.is_error is False
+
+    def test_none_usage(self):
+        raw = {"type": "result", "usage": None}
+        event = fallback_result_event(raw, start_time=0)
+        assert event.result.input_tokens == 0
 
 
 class TestErrorEvent:

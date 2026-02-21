@@ -92,11 +92,16 @@ def map_stream_event(event: StreamEvent) -> agent_pb2.AgentEvent | None:
     """Map a StreamEvent to an AgentEvent.
 
     StreamEvents contain partial messages and subagent tracking.
+    Handles the full SDK event flow:
+    - content_block_start (tool_use) → ToolUse event for live card
+    - content_block_delta (text_delta) → partial TextContent
+    - content_block_start/message_stop with parent_tool_use_id → SubagentEvent
     """
-    # Track subagent start/end via parent_tool_use_id
+    raw = event.event or {}
+    event_type = raw.get("type", "")
+
+    # --- Subagent tracking (has parent_tool_use_id) ---
     if event.parent_tool_use_id is not None:
-        raw = event.event or {}
-        event_type = raw.get("type", "")
         if event_type == "content_block_start":
             return agent_pb2.AgentEvent(
                 subagent=agent_pb2.SubagentEvent(
@@ -114,9 +119,20 @@ def map_stream_event(event: StreamEvent) -> agent_pb2.AgentEvent | None:
                 )
             )
 
-    # Partial text content
-    raw = event.event or {}
-    if raw.get("type") == "content_block_delta":
+    # --- Tool use starting (content_block_start with tool_use type) ---
+    if event_type == "content_block_start":
+        content_block = raw.get("content_block", {})
+        if content_block.get("type") == "tool_use":
+            return agent_pb2.AgentEvent(
+                tool_use=agent_pb2.ToolUse(
+                    tool_name=content_block.get("name", ""),
+                    tool_use_id=content_block.get("id", ""),
+                    input_json="{}",  # Full input arrives via AssistantMessage later
+                )
+            )
+
+    # --- Text delta streaming ---
+    if event_type == "content_block_delta":
         delta = raw.get("delta", {})
         if delta.get("type") == "text_delta":
             return agent_pb2.AgentEvent(
@@ -126,6 +142,8 @@ def map_stream_event(event: StreamEvent) -> agent_pb2.AgentEvent | None:
                 )
             )
 
+    # message_start, message_stop, message_delta, content_block_stop,
+    # input_json_delta: not needed for live card updates
     return None
 
 
@@ -133,4 +151,28 @@ def error_event(message: str, error_type: str = "internal") -> agent_pb2.AgentEv
     """Create an AgentError event."""
     return agent_pb2.AgentEvent(
         error=agent_pb2.AgentError(message=message, error_type=error_type)
+    )
+
+
+def fallback_result_event(
+    raw_data: dict, start_time: float
+) -> agent_pb2.AgentEvent:
+    """Build a SessionResult from raw dict when ResultMessage fails to parse.
+
+    Uses .get() with safe defaults for all fields so partial data doesn't crash.
+    """
+    usage = raw_data.get("usage", {}) or {}
+    duration_ms = int((time.monotonic() - start_time) * 1000)
+
+    return agent_pb2.AgentEvent(
+        result=agent_pb2.SessionResult(
+            session_id=raw_data.get("session_id", ""),
+            input_tokens=usage.get("input_tokens", 0),
+            output_tokens=usage.get("output_tokens", 0),
+            cost_usd=raw_data.get("total_cost_usd", 0.0) or 0.0,
+            num_turns=raw_data.get("num_turns", 0) or 0,
+            duration_ms=duration_ms,
+            is_error=raw_data.get("is_error", False) or False,
+            result_text=raw_data.get("result", "") or "",
+        )
     )

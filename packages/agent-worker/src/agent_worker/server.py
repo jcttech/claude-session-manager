@@ -19,6 +19,7 @@ from grpc import aio as grpc_aio
 from . import agent_pb2, agent_pb2_grpc
 from .event_mapper import (
     error_event,
+    fallback_result_event,
     map_assistant_message,
     map_result_message,
     map_stream_event,
@@ -43,118 +44,127 @@ class AgentWorkerServicer(agent_pb2_grpc.AgentWorkerServicer):
     def __init__(self) -> None:
         self.sessions = SessionManager()
 
-    async def Execute(self, request, context):
-        """Create a new session and stream events."""
-        start_time = time.monotonic()
-        logger.info("Execute: prompt=%s...", request.prompt[:80])
+    async def _iter_sdk_messages(self, messages, start_time: float):
+        """Shared async generator that iterates SDK messages and yields AgentEvents.
+
+        Handles all message types (SystemMessage, AssistantMessage, ResultMessage,
+        StreamEvent, UserMessage) and the parse-failure fix for ResultMessage.
+        """
+        msg_iter = messages.__aiter__()
+        while True:
+            try:
+                message = await msg_iter.__anext__()
+            except StopAsyncIteration:
+                break
+            except Exception as parse_exc:
+                logger.warning("Skipping unparseable message: %s", parse_exc)
+                # Check if this is a ResultMessage parse failure — if so, force exit
+                try:
+                    from claude_agent_sdk._errors import MessageParseError
+                    raw_data = getattr(parse_exc, 'data', None)
+                    if isinstance(parse_exc, MessageParseError) and isinstance(raw_data, dict):
+                        if raw_data.get("type") == "result":
+                            logger.error(
+                                "ResultMessage parse failed — forcing exit: %s",
+                                parse_exc,
+                            )
+                            yield fallback_result_event(raw_data, start_time)
+                            return
+                except ImportError:
+                    pass
+                continue
+
+            msg_type = type(message).__name__
+            if isinstance(message, SystemMessage):
+                logger.debug("received SystemMessage (subtype=%s)", message.subtype)
+                event = map_system_message(message)
+                if event is not None:
+                    yield event
+
+            elif isinstance(message, AssistantMessage):
+                block_count = len(message.content) if hasattr(message, 'content') else 0
+                logger.debug("received AssistantMessage (%d blocks)", block_count)
+                for event in map_assistant_message(message):
+                    yield event
+
+            elif isinstance(message, ResultMessage):
+                logger.info("received ResultMessage (session=%s, turns=%s)",
+                            getattr(message, 'session_id', '?'),
+                            getattr(message, 'num_turns', '?'))
+                yield map_result_message(message, start_time)
+                return  # ResultMessage terminates the turn
+
+            elif isinstance(message, StreamEvent):
+                raw = message.event or {}
+                event_type = raw.get("type", "unknown")
+                logger.debug("received StreamEvent (%s)", event_type)
+                event = map_stream_event(message)
+                if event is not None:
+                    yield event
+
+            elif isinstance(message, UserMessage):
+                pass  # Tool results flowing back — not surfaced to chat
+
+            else:
+                logger.warning("Unhandled message type: %s", msg_type)
+
+    async def Session(self, request_iterator, context):
+        """Bidirectional streaming: one gRPC stream = one SDK session lifecycle."""
+        client = None
+        session_id = None
+        events_yielded = 0
 
         try:
-            client = await self.sessions.create_session(
-                request.prompt,
-                permission_mode=request.permission_mode,
-                env=dict(request.env),
-                system_prompt_append=request.system_prompt_append,
-                max_turns=request.max_turns if request.max_turns > 0 else None,
-            )
+            async for request in request_iterator:
+                input_type = request.WhichOneof("input")
+                turn_start = time.monotonic()
 
-            session_id = None
-            # Manually iterate so we can catch per-message parse errors
-            # (e.g. "Unknown message type") without killing the whole stream.
-            msg_iter = client.receive_messages().__aiter__()
-            while True:
-                try:
-                    message = await msg_iter.__anext__()
-                except StopAsyncIteration:
-                    break
-                except Exception as parse_exc:
-                    logger.warning("Skipping unparseable message: %s", parse_exc)
-                    continue
-
-                if isinstance(message, SystemMessage):
-                    event = map_system_message(message)
-                    if event is not None:
+                if input_type == "create":
+                    # First message: create SDK client
+                    logger.info("Session: create prompt=%s...",
+                                request.create.prompt[:80])
+                    req = request.create
+                    client = await self.sessions.create_session(
+                        req.prompt,
+                        permission_mode=req.permission_mode,
+                        env=dict(req.env),
+                        system_prompt_append=req.system_prompt_append,
+                        max_turns=req.max_turns or None,
+                        max_thinking_tokens=req.max_thinking_tokens or None,
+                    )
+                    msgs = client.receive_messages()
+                    async for event in self._iter_sdk_messages(msgs, turn_start):
+                        events_yielded += 1
                         if event.HasField("session_init"):
                             session_id = event.session_init.session_id
                             self.sessions.register(session_id, client)
                         yield event
+                        if event.HasField("result"):
+                            break
 
-                elif isinstance(message, AssistantMessage):
-                    for event in map_assistant_message(message):
+                elif input_type == "follow_up":
+                    logger.info("Session: follow_up prompt=%s...",
+                                request.follow_up.prompt[:80])
+                    if client is None:
+                        yield error_event("No session created yet", "no_session")
+                        continue
+                    await client.query(request.follow_up.prompt)
+                    msgs = client.receive_response()
+                    async for event in self._iter_sdk_messages(msgs, turn_start):
+                        events_yielded += 1
                         yield event
-
-                elif isinstance(message, ResultMessage):
-                    yield map_result_message(message, start_time)
-                    break
-
-                elif isinstance(message, StreamEvent):
-                    event = map_stream_event(message)
-                    if event is not None:
-                        yield event
-
-                elif isinstance(message, UserMessage):
-                    pass  # Tool results flowing back — not surfaced to chat
-
-                else:
-                    logger.warning("Unhandled message type: %s", type(message).__name__)
+                        if event.HasField("result"):
+                            break
 
         except GeneratorExit:
             pass
         except Exception as exc:
-            logger.exception("Execute failed")
-            yield error_event(str(exc), "execute_error")
+            logger.exception("Session failed")
+            yield error_event(str(exc), "session_error")
 
-    async def SendMessage(self, request, context):
-        """Send a follow-up message to an existing session."""
-        start_time = time.monotonic()
-        logger.info("SendMessage: session=%s", request.session_id)
-
-        client = self.sessions.get(request.session_id)
-        if client is None:
-            yield error_event(
-                f"Session not found: {request.session_id}",
-                "session_not_found",
-            )
-            return
-
-        try:
-            await client.query(request.prompt)
-
-            # Manually iterate so we can catch per-message parse errors
-            # without killing the whole stream.
-            msg_iter = client.receive_response().__aiter__()
-            while True:
-                try:
-                    message = await msg_iter.__anext__()
-                except StopAsyncIteration:
-                    break
-                except Exception as parse_exc:
-                    logger.warning("Skipping unparseable message: %s", parse_exc)
-                    continue
-
-                if isinstance(message, AssistantMessage):
-                    for event in map_assistant_message(message):
-                        yield event
-
-                elif isinstance(message, ResultMessage):
-                    yield map_result_message(message, start_time)
-                    break
-
-                elif isinstance(message, StreamEvent):
-                    event = map_stream_event(message)
-                    if event is not None:
-                        yield event
-
-                elif isinstance(message, UserMessage):
-                    pass  # Tool results flowing back — not surfaced to chat
-
-                else:
-                    logger.warning("Unhandled message type: %s", type(message).__name__)
-
-        except GeneratorExit:
-            pass
-        except Exception as exc:
-            logger.exception("SendMessage failed")
-            yield error_event(str(exc), "send_message_error")
+        logger.info("Session: ended, yielded %d events", events_yielded)
+        if session_id:
+            await self.sessions.remove(session_id)
 
     async def Interrupt(self, request, context):
         """Interrupt a running session."""

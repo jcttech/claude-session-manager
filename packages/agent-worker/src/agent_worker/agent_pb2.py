@@ -24,45 +24,47 @@ _sym_db = _symbol_database.Default()
 
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x0b\x61gent.proto\x12\x0c\x63laude_agent\"\xca\x01\n\x0e\x45xecuteRequest\x12\x0e\n\x06prompt\x18\x01 \x01(\t\x12\x17\n\x0fpermission_mode\x18\x02 \x01(\t\x12\x32\n\x03\x65nv\x18\x03 \x03(\x0b\x32%.claude_agent.ExecuteRequest.EnvEntry\x12\x1c\n\x14system_prompt_append\x18\x04 \x01(\t\x12\x11\n\tmax_turns\x18\x05 \x01(\x05\x1a*\n\x08\x45nvEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12\r\n\x05value\x18\x02 \x01(\t:\x02\x38\x01\"8\n\x12SendMessageRequest\x12\x12\n\nsession_id\x18\x01 \x01(\t\x12\x0e\n\x06prompt\x18\x02 \x01(\t\"&\n\x10InterruptRequest\x12\x12\n\nsession_id\x18\x01 \x01(\t\"$\n\x11InterruptResponse\x12\x0f\n\x07success\x18\x01 \x01(\x08\"\x0f\n\rHealthRequest\"7\n\x0eHealthResponse\x12\r\n\x05ready\x18\x01 \x01(\x08\x12\x16\n\x0eworker_version\x18\x02 \x01(\t\"\xda\x02\n\nAgentEvent\x12\x31\n\x0csession_init\x18\x01 \x01(\x0b\x32\x19.claude_agent.SessionInitH\x00\x12)\n\x04text\x18\x02 \x01(\x0b\x32\x19.claude_agent.TextContentH\x00\x12)\n\x08tool_use\x18\x03 \x01(\x0b\x32\x15.claude_agent.ToolUseH\x00\x12/\n\x0btool_result\x18\x04 \x01(\x0b\x32\x18.claude_agent.ToolResultH\x00\x12/\n\x08subagent\x18\x05 \x01(\x0b\x32\x1b.claude_agent.SubagentEventH\x00\x12-\n\x06result\x18\x06 \x01(\x0b\x32\x1b.claude_agent.SessionResultH\x00\x12)\n\x05\x65rror\x18\x07 \x01(\x0b\x32\x18.claude_agent.AgentErrorH\x00\x42\x07\n\x05\x65vent\"!\n\x0bSessionInit\x12\x12\n\nsession_id\x18\x01 \x01(\t\"/\n\x0bTextContent\x12\x0c\n\x04text\x18\x01 \x01(\t\x12\x12\n\nis_partial\x18\x02 \x01(\x08\"E\n\x07ToolUse\x12\x11\n\ttool_name\x18\x01 \x01(\t\x12\x13\n\x0btool_use_id\x18\x02 \x01(\t\x12\x12\n\ninput_json\x18\x03 \x01(\t\"3\n\nToolResult\x12\x13\n\x0btool_use_id\x18\x01 \x01(\t\x12\x10\n\x08is_error\x18\x02 \x01(\x08\"Q\n\rSubagentEvent\x12\x12\n\nagent_name\x18\x01 \x01(\t\x12\x1a\n\x12parent_tool_use_id\x18\x02 \x01(\t\x12\x10\n\x08is_start\x18\x03 \x01(\x08\"\xb1\x01\n\rSessionResult\x12\x12\n\nsession_id\x18\x01 \x01(\t\x12\x14\n\x0cinput_tokens\x18\x02 \x01(\x04\x12\x15\n\routput_tokens\x18\x03 \x01(\x04\x12\x10\n\x08\x63ost_usd\x18\x04 \x01(\x01\x12\x11\n\tnum_turns\x18\x05 \x01(\x05\x12\x13\n\x0b\x64uration_ms\x18\x06 \x01(\x03\x12\x10\n\x08is_error\x18\x07 \x01(\x08\x12\x13\n\x0bresult_text\x18\x08 \x01(\t\"1\n\nAgentError\x12\x0f\n\x07message\x18\x01 \x01(\t\x12\x12\n\nerror_type\x18\x02 \x01(\t2\xb2\x02\n\x0b\x41gentWorker\x12\x43\n\x07\x45xecute\x12\x1c.claude_agent.ExecuteRequest\x1a\x18.claude_agent.AgentEvent0\x01\x12K\n\x0bSendMessage\x12 .claude_agent.SendMessageRequest\x1a\x18.claude_agent.AgentEvent0\x01\x12L\n\tInterrupt\x12\x1e.claude_agent.InterruptRequest\x1a\x1f.claude_agent.InterruptResponse\x12\x43\n\x06Health\x12\x1b.claude_agent.HealthRequest\x1a\x1c.claude_agent.HealthResponseb\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x0b\x61gent.proto\x12\x0c\x63laude_agent\"s\n\x0cSessionInput\x12-\n\x06\x63reate\x18\x01 \x01(\x0b\x32\x1b.claude_agent.CreateSessionH\x00\x12+\n\tfollow_up\x18\x02 \x01(\x0b\x32\x16.claude_agent.FollowUpH\x00\x42\x07\n\x05input\"\xe5\x01\n\rCreateSession\x12\x0e\n\x06prompt\x18\x01 \x01(\t\x12\x17\n\x0fpermission_mode\x18\x02 \x01(\t\x12\x31\n\x03\x65nv\x18\x03 \x03(\x0b\x32$.claude_agent.CreateSession.EnvEntry\x12\x1c\n\x14system_prompt_append\x18\x04 \x01(\t\x12\x11\n\tmax_turns\x18\x05 \x01(\x05\x12\x1b\n\x13max_thinking_tokens\x18\x06 \x01(\x05\x1a*\n\x08\x45nvEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12\r\n\x05value\x18\x02 \x01(\t:\x02\x38\x01\"\x1a\n\x08\x46ollowUp\x12\x0e\n\x06prompt\x18\x01 \x01(\t\"&\n\x10InterruptRequest\x12\x12\n\nsession_id\x18\x01 \x01(\t\"$\n\x11InterruptResponse\x12\x0f\n\x07success\x18\x01 \x01(\x08\"\x0f\n\rHealthRequest\"7\n\x0eHealthResponse\x12\r\n\x05ready\x18\x01 \x01(\x08\x12\x16\n\x0eworker_version\x18\x02 \x01(\t\"\xda\x02\n\nAgentEvent\x12\x31\n\x0csession_init\x18\x01 \x01(\x0b\x32\x19.claude_agent.SessionInitH\x00\x12)\n\x04text\x18\x02 \x01(\x0b\x32\x19.claude_agent.TextContentH\x00\x12)\n\x08tool_use\x18\x03 \x01(\x0b\x32\x15.claude_agent.ToolUseH\x00\x12/\n\x0btool_result\x18\x04 \x01(\x0b\x32\x18.claude_agent.ToolResultH\x00\x12/\n\x08subagent\x18\x05 \x01(\x0b\x32\x1b.claude_agent.SubagentEventH\x00\x12-\n\x06result\x18\x06 \x01(\x0b\x32\x1b.claude_agent.SessionResultH\x00\x12)\n\x05\x65rror\x18\x07 \x01(\x0b\x32\x18.claude_agent.AgentErrorH\x00\x42\x07\n\x05\x65vent\"!\n\x0bSessionInit\x12\x12\n\nsession_id\x18\x01 \x01(\t\"/\n\x0bTextContent\x12\x0c\n\x04text\x18\x01 \x01(\t\x12\x12\n\nis_partial\x18\x02 \x01(\x08\"E\n\x07ToolUse\x12\x11\n\ttool_name\x18\x01 \x01(\t\x12\x13\n\x0btool_use_id\x18\x02 \x01(\t\x12\x12\n\ninput_json\x18\x03 \x01(\t\"3\n\nToolResult\x12\x13\n\x0btool_use_id\x18\x01 \x01(\t\x12\x10\n\x08is_error\x18\x02 \x01(\x08\"Q\n\rSubagentEvent\x12\x12\n\nagent_name\x18\x01 \x01(\t\x12\x1a\n\x12parent_tool_use_id\x18\x02 \x01(\t\x12\x10\n\x08is_start\x18\x03 \x01(\x08\"\xb1\x01\n\rSessionResult\x12\x12\n\nsession_id\x18\x01 \x01(\t\x12\x14\n\x0cinput_tokens\x18\x02 \x01(\x04\x12\x15\n\routput_tokens\x18\x03 \x01(\x04\x12\x10\n\x08\x63ost_usd\x18\x04 \x01(\x01\x12\x11\n\tnum_turns\x18\x05 \x01(\x05\x12\x13\n\x0b\x64uration_ms\x18\x06 \x01(\x03\x12\x10\n\x08is_error\x18\x07 \x01(\x08\x12\x13\n\x0bresult_text\x18\x08 \x01(\t\"1\n\nAgentError\x12\x0f\n\x07message\x18\x01 \x01(\t\x12\x12\n\nerror_type\x18\x02 \x01(\t2\xe5\x01\n\x0b\x41gentWorker\x12\x43\n\x07Session\x12\x1a.claude_agent.SessionInput\x1a\x18.claude_agent.AgentEvent(\x01\x30\x01\x12L\n\tInterrupt\x12\x1e.claude_agent.InterruptRequest\x1a\x1f.claude_agent.InterruptResponse\x12\x43\n\x06Health\x12\x1b.claude_agent.HealthRequest\x1a\x1c.claude_agent.HealthResponseb\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
 _builder.BuildTopDescriptorsAndMessages(DESCRIPTOR, 'agent_pb2', _globals)
 if not _descriptor._USE_C_DESCRIPTORS:
   DESCRIPTOR._loaded_options = None
-  _globals['_EXECUTEREQUEST_ENVENTRY']._loaded_options = None
-  _globals['_EXECUTEREQUEST_ENVENTRY']._serialized_options = b'8\001'
-  _globals['_EXECUTEREQUEST']._serialized_start=30
-  _globals['_EXECUTEREQUEST']._serialized_end=232
-  _globals['_EXECUTEREQUEST_ENVENTRY']._serialized_start=190
-  _globals['_EXECUTEREQUEST_ENVENTRY']._serialized_end=232
-  _globals['_SENDMESSAGEREQUEST']._serialized_start=234
-  _globals['_SENDMESSAGEREQUEST']._serialized_end=290
-  _globals['_INTERRUPTREQUEST']._serialized_start=292
-  _globals['_INTERRUPTREQUEST']._serialized_end=330
-  _globals['_INTERRUPTRESPONSE']._serialized_start=332
-  _globals['_INTERRUPTRESPONSE']._serialized_end=368
-  _globals['_HEALTHREQUEST']._serialized_start=370
-  _globals['_HEALTHREQUEST']._serialized_end=385
-  _globals['_HEALTHRESPONSE']._serialized_start=387
-  _globals['_HEALTHRESPONSE']._serialized_end=442
-  _globals['_AGENTEVENT']._serialized_start=445
-  _globals['_AGENTEVENT']._serialized_end=791
-  _globals['_SESSIONINIT']._serialized_start=793
-  _globals['_SESSIONINIT']._serialized_end=826
-  _globals['_TEXTCONTENT']._serialized_start=828
-  _globals['_TEXTCONTENT']._serialized_end=875
-  _globals['_TOOLUSE']._serialized_start=877
-  _globals['_TOOLUSE']._serialized_end=946
-  _globals['_TOOLRESULT']._serialized_start=948
-  _globals['_TOOLRESULT']._serialized_end=999
-  _globals['_SUBAGENTEVENT']._serialized_start=1001
-  _globals['_SUBAGENTEVENT']._serialized_end=1082
-  _globals['_SESSIONRESULT']._serialized_start=1085
-  _globals['_SESSIONRESULT']._serialized_end=1262
-  _globals['_AGENTERROR']._serialized_start=1264
-  _globals['_AGENTERROR']._serialized_end=1313
-  _globals['_AGENTWORKER']._serialized_start=1316
-  _globals['_AGENTWORKER']._serialized_end=1622
+  _globals['_CREATESESSION_ENVENTRY']._loaded_options = None
+  _globals['_CREATESESSION_ENVENTRY']._serialized_options = b'8\001'
+  _globals['_SESSIONINPUT']._serialized_start=29
+  _globals['_SESSIONINPUT']._serialized_end=144
+  _globals['_CREATESESSION']._serialized_start=147
+  _globals['_CREATESESSION']._serialized_end=376
+  _globals['_CREATESESSION_ENVENTRY']._serialized_start=334
+  _globals['_CREATESESSION_ENVENTRY']._serialized_end=376
+  _globals['_FOLLOWUP']._serialized_start=378
+  _globals['_FOLLOWUP']._serialized_end=404
+  _globals['_INTERRUPTREQUEST']._serialized_start=406
+  _globals['_INTERRUPTREQUEST']._serialized_end=444
+  _globals['_INTERRUPTRESPONSE']._serialized_start=446
+  _globals['_INTERRUPTRESPONSE']._serialized_end=482
+  _globals['_HEALTHREQUEST']._serialized_start=484
+  _globals['_HEALTHREQUEST']._serialized_end=499
+  _globals['_HEALTHRESPONSE']._serialized_start=501
+  _globals['_HEALTHRESPONSE']._serialized_end=556
+  _globals['_AGENTEVENT']._serialized_start=559
+  _globals['_AGENTEVENT']._serialized_end=905
+  _globals['_SESSIONINIT']._serialized_start=907
+  _globals['_SESSIONINIT']._serialized_end=940
+  _globals['_TEXTCONTENT']._serialized_start=942
+  _globals['_TEXTCONTENT']._serialized_end=989
+  _globals['_TOOLUSE']._serialized_start=991
+  _globals['_TOOLUSE']._serialized_end=1060
+  _globals['_TOOLRESULT']._serialized_start=1062
+  _globals['_TOOLRESULT']._serialized_end=1113
+  _globals['_SUBAGENTEVENT']._serialized_start=1115
+  _globals['_SUBAGENTEVENT']._serialized_end=1196
+  _globals['_SESSIONRESULT']._serialized_start=1199
+  _globals['_SESSIONRESULT']._serialized_end=1376
+  _globals['_AGENTERROR']._serialized_start=1378
+  _globals['_AGENTERROR']._serialized_end=1427
+  _globals['_AGENTWORKER']._serialized_start=1430
+  _globals['_AGENTWORKER']._serialized_end=1659
 # @@protoc_insertion_point(module_scope)

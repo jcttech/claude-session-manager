@@ -2,23 +2,30 @@ syntax = "proto3";
 package claude_agent;
 
 service AgentWorker {
-  rpc Execute (ExecuteRequest) returns (stream AgentEvent);
-  rpc SendMessage (SendMessageRequest) returns (stream AgentEvent);
+  // One bidirectional stream per session — replaces Execute + SendMessage
+  rpc Session (stream SessionInput) returns (stream AgentEvent);
   rpc Interrupt (InterruptRequest) returns (InterruptResponse);
   rpc Health (HealthRequest) returns (HealthResponse);
 }
 
-message ExecuteRequest {
+message SessionInput {
+  oneof input {
+    CreateSession create = 1;
+    FollowUp follow_up = 2;
+  }
+}
+
+message CreateSession {
   string prompt = 1;
   string permission_mode = 2;
   map<string, string> env = 3;
   string system_prompt_append = 4;
   int32 max_turns = 5;
+  int32 max_thinking_tokens = 6;
 }
 
-message SendMessageRequest {
-  string session_id = 1;
-  string prompt = 2;
+message FollowUp {
+  string prompt = 1;
 }
 
 message InterruptRequest {
