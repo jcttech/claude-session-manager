@@ -15,8 +15,9 @@ class CustomBuildHook(BuildHookInterface):
 
         proto_file = proto_dir / "agent.proto"
         if not proto_file.exists():
-            msg = f"Proto file not found: {proto_file}"
-            raise FileNotFoundError(msg)
+            # Skip proto compilation in isolated builds (e.g. uv sync).
+            # CI setup-command pre-compiles stubs into src/agent_worker/.
+            return
 
         subprocess.check_call(
             [
