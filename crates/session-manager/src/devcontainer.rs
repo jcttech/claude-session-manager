@@ -17,6 +17,7 @@ pub async fn has_devcontainer_config(project_path: &str) -> bool {
 
 /// Generate a minimal devcontainer.json for projects that don't have one.
 /// Uses the fallback container image and network from config.
+/// Includes forwardPorts for gRPC worker and postStartCommand to auto-start the worker.
 pub fn generate_default_config(image: &str, network: &str) -> String {
     format!(
         r#"{{
@@ -28,6 +29,8 @@ pub fn generate_default_config(image: &str, network: &str) -> String {
     "containerEnv": {{
         "ANTHROPIC_API_KEY": "${{localEnv:ANTHROPIC_API_KEY}}"
     }},
+    "forwardPorts": [50051],
+    "postStartCommand": "python -m agent_worker --port 50051 &",
     "runArgs": ["--network={}"]
 }}"#,
         image, network

@@ -50,5 +50,7 @@
         "GH_TOKEN": "${localEnv:GH_TOKEN}"
     },
     "workspaceMount": "source=${localWorkspaceFolder},target=/workspaces/${localWorkspaceFolderBasename},type=bind,consistency=delegated",
-    "workspaceFolder": "/workspaces/${localWorkspaceFolderBasename}"
+    "workspaceFolder": "/workspaces/${localWorkspaceFolderBasename}",
+    "postCreateCommand": "sudo apt-get update -qq && sudo apt-get install -y -qq protobuf-compiler > /dev/null 2>&1",
+    "postStartCommand": "sudo /usr/local/bin/start-podman-socket.sh"
 }

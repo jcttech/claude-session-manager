@@ -1,0 +1,31 @@
+"""Custom hatch build hook to compile proto files during build."""
+
+import subprocess
+import sys
+from pathlib import Path
+
+from hatchling.builders.hooks.plugin.interface import BuildHookInterface
+
+
+class CustomBuildHook(BuildHookInterface):
+    def initialize(self, version, build_data):
+        """Compile proto files before building the package."""
+        proto_dir = Path(self.root) / ".." / ".." / "proto"
+        output_dir = Path(self.root) / "src" / "agent_worker"
+
+        proto_file = proto_dir / "agent.proto"
+        if not proto_file.exists():
+            msg = f"Proto file not found: {proto_file}"
+            raise FileNotFoundError(msg)
+
+        subprocess.check_call(
+            [
+                sys.executable,
+                "-m",
+                "grpc_tools.protoc",
+                f"-I{proto_dir}",
+                f"--python_out={output_dir}",
+                f"--grpc_python_out={output_dir}",
+                str(proto_file),
+            ]
+        )

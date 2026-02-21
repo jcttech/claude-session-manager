@@ -1,0 +1,88 @@
+syntax = "proto3";
+package claude_agent;
+
+service AgentWorker {
+  rpc Execute (ExecuteRequest) returns (stream AgentEvent);
+  rpc SendMessage (SendMessageRequest) returns (stream AgentEvent);
+  rpc Interrupt (InterruptRequest) returns (InterruptResponse);
+  rpc Health (HealthRequest) returns (HealthResponse);
+}
+
+message ExecuteRequest {
+  string prompt = 1;
+  string permission_mode = 2;
+  map<string, string> env = 3;
+  string system_prompt_append = 4;
+  int32 max_turns = 5;
+}
+
+message SendMessageRequest {
+  string session_id = 1;
+  string prompt = 2;
+}
+
+message InterruptRequest {
+  string session_id = 1;
+}
+
+message InterruptResponse {
+  bool success = 1;
+}
+
+message HealthRequest {}
+message HealthResponse {
+  bool ready = 1;
+  string worker_version = 2;
+}
+
+message AgentEvent {
+  oneof event {
+    SessionInit session_init = 1;
+    TextContent text = 2;
+    ToolUse tool_use = 3;
+    ToolResult tool_result = 4;
+    SubagentEvent subagent = 5;
+    SessionResult result = 6;
+    AgentError error = 7;
+  }
+}
+
+message SessionInit { string session_id = 1; }
+
+message TextContent {
+  string text = 1;
+  bool is_partial = 2;
+}
+
+message ToolUse {
+  string tool_name = 1;
+  string tool_use_id = 2;
+  string input_json = 3;
+}
+
+message ToolResult {
+  string tool_use_id = 1;
+  bool is_error = 2;
+}
+
+message SubagentEvent {
+  string agent_name = 1;
+  string parent_tool_use_id = 2;
+  bool is_start = 3;
+}
+
+message SessionResult {
+  string session_id = 1;
+  uint64 input_tokens = 2;
+  uint64 output_tokens = 3;
+  double cost_usd = 4;
+  int32 num_turns = 5;
+  int64 duration_ms = 6;
+  bool is_error = 7;
+  string result_text = 8;
+}
+
+message AgentError {
+  string message = 1;
+  string error_type = 2;
+}

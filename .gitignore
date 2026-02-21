@@ -6,6 +6,15 @@
 # Build artifacts
 /target/
 
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.venv/
+
 # IDE
 .idea/
 .vscode/

@@ -35,8 +35,15 @@ config = "0.15"
 shell-escape = "0.1"
 dotenvy = "0.15"
 
+# gRPC
+tonic = "0.12"
+prost = "0.13"
+
 # Observability
 metrics = "0.24"
 metrics-exporter-prometheus = "0.16"
+
+[build-dependencies]
+tonic-build = "0.12"
 
 [dev-dependencies]

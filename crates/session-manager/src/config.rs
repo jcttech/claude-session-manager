@@ -115,6 +115,10 @@ pub struct Settings {
     /// Seconds of inactivity before posting a liveness warning in the thread (0 = disabled)
     #[serde(default = "default_session_liveness_timeout_secs")]
     pub session_liveness_timeout_secs: u64,
+
+    /// Starting port number for gRPC agent worker connections
+    #[serde(default = "default_grpc_port_start")]
+    pub grpc_port_start: u16,
 }
 
 fn default_vm_user() -> String { "claude".into() }
@@ -141,6 +145,7 @@ fn default_worktrees_path() -> String { "/home/claude/worktrees".into() }
 fn default_container_max_sessions() -> i32 { 5 }
 fn default_container_idle_timeout_secs() -> u64 { 1800 }
 fn default_session_liveness_timeout_secs() -> u64 { 120 }
+fn default_grpc_port_start() -> u16 { 50051 }
 
 static SETTINGS: OnceLock<Settings> = OnceLock::new();
 

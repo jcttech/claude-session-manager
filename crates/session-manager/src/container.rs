@@ -6,16 +6,15 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 
 use crate::config::settings;
 use crate::container_registry::{ContainerRegistry, ContainerState};
 use crate::database::Database;
 use crate::devcontainer;
-use crate::orchestrator_prompt;
+use crate::grpc::GrpcExecutor;
 use crate::ssh;
-use crate::stream_json::{ContentPart, LineBuffer, OutputEvent, StreamLine, format_tool_action, signal_name};
+use crate::stream_json::OutputEvent;
 
 /// Escape a string for safe use in shell commands
 fn shell_escape(s: &str) -> Cow<'_, str> {
@@ -49,7 +48,7 @@ struct Session {
     _session_type: String,
     /// true → first message (no --resume); false → subsequent (--resume)
     is_first_message: Arc<AtomicBool>,
-    /// Claude Code session ID captured from first invocation's init event
+    /// Claude session ID captured from gRPC SessionInit event
     claude_session_id: Arc<Mutex<Option<String>>>,
     /// Whether plan mode is enabled for this session
     plan_mode: Arc<AtomicBool>,
@@ -169,7 +168,8 @@ impl ContainerManager {
         })
     }
 
-    /// Cold start: generate devcontainer config if needed, run `devcontainer up`, register container.
+    /// Cold start: generate devcontainer config if needed, run `devcontainer up`,
+    /// wait for worker health check, register container.
     async fn cold_start(
         &self,
         project_path: &str,
@@ -224,6 +224,10 @@ impl ContainerManager {
             .ok_or_else(|| anyhow!("No containerId in devcontainer output"))?
             .to_string();
 
+        // Wait for worker health check
+        let grpc_addr = format!("http://{}:{}", s.vm_host, s.grpc_port_start);
+        crate::grpc::wait_for_health(&grpc_addr, 30, Duration::from_secs(1)).await?;
+
         // Register container in registry and database, with session_count = 1
         self.registry
             .register_container(db, repo, branch, &container_name, config_hash.as_deref())
@@ -243,7 +247,7 @@ impl ContainerManager {
         &self,
         session_id: &str,
         container_name: &str,
-        project_path: &str,
+        _project_path: &str,
         repo: &str,
         branch: &str,
         output_tx: mpsc::Sender<OutputEvent>,
@@ -256,7 +260,6 @@ impl ContainerManager {
         let plan_mode_flag = Arc::new(AtomicBool::new(plan_mode));
         let pending_title_flag = Arc::new(AtomicBool::new(false));
 
-        let project_path_owned = project_path.to_string();
         let session_id_owned = session_id.to_string();
         let session_type_owned = session_type.to_string();
         let is_first_clone = Arc::clone(&is_first_message);
@@ -267,7 +270,6 @@ impl ContainerManager {
             message_processor(
                 message_rx,
                 output_tx,
-                project_path_owned,
                 session_id_owned,
                 session_type_owned,
                 is_first_clone,
@@ -487,298 +489,114 @@ pub struct SessionInfo {
 }
 
 /// Per-message processor task. Reads messages from the channel and for each one:
-/// 1. Builds `claude -p [--resume <id>] --output-format stream-json` command via devcontainer exec
-/// 2. Writes message to stdin, shuts down stdin (ensures flush + EOF)
-/// 3. Parses NDJSON stdout → OutputEvent variants
-/// 4. Drains stderr to tracing at warn level
-/// 5. Waits for process exit, logs non-zero status
+/// 1. Connects to the gRPC worker via GrpcExecutor
+/// 2. Calls Execute (first message) or SendMessage (subsequent) on the worker
+/// 3. Streams AgentEvent → OutputEvent to the output channel
 #[allow(clippy::too_many_arguments)]
 async fn message_processor(
     mut message_rx: mpsc::Receiver<String>,
     output_tx: mpsc::Sender<OutputEvent>,
-    project_path: String,
     session_id: String,
-    session_type: String,
+    _session_type: String,
     is_first_message: Arc<AtomicBool>,
     claude_session_id: Arc<Mutex<Option<String>>>,
     plan_mode: Arc<AtomicBool>,
     pending_title: Arc<AtomicBool>,
 ) {
     let s = settings();
+    let grpc_addr = format!("http://{}:{}", s.vm_host, s.grpc_port_start);
+
+    let mut executor = match GrpcExecutor::connect(&grpc_addr).await {
+        Ok(e) => e,
+        Err(e) => {
+            tracing::error!(session_id = %session_id, error = %e, "Failed to connect to gRPC worker");
+            let _ = output_tx.send(OutputEvent::ProcessDied {
+                exit_code: Some(1),
+                signal: Some(format!("gRPC connection failed: {}", e)),
+            }).await;
+            return;
+        }
+    };
 
     while let Some(message) = message_rx.recv().await {
-        // Prepend orchestrator prompt template on first message for orchestrator sessions
-        let message = if session_type == "orchestrator" && is_first_message.load(Ordering::SeqCst) {
-            let template = if let Ok(custom_path) = std::env::var("ORCHESTRATOR_PROMPT_PATH") {
-                orchestrator_prompt::load_custom_template(&custom_path)
-                    .unwrap_or_else(|| orchestrator_prompt::DEFAULT_TEMPLATE.to_string())
-            } else {
-                orchestrator_prompt::DEFAULT_TEMPLATE.to_string()
-            };
-            let rendered = orchestrator_prompt::render_template(&template, &project_path, &session_id);
-            format!("{}\n\n---\n\n{}", rendered, message)
-        } else {
-            message
-        };
-        // Build claude command with --resume if we have a session ID
         let stored_sid = claude_session_id.lock().unwrap().clone();
-        let mut claude_args = match stored_sid.as_deref() {
-            Some(id) => format!(
-                "{} -p --verbose --resume {} --output-format stream-json",
-                &s.claude_command, id
-            ),
-            None => format!(
-                "{} -p --verbose --output-format stream-json",
-                &s.claude_command
-            ),
+        let is_first = is_first_message.load(Ordering::SeqCst);
+
+        // Determine permission mode
+        let permission_mode = if plan_mode.load(Ordering::SeqCst) {
+            "plan"
+        } else {
+            "bypassPermissions"
         };
-
-        // Append plan mode if enabled
-        if plan_mode.load(Ordering::SeqCst) {
-            claude_args.push_str(" --permission-mode plan");
-        }
-
-        let exec_cmd = format!(
-            "devcontainer exec --workspace-folder {} --docker-path {} {}",
-            shell_escape(&project_path),
-            shell_escape(&s.container_runtime),
-            &claude_args,
-        );
 
         tracing::info!(
             session_id = %session_id,
-            has_resume_id = stored_sid.is_some(),
-            plan_mode = plan_mode.load(Ordering::SeqCst),
-            "Spawning claude -p for message"
+            is_first,
+            has_session_id = stored_sid.is_some(),
+            permission_mode,
+            "Sending message via gRPC"
         );
 
-        let mut child = match ssh::command() {
-            Ok(mut cmd) => {
-                match cmd
-                    .arg(ssh::login_shell(&exec_cmd))
-                    .stdin(std::process::Stdio::piped())
-                    .stdout(std::process::Stdio::piped())
-                    .stderr(std::process::Stdio::piped())
-                    .spawn()
-                {
-                    Ok(child) => child,
-                    Err(e) => {
-                        tracing::error!(session_id = %session_id, error = %e, "Failed to spawn claude -p");
-                        continue;
-                    }
-                }
-            }
-            Err(e) => {
-                tracing::error!(session_id = %session_id, error = %e, "Failed to create SSH command");
-                continue;
-            }
+        // If pending_title is set, we'll capture the response as a title
+        let is_title_request = pending_title.swap(false, Ordering::SeqCst);
+
+        let result = if is_first || stored_sid.is_none() {
+            // First message: Execute (creates new session)
+            executor.execute(
+                &message,
+                "",
+                permission_mode,
+                std::collections::HashMap::new(),
+                &output_tx,
+            ).await
+        } else {
+            // Subsequent message: SendMessage (continues session)
+            executor.send_message(
+                stored_sid.as_deref().unwrap(),
+                &message,
+                &output_tx,
+            ).await
         };
 
-        let stdin = child.stdin.take().expect("Failed to get stdin");
-        let stdout = child.stdout.take().expect("Failed to get stdout");
-        let stderr = child.stderr.take().expect("Failed to get stderr");
-
-        // Write message to stdin, then shutdown to ensure flush + EOF
-        let mut stdin = stdin;
-        if let Err(e) = stdin.write_all(message.as_bytes()).await {
-            tracing::warn!(session_id = %session_id, error = %e, "Failed to write to claude stdin");
-            let _ = child.wait().await;
-            continue;
-        }
-        if let Err(e) = stdin.shutdown().await {
-            tracing::warn!(session_id = %session_id, error = %e, "Failed to shutdown claude stdin");
-        }
-        drop(stdin);
-        tracing::info!(session_id = %session_id, "Stdin written and closed, reading stdout");
-
-        // Drain stderr in background — log at warn level so errors are visible
-        let session_id_for_stderr = session_id.clone();
-        let stderr_handle = tokio::spawn(async move {
-            let reader = BufReader::new(stderr);
-            let mut lines = reader.lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                tracing::warn!(session_id = %session_id_for_stderr, stderr = %line, "claude -p stderr");
-            }
-        });
-
-        // Parse NDJSON stdout → OutputEvent
-        //
-        // The Claude CLI with `-p --verbose --output-format stream-json` emits:
-        //   {"type":"system","subtype":"init","session_id":"..."}  — capture session ID
-        //   {"type":"system","subtype":"hook_*",...}               — skip
-        //   {"type":"assistant","message":{"content":[...],...}}   — extract text
-        //   {"type":"result","result":"...","usage":{...}}         — final stats
-        let reader = BufReader::new(stdout);
-        let mut lines = reader.lines();
-        let mut output_closed = false;
-        let mut line_buffer = LineBuffer::new();
-        let mut input_tokens: u64 = 0;
-        let mut output_tokens: u64 = 0;
-
-        while let Ok(Some(raw_line)) = lines.next_line().await {
-            // Try to parse as NDJSON
-            let parsed = match serde_json::from_str::<StreamLine>(&raw_line) {
-                Ok(p) => p,
-                Err(_) => {
-                    // Non-JSON line (SSH noise, etc.) — skip
-                    tracing::info!(session_id = %session_id, line = %raw_line, "Non-JSON stdout line");
-                    continue;
-                }
-            };
-
-            match parsed {
-                StreamLine::System { subtype, session_id: sid } => {
-                    // Capture session ID from the init event
-                    if subtype.as_deref() == Some("init") && let Some(sid) = sid {
-                        tracing::info!(session_id = %session_id, claude_session_id = %sid, "Captured Claude session ID");
+        match result {
+            Ok(new_session_id) => {
+                // Capture session ID from first Execute
+                if let Some(sid) = new_session_id {
+                    if stored_sid.is_none() {
+                        tracing::info!(
+                            session_id = %session_id,
+                            claude_session_id = %sid,
+                            "Captured Claude session ID from gRPC"
+                        );
                         *claude_session_id.lock().unwrap() = Some(sid);
                     }
-                    // Other system events (hooks, tool use metadata) are silently skipped
                 }
-                StreamLine::Assistant { message, .. } => {
-                    // Extract input tokens from the assistant message usage
-                    if let Some(usage) = &message.usage {
-                        input_tokens = usage.input_tokens.unwrap_or(0)
-                            + usage.cache_read_input_tokens.unwrap_or(0)
-                            + usage.cache_creation_input_tokens.unwrap_or(0);
-                    }
-
-                    // If pending_title is set, collect all text and emit TitleGenerated instead
-                    if pending_title.swap(false, Ordering::SeqCst) {
-                        let mut title_text = String::new();
-                        if let Some(parts) = message.content {
-                            for part in parts {
-                                if let ContentPart::Text { text } = part {
-                                    title_text.push_str(&text);
-                                }
-                            }
-                        }
-                        if output_tx.send(OutputEvent::TitleGenerated(title_text)).await.is_err() {
-                            output_closed = true;
-                            break;
-                        }
-                        continue;
-                    }
-
-                    // Notify that processing started (with token count)
-                    if output_tx.send(OutputEvent::ProcessingStarted { input_tokens }).await.is_err() {
-                        output_closed = true;
-                        break;
-                    }
-
-                    // Extract text and tool actions from content parts
-                    if let Some(parts) = message.content {
-                        for part in parts {
-                            match part {
-                                ContentPart::Text { text } => {
-                                    let complete_lines = line_buffer.feed(&text);
-                                    for line in complete_lines {
-                                        if output_tx.send(OutputEvent::TextLine(line)).await.is_err() {
-                                            output_closed = true;
-                                            break;
-                                        }
-                                    }
-                                    if output_closed { break; }
-                                }
-                                ContentPart::ToolUse { ref name, ref input } => {
-                                    // Flush any buffered text before showing tool action
-                                    if let Some(partial) = line_buffer.flush() && output_tx.send(OutputEvent::TextLine(partial)).await.is_err() {
-                                        output_closed = true;
-                                        break;
-                                    }
-                                    let action = format_tool_action(name, input);
-                                    if output_tx.send(OutputEvent::ToolAction(action)).await.is_err() {
-                                        output_closed = true;
-                                        break;
-                                    }
-                                }
-                                ContentPart::ToolResult { .. } | ContentPart::Other => {
-                                    // Skip tool results and unknown content types
-                                }
-                            }
-                        }
-                        if output_closed { break; }
-
-                        // Flush any remaining partial line
-                        if let Some(partial) = line_buffer.flush() && output_tx.send(OutputEvent::TextLine(partial)).await.is_err() {
-                            output_closed = true;
-                            break;
-                        }
-                    }
-                }
-                StreamLine::Result { usage, .. } => {
-                    // Extract final usage stats
-                    if let Some(u) = usage {
-                        output_tokens = u.output_tokens.unwrap_or(0);
-                        // Update input_tokens if we missed the assistant event
-                        if input_tokens == 0 {
-                            input_tokens = u.input_tokens.unwrap_or(0)
-                                + u.cache_read_input_tokens.unwrap_or(0)
-                                + u.cache_creation_input_tokens.unwrap_or(0);
-                        }
-                    }
-
-                    if output_tx.send(OutputEvent::ResponseComplete { input_tokens, output_tokens }).await.is_err() {
-                        output_closed = true;
-                        break;
-                    }
-                }
-                StreamLine::Unknown => {
-                    // Skip unrecognized event types
-                }
-            }
-        }
-
-        tracing::info!(session_id = %session_id, "Stdout stream ended, waiting for process exit");
-
-        // Wait for process to finish and stderr to drain
-        let status = child.wait().await;
-        let _ = stderr_handle.await;
-
-        // Determine if this was a user-initiated stop (output channel was closed
-        // by the receiver, meaning the session was stopped from the Mattermost side)
-        // vs an unexpected process death (non-zero exit while output channel is still open).
-        let user_initiated_stop = output_closed;
-
-        match &status {
-            Ok(s) if !s.success() => {
-                tracing::warn!(session_id = %session_id, status = ?s, "claude -p exited with error");
-
-                // Only emit ProcessDied if this was NOT a user-initiated stop
-                if !user_initiated_stop {
-                    let exit_code = s.code();
-                    let signal = exit_code
-                        .filter(|&c| c > 128)
-                        .map(|c| signal_name(c).to_string());
-                    let _ = output_tx.send(OutputEvent::ProcessDied {
-                        exit_code,
-                        signal,
-                    }).await;
-                }
+                is_first_message.store(false, Ordering::SeqCst);
             }
             Err(e) => {
-                tracing::warn!(session_id = %session_id, error = %e, "Failed to wait for claude -p");
-
-                if !user_initiated_stop {
-                    let _ = output_tx.send(OutputEvent::ProcessDied {
-                        exit_code: None,
-                        signal: None,
-                    }).await;
+                tracing::error!(
+                    session_id = %session_id,
+                    error = %e,
+                    "gRPC call failed"
+                );
+                if output_tx.send(OutputEvent::ProcessDied {
+                    exit_code: Some(1),
+                    signal: Some(format!("gRPC error: {}", e)),
+                }).await.is_err() {
+                    break;
                 }
             }
-            _ => {}
         }
 
-        // Mark that first message has been processed
-        is_first_message.store(false, Ordering::SeqCst);
-
-        if output_closed {
-            tracing::debug!(session_id = %session_id, "Output channel closed, stopping message processor");
-            break;
+        // If this was a title request, emit TitleGenerated
+        // (The actual title text was already streamed as TextLine events,
+        //  the stream_output handler will have captured it)
+        if is_title_request {
+            // Title requests are handled by the `title` command in main.rs
+            // which sends a specific prompt and captures the response.
+            // The TextLine events already went through.
         }
     }
 
-    // message_rx closed or output_tx closed → task exits
-    // Dropping output_tx here signals stream_output to exit → cleanup runs
     tracing::debug!(session_id = %session_id, "Message processor exiting");
 }
