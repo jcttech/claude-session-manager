@@ -194,6 +194,11 @@ impl GrpcStream {
                             }
                         }
                         agent_event::Event::ToolUse(tool) => {
+                            // Skip streaming-phase tool events with no input (full input arrives later)
+                            if tool.input_json.is_empty() || tool.input_json == "{}" {
+                                tracing::debug!(event_count, tool = %tool.tool_name, "gRPC: skipping ToolUse with empty input");
+                                continue;
+                            }
                             // Flush any remaining partial text before tool action
                             if !partial_buf.is_empty() {
                                 let _ = output_tx
