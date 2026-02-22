@@ -51,62 +51,79 @@ class AgentWorkerServicer(agent_pb2_grpc.AgentWorkerServicer):
         StreamEvent, UserMessage) and the parse-failure fix for ResultMessage.
         """
         msg_iter = messages.__aiter__()
-        while True:
-            try:
-                message = await msg_iter.__anext__()
-            except StopAsyncIteration:
-                break
-            except Exception as parse_exc:
-                logger.warning("Skipping unparseable message: %s", parse_exc)
-                # Check if this is a ResultMessage parse failure — if so, force exit
+        try:
+            while True:
                 try:
-                    from claude_agent_sdk._errors import MessageParseError
-                    raw_data = getattr(parse_exc, 'data', None)
-                    if isinstance(parse_exc, MessageParseError) and isinstance(raw_data, dict):
-                        if raw_data.get("type") == "result":
-                            logger.error(
-                                "ResultMessage parse failed — forcing exit: %s",
-                                parse_exc,
-                            )
-                            yield fallback_result_event(raw_data, start_time)
-                            return
-                except ImportError:
-                    pass
-                continue
+                    message = await msg_iter.__anext__()
+                except StopAsyncIteration:
+                    break
+                except Exception as parse_exc:
+                    exc_str = str(parse_exc)
+                    if "rate_limit_event" in exc_str:
+                        logger.info("Rate limit event received: %s", parse_exc)
+                        try:
+                            from claude_agent_sdk._errors import MessageParseError
+                            raw_data = getattr(parse_exc, 'data', None)
+                            if isinstance(parse_exc, MessageParseError) and isinstance(raw_data, dict):
+                                logger.info("Rate limit details: %s", raw_data)
+                        except ImportError:
+                            pass
+                    else:
+                        logger.warning("Skipping unparseable message: %s", parse_exc)
+                        # Check if this is a ResultMessage parse failure — if so, force exit
+                        try:
+                            from claude_agent_sdk._errors import MessageParseError
+                            raw_data = getattr(parse_exc, 'data', None)
+                            if isinstance(parse_exc, MessageParseError) and isinstance(raw_data, dict):
+                                if raw_data.get("type") == "result":
+                                    logger.error(
+                                        "ResultMessage parse failed — forcing exit: %s",
+                                        parse_exc,
+                                    )
+                                    yield fallback_result_event(raw_data, start_time)
+                                    return
+                        except ImportError:
+                            pass
+                    continue
 
-            msg_type = type(message).__name__
-            if isinstance(message, SystemMessage):
-                logger.debug("received SystemMessage (subtype=%s)", message.subtype)
-                event = map_system_message(message)
-                if event is not None:
-                    yield event
+                msg_type = type(message).__name__
+                if isinstance(message, SystemMessage):
+                    logger.debug("received SystemMessage (subtype=%s)", message.subtype)
+                    event = map_system_message(message)
+                    if event is not None:
+                        yield event
 
-            elif isinstance(message, AssistantMessage):
-                block_count = len(message.content) if hasattr(message, 'content') else 0
-                logger.debug("received AssistantMessage (%d blocks)", block_count)
-                for event in map_assistant_message(message):
-                    yield event
+                elif isinstance(message, AssistantMessage):
+                    block_count = len(message.content) if hasattr(message, 'content') else 0
+                    logger.debug("received AssistantMessage (%d blocks)", block_count)
+                    for event in map_assistant_message(message):
+                        yield event
 
-            elif isinstance(message, ResultMessage):
-                logger.info("received ResultMessage (session=%s, turns=%s)",
-                            getattr(message, 'session_id', '?'),
-                            getattr(message, 'num_turns', '?'))
-                yield map_result_message(message, start_time)
-                return  # ResultMessage terminates the turn
+                elif isinstance(message, ResultMessage):
+                    logger.info("received ResultMessage (session=%s, turns=%s)",
+                                getattr(message, 'session_id', '?'),
+                                getattr(message, 'num_turns', '?'))
+                    yield map_result_message(message, start_time)
+                    return  # ResultMessage terminates the turn
 
-            elif isinstance(message, StreamEvent):
-                raw = message.event or {}
-                event_type = raw.get("type", "unknown")
-                logger.debug("received StreamEvent (%s)", event_type)
-                event = map_stream_event(message)
-                if event is not None:
-                    yield event
+                elif isinstance(message, StreamEvent):
+                    raw = message.event or {}
+                    event_type = raw.get("type", "unknown")
+                    logger.debug("received StreamEvent (%s)", event_type)
+                    event = map_stream_event(message)
+                    if event is not None:
+                        yield event
 
-            elif isinstance(message, UserMessage):
-                pass  # Tool results flowing back — not surfaced to chat
+                elif isinstance(message, UserMessage):
+                    pass  # Tool results flowing back — not surfaced to chat
 
-            else:
-                logger.warning("Unhandled message type: %s", msg_type)
+                else:
+                    logger.warning("Unhandled message type: %s", msg_type)
+        finally:
+            # Close the underlying SDK iterator to release the _message_receive channel.
+            # Without this, a dangling iterator blocks the follow-up turn.
+            if hasattr(msg_iter, 'aclose'):
+                await msg_iter.aclose()
 
     async def Session(self, request_iterator, context):
         """Bidirectional streaming: one gRPC stream = one SDK session lifecycle."""
@@ -149,8 +166,6 @@ class AgentWorkerServicer(agent_pb2_grpc.AgentWorkerServicer):
                             session_id = event.session_init.session_id
                             self.sessions.register(session_id, client)
                         yield event
-                        if event.HasField("result"):
-                            break
 
                 elif input_type == "follow_up":
                     logger.info("Session: follow_up prompt=%s...",
@@ -163,8 +178,6 @@ class AgentWorkerServicer(agent_pb2_grpc.AgentWorkerServicer):
                     async for event in self._iter_sdk_messages(msgs, turn_start):
                         events_yielded += 1
                         yield event
-                        if event.HasField("result"):
-                            break
 
         except GeneratorExit:
             pass

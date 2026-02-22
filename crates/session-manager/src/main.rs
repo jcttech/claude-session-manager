@@ -134,7 +134,7 @@ async fn main() -> Result<()> {
                     .await
                     .map(|e| if e.grpc_port == 0 { config::settings().grpc_port_start } else { e.grpc_port })
                     .unwrap_or(config::settings().grpc_port_start);
-                state.containers.reconnect(
+                if let Err(e) = state.containers.reconnect(
                     &session.session_id,
                     &session.container_name,
                     &session.project_path,
@@ -143,7 +143,14 @@ async fn main() -> Result<()> {
                     &session.session_type,
                     output_tx,
                     reconnect_grpc_port,
-                );
+                ).await {
+                    tracing::warn!(
+                        session_id = %session.session_id,
+                        error = %e,
+                        "Failed to reconnect session (container may be gone)"
+                    );
+                    continue;
+                }
 
                 // Register for liveness tracking
                 state.liveness.register(
@@ -573,9 +580,9 @@ async fn start_session(
             );
 
             let ready_msg = if result.reused {
-                format!("Ready. Container: `{}` (reused)", result.container_name)
+                format!("Container attached: `{}` (reused). Session ready.", result.container_name)
             } else {
-                format!("Ready. Container: `{}`", result.container_name)
+                format!("Container attached: `{}`. Session ready.", result.container_name)
             };
             let _ = state.mm.post_in_thread(channel_id, &thread_id, &ready_msg).await;
 

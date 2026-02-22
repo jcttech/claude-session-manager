@@ -12,7 +12,7 @@ use crate::config::settings;
 use crate::container_registry::{ContainerRegistry, ContainerState};
 use crate::database::Database;
 use crate::devcontainer;
-use crate::grpc::GrpcExecutor;
+use crate::grpc::{GrpcExecutor, GrpcSession};
 use crate::ssh;
 use crate::stream_json::OutputEvent;
 
@@ -168,12 +168,12 @@ impl ContainerManager {
             ensure_worker_running(&container_name, &grpc_addr).await?;
         }
 
-        // Set up message channel and spawn processor
+        // Set up message channel, connect gRPC, and spawn processor
         let reused = existing.is_some();
         self.create_session_internal(
             session_id, &container_name, project_path, repo, branch,
             output_tx, plan_mode, thinking_mode, session_type, grpc_port,
-        );
+        ).await?;
 
         Ok(StartResult {
             container_name,
@@ -294,8 +294,11 @@ impl ContainerManager {
     }
 
     /// Internal helper to create session state and spawn message processor.
+    /// Connects to the gRPC worker and opens a bidirectional session stream
+    /// before spawning the message processor, so the caller gets immediate
+    /// feedback if the connection fails.
     #[allow(clippy::too_many_arguments)]
-    fn create_session_internal(
+    async fn create_session_internal(
         &self,
         session_id: &str,
         container_name: &str,
@@ -307,7 +310,28 @@ impl ContainerManager {
         thinking_mode: bool,
         session_type: &str,
         grpc_port: u16,
-    ) {
+    ) -> Result<()> {
+        let s = settings();
+        let grpc_addr = format!("http://{}:{}", s.vm_host, grpc_port);
+
+        // Connect to gRPC worker (with retry/restart)
+        let mut executor = match GrpcExecutor::connect(&grpc_addr).await {
+            Ok(e) => e,
+            Err(_) => {
+                tracing::warn!(session_id = %session_id, "Initial gRPC connect failed, attempting worker restart");
+                ensure_worker_running(container_name, &grpc_addr).await?;
+                GrpcExecutor::connect(&grpc_addr).await?
+            }
+        };
+
+        // Open bidirectional session with timeout
+        let grpc_session = tokio::time::timeout(
+            Duration::from_secs(30),
+            executor.open_session(),
+        ).await
+            .map_err(|_| anyhow!("gRPC open_session timed out after 30s (handshake deadlock?)"))?
+            .map_err(|e| anyhow!("Failed to open gRPC session: {}", e))?;
+
         let (message_tx, message_rx) = mpsc::channel::<String>(32);
         let is_first_message = Arc::new(AtomicBool::new(true));
         let claude_session_id = Arc::new(Mutex::new(None));
@@ -316,8 +340,6 @@ impl ContainerManager {
         let pending_title_flag = Arc::new(AtomicBool::new(false));
 
         let session_id_owned = session_id.to_string();
-        let session_type_owned = session_type.to_string();
-        let container_name_owned = container_name.to_string();
         let is_first_clone = Arc::clone(&is_first_message);
         let claude_sid_clone = Arc::clone(&claude_session_id);
         let plan_mode_clone = Arc::clone(&plan_mode_flag);
@@ -328,14 +350,12 @@ impl ContainerManager {
                 message_rx,
                 output_tx,
                 session_id_owned,
-                session_type_owned,
-                container_name_owned,
                 is_first_clone,
                 claude_sid_clone,
                 plan_mode_clone,
                 thinking_mode_clone,
                 pending_title_clone,
-                grpc_port,
+                grpc_session,
             ).await;
         });
 
@@ -355,13 +375,15 @@ impl ContainerManager {
                 pending_title: pending_title_flag,
             },
         );
+
+        Ok(())
     }
 
     /// Reconnect to an existing session after a restart.
     /// Creates in-memory state (channels, message_processor) without running `devcontainer up`.
     /// The container must already be running.
     #[allow(clippy::too_many_arguments)]
-    pub fn reconnect(
+    pub async fn reconnect(
         &self,
         session_id: &str,
         container_name: &str,
@@ -371,11 +393,11 @@ impl ContainerManager {
         session_type: &str,
         output_tx: mpsc::Sender<OutputEvent>,
         grpc_port: u16,
-    ) {
+    ) -> Result<()> {
         self.create_session_internal(
             session_id, container_name, project_path, repo, branch,
             output_tx, false, false, session_type, grpc_port,
-        );
+        ).await?;
 
         tracing::info!(
             session_id = %session_id,
@@ -383,6 +405,7 @@ impl ContainerManager {
             grpc_port,
             "Reconnected session (fresh conversation)"
         );
+        Ok(())
     }
 
     pub async fn send(&self, session_id: &str, text: &str) -> Result<()> {
@@ -593,78 +616,21 @@ async fn ensure_worker_running(container_name: &str, grpc_addr: &str) -> Result<
     crate::grpc::wait_for_health(grpc_addr, 15, Duration::from_secs(1)).await
 }
 
-/// Per-message processor task. Opens a single bidirectional gRPC Session stream,
-/// then for each user message sends CreateSession (first) or FollowUp (subsequent)
+/// Per-message processor task. Uses an already-established gRPC Session stream.
+/// For each user message sends CreateSession (first) or FollowUp (subsequent)
 /// and processes the turn's events until SessionResult.
 #[allow(clippy::too_many_arguments)]
 async fn message_processor(
     mut message_rx: mpsc::Receiver<String>,
     output_tx: mpsc::Sender<OutputEvent>,
     session_id: String,
-    _session_type: String,
-    container_name: String,
     is_first_message: Arc<AtomicBool>,
     claude_session_id: Arc<Mutex<Option<String>>>,
     plan_mode: Arc<AtomicBool>,
     thinking_mode: Arc<AtomicBool>,
     pending_title: Arc<AtomicBool>,
-    grpc_port: u16,
+    mut session: GrpcSession,
 ) {
-    let s = settings();
-    let grpc_addr = format!("http://{}:{}", s.vm_host, grpc_port);
-
-    let mut executor = match GrpcExecutor::connect(&grpc_addr).await {
-        Ok(e) => e,
-        Err(_) => {
-            // Worker may have crashed — try restarting it once
-            tracing::warn!(session_id = %session_id, "Initial gRPC connect failed, attempting worker restart");
-            match ensure_worker_running(&container_name, &grpc_addr).await {
-                Ok(()) => match GrpcExecutor::connect(&grpc_addr).await {
-                    Ok(e) => e,
-                    Err(e) => {
-                        tracing::error!(session_id = %session_id, error = %e, "Failed to connect after worker restart");
-                        let _ = output_tx.send(OutputEvent::ProcessDied {
-                            exit_code: Some(1),
-                            signal: Some(format!("gRPC connection failed after restart: {}", e)),
-                        }).await;
-                        return;
-                    }
-                },
-                Err(e) => {
-                    tracing::error!(session_id = %session_id, error = %e, "Failed to restart worker");
-                    let _ = output_tx.send(OutputEvent::ProcessDied {
-                        exit_code: Some(1),
-                        signal: Some(format!("Worker restart failed: {}", e)),
-                    }).await;
-                    return;
-                }
-            }
-        }
-    };
-
-    let mut session = match tokio::time::timeout(
-        Duration::from_secs(30),
-        executor.open_session(),
-    ).await {
-        Ok(Ok(s)) => s,
-        Ok(Err(e)) => {
-            tracing::error!(session_id = %session_id, error = %e, "Failed to open gRPC session");
-            let _ = output_tx.send(OutputEvent::ProcessDied {
-                exit_code: Some(1),
-                signal: Some(format!("Failed to open gRPC session: {}", e)),
-            }).await;
-            return;
-        }
-        Err(_) => {
-            tracing::error!(session_id = %session_id, "gRPC open_session timed out after 30s (handshake deadlock?)");
-            let _ = output_tx.send(OutputEvent::ProcessDied {
-                exit_code: Some(1),
-                signal: Some("gRPC session handshake timed out after 30s".to_string()),
-            }).await;
-            return;
-        }
-    };
-
     while let Some(message) = message_rx.recv().await {
         let stored_sid = claude_session_id.lock().unwrap().clone();
         let is_first = is_first_message.load(Ordering::SeqCst);
