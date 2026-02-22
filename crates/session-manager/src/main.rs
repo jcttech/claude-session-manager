@@ -26,6 +26,8 @@ use session_manager::rate_limit::{self, RateLimitLayer};
 use session_manager::ssh;
 use session_manager::stream_json::OutputEvent;
 
+const APP_VERSION: &str = env!("APP_VERSION");
+
 /// Cached regex for network request detection (compiled once on first use)
 static NETWORK_REQUEST_RE: OnceLock<Regex> = OnceLock::new();
 
@@ -254,7 +256,7 @@ async fn main() -> Result<()> {
 
     let listen_addr = &config::settings().listen_addr;
     let listener = tokio::net::TcpListener::bind(listen_addr).await?;
-    tracing::info!("Listening on {}", listen_addr);
+    tracing::info!(version = APP_VERSION, "Listening on {}", listen_addr);
     axum::serve(
         listener,
         app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
@@ -1011,14 +1013,29 @@ async fn handle_messages(
                             ),
                             None => "_unknown_".to_string(),
                         };
+                        // Context window usage
+                        let last_input = info.as_ref().map(|i| i.last_input_tokens).unwrap_or(0);
+                        let context_line = if last_input > 0 {
+                            let usage_pct = (last_input as f64 / 200_000.0 * 100.0) as u64;
+                            format!(
+                                "| Context | {} / 200k ({}%) |",
+                                format_token_count(last_input),
+                                usage_pct
+                            )
+                        } else {
+                            "| Context | _no data yet_ |".to_string()
+                        };
+
                         let msg = format!(
                             "**Session Status:**\n\
 | Property | Value |\n\
 |---|---|\n\
+| Version | {} |\n\
 | Session | `{}` |\n\
 | Claude ID | {} |\n\
 | Type | {} |\n\
 | Project | **{}** |\n\
+{}\n\
 {}\n\
 | Messages | {} |\n\
 | Compactions | {} |\n\
@@ -1027,11 +1044,13 @@ async fn handle_messages(
 | Age | {} |\n\
 | Idle | {} |\n\
 | Last active | {} |",
+                            APP_VERSION,
                             &session.session_id[..8.min(session.session_id.len())],
                             claude_sid.unwrap_or_else(|| "_none_".to_string()),
                             session.session_type,
                             session.project,
                             container_line,
+                            context_line,
                             session.message_count,
                             session.compaction_count,
                             if plan_mode { "on" } else { "off" },
@@ -1248,14 +1267,14 @@ async fn handle_messages(
                 if cmd_text == "status" {
                     match state.db.get_all_sessions().await {
                         Ok(sessions) if sessions.is_empty() => {
-                            let _ = state.mm.post(channel_id, "No active sessions.").await;
+                            let _ = state.mm.post(channel_id, &format!("**Version:** {}\n\nNo active sessions.", APP_VERSION)).await;
                         }
                         Ok(sessions) => {
                             let now = chrono::Utc::now();
 
                             // Show container info first
                             let containers = state.containers.registry.list_all().await;
-                            let mut msg = String::new();
+                            let mut msg = format!("**Version:** {}\n\n", APP_VERSION);
                             if !containers.is_empty() {
                                 msg.push_str("**Containers:**\n");
                                 for ((_repo, _branch), entry) in &containers {
@@ -1416,6 +1435,8 @@ struct LiveCard {
     started_at: Option<tokio::time::Instant>,
     /// Whether the card has unsent changes (dirty flag for throttled updates)
     dirty: bool,
+    /// Last known input_tokens (for context window display in headers)
+    last_input_tokens: u64,
 }
 
 impl LiveCard {
@@ -1428,12 +1449,20 @@ impl LiveCard {
             last_update: tokio::time::Instant::now(),
             started_at: None,
             dirty: false,
+            last_input_tokens: 0,
         }
     }
 
     /// Reset for a new processing turn.
     fn start_processing(&mut self) {
-        self.header = ":hourglass_flowing_sand: Processing...".to_string();
+        self.header = if self.last_input_tokens > 0 {
+            format!(
+                ":hourglass_flowing_sand: Processing... · {}",
+                format_ctx_suffix(self.last_input_tokens)
+            )
+        } else {
+            ":hourglass_flowing_sand: Processing...".to_string()
+        };
         self.tool_lines.clear();
         self.text_content.clear();
         self.started_at = Some(tokio::time::Instant::now());
@@ -1451,9 +1480,10 @@ impl LiveCard {
         let input_k = format_token_count(input_tokens);
         let output_k = format_token_count(output_tokens);
         self.header = format!(
-            ":white_check_mark: Done ({} in / {} out)",
-            input_k, output_k
+            ":white_check_mark: Done ({} in / {} out · {})",
+            input_k, output_k, format_ctx_suffix(input_tokens)
         );
+        self.last_input_tokens = input_tokens;
         self.started_at = None;
         self.dirty = true;
     }
@@ -1481,7 +1511,14 @@ impl LiveCard {
             } else {
                 format!("{}s", secs)
             };
-            self.header = format!(":hourglass_flowing_sand: Processing... ({})", elapsed_str);
+            self.header = if self.last_input_tokens > 0 {
+                format!(
+                    ":hourglass_flowing_sand: Processing... ({}) · {}",
+                    elapsed_str, format_ctx_suffix(self.last_input_tokens)
+                )
+            } else {
+                format!(":hourglass_flowing_sand: Processing... ({})", elapsed_str)
+            };
             self.dirty = true;
         }
     }
@@ -1579,6 +1616,11 @@ fn format_token_count(tokens: u64) -> String {
     } else {
         tokens.to_string()
     }
+}
+
+/// Format context window suffix (e.g. "45.2k/200k ctx")
+fn format_ctx_suffix(input_tokens: u64) -> String {
+    format!("{}/200k ctx", format_token_count(input_tokens))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1679,6 +1721,9 @@ async fn stream_output(
                         card.flush(&state, &channel_id, &thread_id).await;
                         // Reset card post_id so next turn creates a fresh card
                         card.post_id = None;
+
+                        // Persist last input_tokens for status display
+                        state.containers.set_last_input_tokens(&session_id, input_tokens);
 
                         counter!("tokens_input_total").increment(input_tokens);
                         counter!("tokens_output_total").increment(output_tokens);

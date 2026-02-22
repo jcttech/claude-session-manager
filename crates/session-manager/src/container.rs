@@ -3,7 +3,7 @@ use dashmap::DashMap;
 use shell_escape::escape;
 use std::borrow::Cow;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -56,6 +56,8 @@ struct Session {
     thinking_mode: Arc<AtomicBool>,
     /// Whether the next response should be captured as a thread title
     pending_title: Arc<AtomicBool>,
+    /// Last known input_tokens from ResponseComplete (for context window display)
+    last_input_tokens: Arc<AtomicU64>,
 }
 
 impl Default for ContainerManager {
@@ -338,6 +340,7 @@ impl ContainerManager {
         let plan_mode_flag = Arc::new(AtomicBool::new(plan_mode));
         let thinking_mode_flag = Arc::new(AtomicBool::new(thinking_mode));
         let pending_title_flag = Arc::new(AtomicBool::new(false));
+        let last_input_tokens_flag = Arc::new(AtomicU64::new(0));
 
         let session_id_owned = session_id.to_string();
         let is_first_clone = Arc::clone(&is_first_message);
@@ -373,6 +376,7 @@ impl ContainerManager {
                 plan_mode: plan_mode_flag,
                 thinking_mode: thinking_mode_flag,
                 pending_title: pending_title_flag,
+                last_input_tokens: last_input_tokens_flag,
             },
         );
 
@@ -490,6 +494,13 @@ impl ContainerManager {
         }
     }
 
+    /// Store the last known input_tokens from a ResponseComplete event
+    pub fn set_last_input_tokens(&self, session_id: &str, tokens: u64) {
+        if let Some(s) = self.sessions.get(session_id) {
+            s.last_input_tokens.store(tokens, Ordering::SeqCst);
+        }
+    }
+
     /// Get plan mode status for a session
     pub fn get_plan_mode(&self, session_id: &str) -> bool {
         self.sessions
@@ -520,6 +531,7 @@ impl ContainerManager {
             plan_mode: s.plan_mode.load(Ordering::SeqCst),
             thinking_mode: s.thinking_mode.load(Ordering::SeqCst),
             is_first_message: s.is_first_message.load(Ordering::SeqCst),
+            last_input_tokens: s.last_input_tokens.load(Ordering::SeqCst),
         })
     }
 
@@ -589,6 +601,7 @@ pub struct SessionInfo {
     pub plan_mode: bool,
     pub thinking_mode: bool,
     pub is_first_message: bool,
+    pub last_input_tokens: u64,
 }
 
 /// Check if the agent worker is healthy; if not, start it via SSH and wait.
