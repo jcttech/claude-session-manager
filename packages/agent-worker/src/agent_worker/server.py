@@ -110,6 +110,10 @@ class AgentWorkerServicer(agent_pb2_grpc.AgentWorkerServicer):
 
     async def Session(self, request_iterator, context):
         """Bidirectional streaming: one gRPC stream = one SDK session lifecycle."""
+        # Send initial metadata immediately so the client's session() call
+        # doesn't block waiting for response headers (avoids deadlock).
+        await context.send_initial_metadata(())
+
         client = None
         session_id = None
         events_yielded = 0
