@@ -1,8 +1,8 @@
 use anyhow::Result;
 use axum::{
+    Json, Router,
     extract::State,
     routing::{get, post},
-    Json, Router,
 };
 use metrics::{counter, gauge, histogram};
 use metrics_exporter_prometheus::PrometheusBuilder;
@@ -14,17 +14,17 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use mattermost_client::{sanitize_channel_name, Mattermost, Post};
+use mattermost_client::{Mattermost, Post, sanitize_channel_name};
 use session_manager::config;
 use session_manager::container::ContainerManager;
-use session_manager::liveness::{LivenessState, format_duration_short};
-use session_manager::stream_json::OutputEvent;
 use session_manager::crypto::{sign_request, verify_signature};
 use session_manager::database::{self, Database};
 use session_manager::git::{GitManager, RepoRef};
+use session_manager::liveness::{LivenessState, format_duration_short};
 use session_manager::opnsense::OPNsense;
 use session_manager::rate_limit::{self, RateLimitLayer};
 use session_manager::ssh;
+use session_manager::stream_json::OutputEvent;
 
 /// Cached regex for network request detection (compiled once on first use)
 static NETWORK_REQUEST_RE: OnceLock<Regex> = OnceLock::new();
@@ -125,25 +125,40 @@ async fn main() -> Result<()> {
                 // Extract repo/branch from session project for registry tracking
                 let (reconnect_repo, reconnect_branch) = {
                     let parts: Vec<&str> = session.project.splitn(2, '@').collect();
-                    (parts[0].to_string(), parts.get(1).unwrap_or(&"").to_string())
+                    (
+                        parts[0].to_string(),
+                        parts.get(1).unwrap_or(&"").to_string(),
+                    )
                 };
                 // Get grpc_port from registry (synced from DB on startup)
                 // grpc_port=0 means pre-migration container — fall back to config default
-                let reconnect_grpc_port = state.containers.registry
+                let reconnect_grpc_port = state
+                    .containers
+                    .registry
                     .get_container(&reconnect_repo, &reconnect_branch)
                     .await
-                    .map(|e| if e.grpc_port == 0 { config::settings().grpc_port_start } else { e.grpc_port })
+                    .map(|e| {
+                        if e.grpc_port == 0 {
+                            config::settings().grpc_port_start
+                        } else {
+                            e.grpc_port
+                        }
+                    })
                     .unwrap_or(config::settings().grpc_port_start);
-                if let Err(e) = state.containers.reconnect(
-                    &session.session_id,
-                    &session.container_name,
-                    &session.project_path,
-                    &reconnect_repo,
-                    &reconnect_branch,
-                    &session.session_type,
-                    output_tx,
-                    reconnect_grpc_port,
-                ).await {
+                if let Err(e) = state
+                    .containers
+                    .reconnect(
+                        &session.session_id,
+                        &session.container_name,
+                        &session.project_path,
+                        &reconnect_repo,
+                        &reconnect_branch,
+                        &session.session_type,
+                        output_tx,
+                        reconnect_grpc_port,
+                    )
+                    .await
+                {
                     tracing::warn!(
                         session_id = %session.session_id,
                         error = %e,
@@ -153,11 +168,7 @@ async fn main() -> Result<()> {
                 }
 
                 // Register for liveness tracking
-                state.liveness.register(
-                    &session.session_id,
-                    &session.channel_id,
-                    &session.thread_id,
-                );
+                state.liveness.register(&session.session_id);
 
                 let state_clone = state.clone();
                 let channel_id = session.channel_id.clone();
@@ -174,7 +185,8 @@ async fn main() -> Result<()> {
                         session_type,
                         project,
                         output_rx,
-                    ).await;
+                    )
+                    .await;
                 });
             }
         }
@@ -218,13 +230,6 @@ async fn main() -> Result<()> {
         cleanup_stale_requests(state_clone, cancel_clone).await;
     });
 
-    // Start liveness monitor
-    let state_clone = state.clone();
-    let cancel_clone = cancel_token.clone();
-    let liveness_handle = tokio::spawn(async move {
-        spawn_liveness_monitor(state_clone, cancel_clone).await;
-    });
-
     // Configure rate limiting
     let s = config::settings();
     let rate_limiter = RateLimitLayer::new(s.rate_limit_rps, s.rate_limit_burst);
@@ -237,19 +242,25 @@ async fn main() -> Result<()> {
     let app = Router::new()
         .route("/callback", post(handle_callback))
         .route("/health", get(health_check))
-        .route("/metrics", get(move || {
-            let handle = prometheus_handle.clone();
-            async move { handle.render() }
-        }))
+        .route(
+            "/metrics",
+            get(move || {
+                let handle = prometheus_handle.clone();
+                async move { handle.render() }
+            }),
+        )
         .layer(rate_limiter)
         .with_state(state);
 
     let listen_addr = &config::settings().listen_addr;
     let listener = tokio::net::TcpListener::bind(listen_addr).await?;
     tracing::info!("Listening on {}", listen_addr);
-    axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>())
-        .with_graceful_shutdown(shutdown_signal(cancel_token.clone()))
-        .await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal(cancel_token.clone()))
+    .await?;
 
     // Cancel background tasks and wait for them to complete
     tracing::info!("Cancelling background tasks...");
@@ -261,7 +272,6 @@ async fn main() -> Result<()> {
         let _ = listener_handle.await;
         let _ = handler_handle.await;
         let _ = cleanup_handle.await;
-        let _ = liveness_handle.await;
         let _ = rate_limit_handle.await;
     })
     .await;
@@ -277,7 +287,10 @@ async fn health_check(
 ) -> (axum::http::StatusCode, &'static str) {
     match state.db.health_check().await {
         Ok(()) => (axum::http::StatusCode::OK, "OK"),
-        Err(_) => (axum::http::StatusCode::SERVICE_UNAVAILABLE, "Database unavailable"),
+        Err(_) => (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "Database unavailable",
+        ),
     }
 }
 
@@ -333,39 +346,6 @@ async fn cleanup_stale_requests(state: Arc<AppState>, cancel_token: Cancellation
     }
 }
 
-/// Liveness monitor: periodically checks for sessions with no recent output
-/// and posts a warning in the thread.
-async fn spawn_liveness_monitor(state: Arc<AppState>, cancel_token: CancellationToken) {
-    let mut interval = tokio::time::interval(Duration::from_secs(30));
-    loop {
-        tokio::select! {
-            _ = interval.tick() => {
-                let timeout = config::settings().session_liveness_timeout_secs;
-                if timeout == 0 {
-                    continue;
-                }
-                for stale in state.liveness.get_stale(timeout) {
-                    let msg = format!(
-                        ":warning: No output activity for **{}**. Session may be unresponsive. Use `stop` to end it or wait for it to resume.",
-                        format_duration_short(stale.idle_duration)
-                    );
-                    let _ = state.mm.post_in_thread(&stale.channel_id, &stale.thread_id, &msg).await;
-                    state.liveness.mark_warned(&stale.session_id);
-                    tracing::warn!(
-                        session_id = %stale.session_id,
-                        idle_secs = stale.idle_duration.as_secs(),
-                        "Liveness warning posted"
-                    );
-                }
-            }
-            _ = cancel_token.cancelled() => {
-                tracing::info!("Liveness monitor cancelled");
-                break;
-            }
-        }
-    }
-}
-
 /// Resolve a project channel: look up or create the channel for a project.
 /// Also manages sidebar categories for bot and requesting user.
 /// Returns (channel_id, channel_name, repo_ref).
@@ -390,30 +370,43 @@ async fn resolve_project_channel(
         pc.channel_id
     } else {
         // Try to find existing channel by name first
-        let channel_id = match state.mm.get_channel_by_name(&s.mattermost_team_id, &channel_name).await {
+        let channel_id = match state
+            .mm
+            .get_channel_by_name(&s.mattermost_team_id, &channel_name)
+            .await
+        {
             Ok(Some(id)) => id,
             Ok(None) => {
                 // Create new channel
-                state.mm.create_channel(
-                    &s.mattermost_team_id,
-                    &channel_name,
-                    &repo_ref.repo,
-                    &format!("Claude sessions for {}", full_name),
-                ).await?
+                state
+                    .mm
+                    .create_channel(
+                        &s.mattermost_team_id,
+                        &channel_name,
+                        &repo_ref.repo,
+                        &format!("Claude sessions for {}", full_name),
+                    )
+                    .await?
             }
             Err(e) => {
                 tracing::warn!(error = %e, "Failed to look up channel, creating new one");
-                state.mm.create_channel(
-                    &s.mattermost_team_id,
-                    &channel_name,
-                    &repo_ref.repo,
-                    &format!("Claude sessions for {}", full_name),
-                ).await?
+                state
+                    .mm
+                    .create_channel(
+                        &s.mattermost_team_id,
+                        &channel_name,
+                        &repo_ref.repo,
+                        &format!("Claude sessions for {}", full_name),
+                    )
+                    .await?
             }
         };
 
         // Persist project -> channel mapping
-        state.db.create_project_channel(&full_name, &channel_id, &channel_name).await?;
+        state
+            .db
+            .create_project_channel(&full_name, &channel_id, &channel_name)
+            .await?;
 
         channel_id
     };
@@ -427,11 +420,7 @@ async fn resolve_project_channel(
 }
 
 /// Setup sidebar category for all team members (best-effort per user)
-async fn setup_sidebar_category(
-    state: &AppState,
-    channel_id: &str,
-    _user_id: &str,
-) -> Result<()> {
+async fn setup_sidebar_category(state: &AppState, channel_id: &str, _user_id: &str) -> Result<()> {
     let s = config::settings();
     let team_id = &s.mattermost_team_id;
     let category_name = &s.channel_category;
@@ -440,10 +429,18 @@ async fn setup_sidebar_category(
 
     for member_id in &member_ids {
         if let Err(e) = async {
-            let cat_id = state.mm.ensure_sidebar_category(member_id, team_id, category_name).await?;
-            state.mm.add_channel_to_category(member_id, team_id, &cat_id, channel_id).await?;
+            let cat_id = state
+                .mm
+                .ensure_sidebar_category(member_id, team_id, category_name)
+                .await?;
+            state
+                .mm
+                .add_channel_to_category(member_id, team_id, &cat_id, channel_id)
+                .await?;
             Ok::<(), anyhow::Error>(())
-        }.await {
+        }
+        .await
+        {
             tracing::debug!(user_id = %member_id, error = %e, "Failed to setup sidebar category for user");
         }
     }
@@ -508,17 +505,31 @@ async fn start_session(
     };
     let thread_id = state.mm.post_root(channel_id, &root_msg).await?;
 
-    let _ = state.mm.post_in_thread(channel_id, &thread_id, "Starting session...").await;
+    let _ = state
+        .mm
+        .post_in_thread(channel_id, &thread_id, "Starting session...")
+        .await;
     let session_start_time = std::time::Instant::now();
 
     let repo_name = repo_ref.full_name();
     let branch_name = repo_ref.branch.clone().unwrap_or_default();
 
     let (output_tx, output_rx) = mpsc::channel::<OutputEvent>(100);
-    match state.containers.start(
-        &session_id, &project_path, &repo_name, &branch_name,
-        &state.db, output_tx, plan_mode, thinking_mode, session_type,
-    ).await {
+    match state
+        .containers
+        .start(
+            &session_id,
+            &project_path,
+            &repo_name,
+            &branch_name,
+            &state.db,
+            output_tx,
+            plan_mode,
+            thinking_mode,
+            session_type,
+        )
+        .await
+    {
         Ok(result) => {
             let session_duration = session_start_time.elapsed();
             histogram!("session_start_duration_seconds").record(session_duration.as_secs_f64());
@@ -531,31 +542,41 @@ async fn start_session(
 
             // Post same-branch warning if applicable
             if let Some(ref warning) = result.warning {
-                let _ = state.mm.post_in_thread(channel_id, &thread_id, warning).await;
+                let _ = state
+                    .mm
+                    .post_in_thread(channel_id, &thread_id, warning)
+                    .await;
             }
 
             // Register liveness tracking
-            state.liveness.register(&session_id, channel_id, &thread_id);
+            state.liveness.register(&session_id);
 
             // Persist session to database — if this fails, clean up everything (fix 1b)
-            if let Err(e) = state.db.create_session(
-                &session_id,
-                channel_id,
-                &thread_id,
-                project_input,
-                &project_path,
-                &result.container_name,
-                session_type,
-                None, // parent_session_id reserved for future use
-                user_id,
-            ).await {
+            if let Err(e) = state
+                .db
+                .create_session(
+                    &session_id,
+                    channel_id,
+                    &thread_id,
+                    project_input,
+                    &project_path,
+                    &result.container_name,
+                    session_type,
+                    None, // parent_session_id reserved for future use
+                    user_id,
+                )
+                .await
+            {
                 tracing::error!(
                     session_id = %session_id,
                     error = %e,
                     "Failed to persist session, cleaning up container"
                 );
                 cleanup_session(state, &session_id).await;
-                return Err(anyhow::anyhow!("Failed to persist session to database: {}", e));
+                return Err(anyhow::anyhow!(
+                    "Failed to persist session to database: {}",
+                    e
+                ));
             }
 
             // Auto-follow thread for the requesting user (fire-and-forget)
@@ -580,11 +601,20 @@ async fn start_session(
             );
 
             let ready_msg = if result.reused {
-                format!("Container attached: `{}` (reused). Session ready.", result.container_name)
+                format!(
+                    "Container attached: `{}` (reused). Session ready.",
+                    result.container_name
+                )
             } else {
-                format!("Container attached: `{}`. Session ready.", result.container_name)
+                format!(
+                    "Container attached: `{}`. Session ready.",
+                    result.container_name
+                )
             };
-            let _ = state.mm.post_in_thread(channel_id, &thread_id, &ready_msg).await;
+            let _ = state
+                .mm
+                .post_in_thread(channel_id, &thread_id, &ready_msg)
+                .await;
 
             // Start output streaming
             let state_clone = state.clone();
@@ -602,7 +632,8 @@ async fn start_session(
                     session_type_clone,
                     project_clone,
                     output_rx,
-                ).await;
+                )
+                .await;
             });
 
             Ok(session_id)
@@ -632,7 +663,12 @@ async fn cleanup_session(state: &AppState, session_id: &str) {
     state.liveness.remove(session_id);
 
     // Unfollow thread for the user who started the session (fire-and-forget)
-    if let Ok(Some(session)) = state.db.get_session_by_id_prefix(&session_id[..8.min(session_id.len())]).await && let Some(ref uid) = session.user_id {
+    if let Ok(Some(session)) = state
+        .db
+        .get_session_by_id_prefix(&session_id[..8.min(session_id.len())])
+        .await
+        && let Some(ref uid) = session.user_id
+    {
         let mm = state.mm.clone();
         let uid = uid.clone();
         let tid = session.thread_id.clone();
@@ -644,7 +680,11 @@ async fn cleanup_session(state: &AppState, session_id: &str) {
     }
 
     // Decrement container session count in registry (don't remove the container)
-    match state.containers.release_session(&state.db, &claimed.repo, &claimed.branch).await {
+    match state
+        .containers
+        .release_session(&state.db, &claimed.repo, &claimed.branch)
+        .await
+    {
         Ok(remaining) => {
             tracing::info!(
                 session_id = %session_id,
@@ -660,7 +700,11 @@ async fn cleanup_session(state: &AppState, session_id: &str) {
                 "Failed to decrement container session count, falling back to container removal"
             );
             // Fallback: remove container directly if registry decrement fails
-            if let Err(e) = state.containers.remove_container_by_name(&claimed.name).await {
+            if let Err(e) = state
+                .containers
+                .remove_container_by_name(&claimed.name)
+                .await
+            {
                 tracing::warn!(session_id = %session_id, error = %e, "Failed to remove container");
             }
         }
@@ -681,7 +725,6 @@ async fn cleanup_session(state: &AppState, session_id: &str) {
 
     gauge!("active_sessions").decrement(1.0);
     tracing::info!(session_id = %session_id, "Session cleaned up");
-
 }
 
 /// Stop a session by ID, cleaning up container and database.
@@ -714,7 +757,11 @@ fn format_root_label(session_type: &str, project: &str) -> String {
     }
 }
 
-async fn handle_messages(state: Arc<AppState>, mut rx: mpsc::Receiver<Post>, cancel_token: CancellationToken) {
+async fn handle_messages(
+    state: Arc<AppState>,
+    mut rx: mpsc::Receiver<Post>,
+    cancel_token: CancellationToken,
+) {
     let bot_trigger = &config::settings().bot_trigger;
 
     loop {
@@ -743,12 +790,17 @@ async fn handle_messages(state: Arc<AppState>, mut rx: mpsc::Receiver<Post>, can
                     let cmd = text.trim_start_matches(bot_trigger).trim();
                     if cmd == "stop" {
                         stop_session(&state, &session).await;
-                        let _ = state.mm.post_in_thread(channel_id, root_id, "Stopped.").await;
+                        let _ = state
+                            .mm
+                            .post_in_thread(channel_id, root_id, "Stopped.")
+                            .await;
                         continue;
                     }
                     if cmd == "stop --container" {
                         // Find the container's repo/branch from this session
-                        let container_info = state.containers.get_session_info(&session.session_id)
+                        let container_info = state
+                            .containers
+                            .get_session_info(&session.session_id)
                             .map(|_| {
                                 // Get repo/branch from the session's container entry
                                 // We need to look up the session in the DashMap for repo/branch
@@ -760,7 +812,9 @@ async fn handle_messages(state: Arc<AppState>, mut rx: mpsc::Receiver<Post>, can
 
                         if let Some((repo, branch)) = container_info {
                             // Stop all sessions sharing this container
-                            let claimed = state.containers.stop_all_sessions_for_container(&repo, &branch);
+                            let claimed = state
+                                .containers
+                                .stop_all_sessions_for_container(&repo, &branch);
                             let count = claimed.len();
 
                             // Clean up each claimed session (git locks, worktrees, DB, metrics)
@@ -776,38 +830,76 @@ async fn handle_messages(state: Arc<AppState>, mut rx: mpsc::Receiver<Post>, can
                             }
 
                             // Tear down the container
-                            if let Err(e) = state.containers.tear_down_container(&state.db, &repo, &branch).await {
+                            if let Err(e) = state
+                                .containers
+                                .tear_down_container(&state.db, &repo, &branch)
+                                .await
+                            {
                                 tracing::warn!(repo = %repo, branch = %branch, error = %e, "Failed to tear down container");
                             }
 
-                            let _ = state.mm.post_in_thread(
-                                channel_id, root_id,
-                                &format!("Container stopped. {} sessions terminated.", count),
-                            ).await;
+                            let _ = state
+                                .mm
+                                .post_in_thread(
+                                    channel_id,
+                                    root_id,
+                                    &format!("Container stopped. {} sessions terminated.", count),
+                                )
+                                .await;
                         } else {
-                            let _ = state.mm.post_in_thread(channel_id, root_id, "Could not find container for this session.").await;
+                            let _ = state
+                                .mm
+                                .post_in_thread(
+                                    channel_id,
+                                    root_id,
+                                    "Could not find container for this session.",
+                                )
+                                .await;
                         }
                         continue;
                     }
                     if cmd == "compact" {
                         let _ = state.containers.send(&session.session_id, "/compact").await;
-                        let _ = state.mm.post_in_thread(channel_id, root_id, "Compacting context...").await;
+                        let _ = state
+                            .mm
+                            .post_in_thread(channel_id, root_id, "Compacting context...")
+                            .await;
                         let _ = state.db.record_compaction(&session.session_id).await;
                         continue;
                     }
                     if cmd == "clear" {
                         let _ = state.containers.send(&session.session_id, "/clear").await;
-                        let _ = state.mm.post_in_thread(channel_id, root_id, "Context cleared.").await;
+                        let _ = state
+                            .mm
+                            .post_in_thread(channel_id, root_id, "Context cleared.")
+                            .await;
                         continue;
                     }
                     if cmd == "restart" {
-                        let _ = state.mm.post_in_thread(channel_id, root_id, "Restarting session...").await;
+                        let _ = state
+                            .mm
+                            .post_in_thread(channel_id, root_id, "Restarting session...")
+                            .await;
                         match state.containers.restart_session(&session.session_id).await {
                             Ok(()) => {
-                                let _ = state.mm.post_in_thread(channel_id, root_id, "Restarted. Next message starts a fresh conversation.").await;
+                                let _ = state
+                                    .mm
+                                    .post_in_thread(
+                                        channel_id,
+                                        root_id,
+                                        "Restarted. Next message starts a fresh conversation.",
+                                    )
+                                    .await;
                             }
                             Err(e) => {
-                                let _ = state.mm.post_in_thread(channel_id, root_id, &format!("Restart failed: {e}")).await;
+                                let _ = state
+                                    .mm
+                                    .post_in_thread(
+                                        channel_id,
+                                        root_id,
+                                        &format!("Restart failed: {e}"),
+                                    )
+                                    .await;
                             }
                         }
                         continue;
@@ -823,7 +915,9 @@ async fn handle_messages(state: Arc<AppState>, mut rx: mpsc::Receiver<Post>, can
                                 continue;
                             }
                         };
-                        state.containers.set_plan_mode(&session.session_id, new_state);
+                        state
+                            .containers
+                            .set_plan_mode(&session.session_id, new_state);
                         let msg = if new_state {
                             "Plan mode **enabled**. Claude will analyze but not modify files."
                         } else {
@@ -843,7 +937,9 @@ async fn handle_messages(state: Arc<AppState>, mut rx: mpsc::Receiver<Post>, can
                                 continue;
                             }
                         };
-                        state.containers.set_thinking_mode(&session.session_id, new_state);
+                        state
+                            .containers
+                            .set_thinking_mode(&session.session_id, new_state);
                         let msg = if new_state {
                             "Thinking mode **enabled**. Takes effect on `restart`."
                         } else {
@@ -861,12 +957,21 @@ async fn handle_messages(state: Arc<AppState>, mut rx: mpsc::Receiver<Post>, can
                                 &session.session_id,
                                 "Summarize this conversation in 5-10 words as a thread title. Output ONLY the title text, nothing else. No quotes, no punctuation at the end.",
                             ).await;
-                            let _ = state.mm.post_in_thread(channel_id, root_id, "_Generating title..._").await;
+                            let _ = state
+                                .mm
+                                .post_in_thread(channel_id, root_id, "_Generating title..._")
+                                .await;
                         } else {
                             // Manual title
                             let label = format_root_label(&session.session_type, &session.project);
-                            let _ = state.mm.update_post(root_id, &format!("{} — {}", label, arg)).await;
-                            let _ = state.mm.post_in_thread(channel_id, root_id, "Title updated.").await;
+                            let _ = state
+                                .mm
+                                .update_post(root_id, &format!("{} — {}", label, arg))
+                                .await;
+                            let _ = state
+                                .mm
+                                .post_in_thread(channel_id, root_id, "Title updated.")
+                                .await;
                         }
                         continue;
                     }
@@ -876,13 +981,18 @@ async fn handle_messages(state: Arc<AppState>, mut rx: mpsc::Receiver<Post>, can
                         let info = state.containers.get_session_info(&session.session_id);
                         let plan_mode = info.as_ref().map(|i| i.plan_mode).unwrap_or(false);
                         let thinking_mode = info.as_ref().map(|i| i.thinking_mode).unwrap_or(false);
-                        let claude_sid = info.as_ref().and_then(|i| i.claude_session_id.as_deref().map(|s| format!("`{}`", &s[..8.min(s.len())])));
+                        let claude_sid = info.as_ref().and_then(|i| {
+                            i.claude_session_id
+                                .as_deref()
+                                .map(|s| format!("`{}`", &s[..8.min(s.len())]))
+                        });
 
                         // Look up container info for this session's repo/branch
                         let parts: Vec<&str> = session.project.splitn(2, '@').collect();
                         let repo = parts[0];
                         let branch = parts.get(1).unwrap_or(&"");
-                        let container_entry = state.containers.registry.get_container(repo, branch).await;
+                        let container_entry =
+                            state.containers.registry.get_container(repo, branch).await;
                         let container_line = match container_entry {
                             Some(entry) => format!(
                                 "| Container | `{}` ({}, {} sessions) |",
@@ -894,17 +1004,15 @@ async fn handle_messages(state: Arc<AppState>, mut rx: mpsc::Receiver<Post>, can
                         // Liveness info
                         let liveness_info = state.liveness.get_info(&session.session_id);
                         let last_active_str = match &liveness_info {
-                            Some(li) => format!("{} ago ({})", format_duration_short(li.idle_duration), li.last_event_type),
+                            Some(li) => format!(
+                                "{} ago ({})",
+                                format_duration_short(li.idle_duration),
+                                li.last_event_type
+                            ),
                             None => "_unknown_".to_string(),
                         };
-                        let liveness_str = match &liveness_info {
-                            Some(li) if li.warning_posted => ":warning: warning posted".to_string(),
-                            Some(_) => "ok".to_string(),
-                            None => "_untracked_".to_string(),
-                        };
-
                         let msg = format!(
-"**Session Status:**\n\
+                            "**Session Status:**\n\
 | Property | Value |\n\
 |---|---|\n\
 | Session | `{}` |\n\
@@ -918,8 +1026,7 @@ async fn handle_messages(state: Arc<AppState>, mut rx: mpsc::Receiver<Post>, can
 | Thinking | {} |\n\
 | Age | {} |\n\
 | Idle | {} |\n\
-| Last active | {} |\n\
-| Liveness | {} |",
+| Last active | {} |",
                             &session.session_id[..8.min(session.session_id.len())],
                             claude_sid.unwrap_or_else(|| "_none_".to_string()),
                             session.session_type,
@@ -932,7 +1039,6 @@ async fn handle_messages(state: Arc<AppState>, mut rx: mpsc::Receiver<Post>, can
                             format_duration(age),
                             format_duration(idle),
                             last_active_str,
-                            liveness_str,
                         );
                         let _ = state.mm.post_in_thread(channel_id, root_id, &msg).await;
                         continue;
@@ -954,11 +1060,10 @@ async fn handle_messages(state: Arc<AppState>, mut rx: mpsc::Receiver<Post>, can
                 // Track activity
                 let _ = state.db.touch_session(&session.session_id).await;
             } else if text.starts_with(bot_trigger) {
-                let _ = state.mm.post_in_thread(
-                    channel_id,
-                    root_id,
-                    "No active session in this thread.",
-                ).await;
+                let _ = state
+                    .mm
+                    .post_in_thread(channel_id, root_id, "No active session in this thread.")
+                    .await;
             }
             // Non-bot thread replies to non-session threads are silently ignored
         } else {
@@ -971,14 +1076,21 @@ async fn handle_messages(state: Arc<AppState>, mut rx: mpsc::Receiver<Post>, can
                 // --- start <project> [--plan] ---
                 if let Some(project_input) = cmd_text.strip_prefix("start ").map(|s| s.trim()) {
                     if project_input.is_empty() {
-                        let _ = state.mm.post(channel_id, "Usage: `@claude start <org/repo>` or `@claude start <repo>`").await;
+                        let _ = state
+                            .mm
+                            .post(
+                                channel_id,
+                                "Usage: `@claude start <org/repo>` or `@claude start <repo>`",
+                            )
+                            .await;
                         continue;
                     }
 
                     // Parse --plan and --thinking flags from input
                     let plan_mode = project_input.split_whitespace().any(|w| w == "--plan");
                     let thinking_mode = project_input.split_whitespace().any(|w| w == "--thinking");
-                    let project_input_clean = project_input.split_whitespace()
+                    let project_input_clean = project_input
+                        .split_whitespace()
                         .filter(|w| *w != "--plan" && *w != "--thinking")
                         .collect::<Vec<_>>()
                         .join(" ");
@@ -987,12 +1099,17 @@ async fn handle_messages(state: Arc<AppState>, mut rx: mpsc::Receiver<Post>, can
                     let s = config::settings();
 
                     // Check if input looks like a repo reference or has a default org
-                    let has_slash = project_input.split_whitespace().next()
+                    let has_slash = project_input
+                        .split_whitespace()
+                        .next()
                         .map(|p| p.split('@').next().unwrap_or(p))
                         .map(|p| p.contains('/'))
                         .unwrap_or(false);
 
-                    if has_slash || s.default_org.is_some() || RepoRef::looks_like_repo(project_input) {
+                    if has_slash
+                        || s.default_org.is_some()
+                        || RepoRef::looks_like_repo(project_input)
+                    {
                         match resolve_project_channel(&state, project_input, &post.user_id).await {
                             Ok((proj_channel_id, channel_name, repo_ref)) => {
                                 match start_session(
@@ -1004,16 +1121,27 @@ async fn handle_messages(state: Arc<AppState>, mut rx: mpsc::Receiver<Post>, can
                                     plan_mode,
                                     thinking_mode,
                                     Some(&post.user_id),
-                                ).await {
+                                )
+                                .await
+                                {
                                     Ok(session_id) => {
-                                        let _ = state.mm.post(channel_id, &format!(
-                                            "Session `{}` started in ~{}",
-                                            &session_id[..8],
-                                            channel_name,
-                                        )).await;
+                                        let _ = state
+                                            .mm
+                                            .post(
+                                                channel_id,
+                                                &format!(
+                                                    "Session `{}` started in ~{}",
+                                                    &session_id[..8],
+                                                    channel_name,
+                                                ),
+                                            )
+                                            .await;
                                     }
                                     Err(e) => {
-                                        let _ = state.mm.post(channel_id, &format!("Failed: {}", e)).await;
+                                        let _ = state
+                                            .mm
+                                            .post(channel_id, &format!("Failed: {}", e))
+                                            .await;
                                     }
                                 }
                             }
@@ -1052,7 +1180,9 @@ async fn handle_messages(state: Arc<AppState>, mut rx: mpsc::Receiver<Post>, can
                         let mut total_sessions = 0;
 
                         for ((repo, branch), _entry) in &containers {
-                            let claimed = state.containers.stop_all_sessions_for_container(repo, branch);
+                            let claimed = state
+                                .containers
+                                .stop_all_sessions_for_container(repo, branch);
                             total_sessions += claimed.len();
 
                             // Clean up each claimed session
@@ -1068,7 +1198,11 @@ async fn handle_messages(state: Arc<AppState>, mut rx: mpsc::Receiver<Post>, can
                             }
 
                             // Tear down the container
-                            if let Err(e) = state.containers.tear_down_container(&state.db, repo, branch).await {
+                            if let Err(e) = state
+                                .containers
+                                .tear_down_container(&state.db, repo, branch)
+                                .await
+                            {
                                 tracing::warn!(repo = %repo, branch = %branch, error = %e, "Failed to tear down container");
                             }
                         }
@@ -1085,16 +1219,22 @@ async fn handle_messages(state: Arc<AppState>, mut rx: mpsc::Receiver<Post>, can
                         match state.db.get_session_by_id_prefix(short_id).await {
                             Ok(Some(session)) => {
                                 stop_session(&state, &session).await;
-                                let _ = state.mm.post(channel_id, &format!(
-                                    "Stopped session `{}`.",
-                                    &session.session_id[..8]
-                                )).await;
+                                let _ = state
+                                    .mm
+                                    .post(
+                                        channel_id,
+                                        &format!("Stopped session `{}`.", &session.session_id[..8]),
+                                    )
+                                    .await;
                             }
                             Ok(None) => {
-                                let _ = state.mm.post(channel_id, &format!(
-                                    "No session found matching `{}`.",
-                                    short_id
-                                )).await;
+                                let _ = state
+                                    .mm
+                                    .post(
+                                        channel_id,
+                                        &format!("No session found matching `{}`.", short_id),
+                                    )
+                                    .await;
                             }
                             Err(e) => {
                                 let _ = state.mm.post(channel_id, &format!("Error: {}", e)).await;
@@ -1121,9 +1261,7 @@ async fn handle_messages(state: Arc<AppState>, mut rx: mpsc::Receiver<Post>, can
                                 for ((_repo, _branch), entry) in &containers {
                                     msg.push_str(&format!(
                                         "- Container: `{}` ({}, {} sessions)\n",
-                                        entry.container_name,
-                                        entry.state,
-                                        entry.session_count,
+                                        entry.container_name, entry.state, entry.session_count,
                                     ));
                                 }
                                 msg.push('\n');
@@ -1181,13 +1319,20 @@ async fn handle_messages(state: Arc<AppState>, mut rx: mpsc::Receiver<Post>, can
                 }
 
                 // Unknown command
-                let _ = state.mm.post(channel_id, &format!(
-                    "Unknown command. Try `{} help`.",
-                    bot_trigger,
-                )).await;
+                let _ = state
+                    .mm
+                    .post(
+                        channel_id,
+                        &format!("Unknown command. Try `{} help`.", bot_trigger,),
+                    )
+                    .await;
             } else {
                 // Step 2: Non-command top-level message — route to active session in this channel
-                match state.db.get_non_worker_sessions_by_channel(channel_id).await {
+                match state
+                    .db
+                    .get_non_worker_sessions_by_channel(channel_id)
+                    .await
+                {
                     Ok(sessions) if sessions.len() == 1 => {
                         // Exactly one session — forward the message to it
                         let session = &sessions[0];
@@ -1216,33 +1361,30 @@ async fn handle_messages(state: Arc<AppState>, mut rx: mpsc::Receiver<Post>, can
     }
 }
 
-/// Flush accumulated output lines as a single Mattermost message.
-async fn flush_batch(
+/// Drain the short-term batch buffer into the LiveCard's text content.
+/// Handles overflow by finalizing the current post and starting a new one.
+async fn drain_batch_to_card(
+    card: &mut LiveCard,
     state: &AppState,
     channel_id: &str,
     thread_id: &str,
-    session_id: &str,
     batch: &mut Vec<String>,
+    batch_bytes: &mut usize,
 ) {
     if batch.is_empty() {
         return;
     }
-    let line_count = batch.len();
-    let content = batch.join("\n");
+    let chunk = batch.join("\n");
     batch.clear();
-    tracing::debug!(
-        session_id = %session_id,
-        line_count,
-        content_len = content.len(),
-        "Flushing batch to Mattermost"
-    );
-    if let Err(e) = state.mm.post_in_thread(channel_id, thread_id, &content).await {
-        tracing::warn!(
-            session_id = %session_id,
-            error = %e,
-            "Failed to post batched output to Mattermost"
-        );
+    *batch_bytes = 0;
+
+    // Overflow check: if appending would exceed limit, finalize and start new post
+    if card.has_content() && card.would_overflow(&chunk) {
+        card.flush(state, channel_id, thread_id).await;
+        card.start_new_post();
     }
+
+    card.append_text(&chunk);
 }
 
 /// Maximum batch size in bytes before flushing (14KB safety margin under Mattermost's 16KB limit)
@@ -1255,15 +1397,20 @@ const BATCH_TIMEOUT: Duration = Duration::from_millis(200);
 const CARD_UPDATE_MIN_INTERVAL: Duration = Duration::from_millis(500);
 /// Maximum number of tool lines shown in the live card before collapsing
 const CARD_MAX_TOOL_LINES: usize = 20;
+/// Maximum post size before starting a new post (safety margin under Mattermost's 16KB limit)
+const POST_MAX_BYTES: usize = 15 * 1024;
 
 /// Heartbeat interval for updating the elapsed timer on the live card
 const CARD_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 
-/// Live card state — a single updatable Mattermost post that shows processing status.
+/// Live card state — a single updatable Mattermost post that shows processing status
+/// and accumulated response text. One post per turn: header + tools + text.
 struct LiveCard {
     post_id: Option<String>,
     header: String,
     tool_lines: Vec<String>,
+    /// Accumulated text content for this turn
+    text_content: String,
     last_update: tokio::time::Instant,
     /// When processing started (for elapsed timer), cleared on finalize
     started_at: Option<tokio::time::Instant>,
@@ -1277,6 +1424,7 @@ impl LiveCard {
             post_id: None,
             header: String::new(),
             tool_lines: Vec::new(),
+            text_content: String::new(),
             last_update: tokio::time::Instant::now(),
             started_at: None,
             dirty: false,
@@ -1287,6 +1435,7 @@ impl LiveCard {
     fn start_processing(&mut self) {
         self.header = ":hourglass_flowing_sand: Processing...".to_string();
         self.tool_lines.clear();
+        self.text_content.clear();
         self.started_at = Some(tokio::time::Instant::now());
         self.dirty = true;
     }
@@ -1301,7 +1450,10 @@ impl LiveCard {
     fn finalize(&mut self, input_tokens: u64, output_tokens: u64) {
         let input_k = format_token_count(input_tokens);
         let output_k = format_token_count(output_tokens);
-        self.header = format!(":white_check_mark: Done ({} in / {} out)", input_k, output_k);
+        self.header = format!(
+            ":white_check_mark: Done ({} in / {} out)",
+            input_k, output_k
+        );
         self.started_at = None;
         self.dirty = true;
     }
@@ -1334,6 +1486,34 @@ impl LiveCard {
         }
     }
 
+    /// Append response text to the card.
+    fn append_text(&mut self, text: &str) {
+        if !self.text_content.is_empty() {
+            self.text_content.push('\n');
+        }
+        self.text_content.push_str(text);
+        self.dirty = true;
+    }
+
+    /// Check if the rendered content would exceed POST_MAX_BYTES after appending new text.
+    fn would_overflow(&self, new_text: &str) -> bool {
+        let current_len = self.render().len();
+        current_len + 1 + new_text.len() > POST_MAX_BYTES
+    }
+
+    /// Finalize current post and start fresh (for overflow).
+    fn start_new_post(&mut self) {
+        self.post_id = None;
+        self.text_content.clear();
+        self.tool_lines.clear();
+        self.dirty = true;
+    }
+
+    /// Whether the card has any content beyond the header.
+    fn has_content(&self) -> bool {
+        !self.text_content.is_empty() || !self.tool_lines.is_empty()
+    }
+
     /// Render the card as a single markdown string.
     fn render(&self) -> String {
         let mut parts = Vec::with_capacity(2 + self.tool_lines.len());
@@ -1356,6 +1536,11 @@ impl LiveCard {
             }
         }
 
+        if !self.text_content.is_empty() {
+            parts.push(String::new()); // blank line separator
+            parts.push(self.text_content.clone());
+        }
+
         parts.join("\n")
     }
 
@@ -1374,7 +1559,9 @@ impl LiveCard {
             let _ = state.mm.update_post(post_id, &msg).await;
         } else {
             match state.mm.post_in_thread(channel_id, thread_id, &msg).await {
-                Ok(post_id) => { self.post_id = Some(post_id); }
+                Ok(post_id) => {
+                    self.post_id = Some(post_id);
+                }
                 Err(e) => {
                     tracing::warn!(error = %e, "Failed to create live card post");
                 }
@@ -1422,9 +1609,9 @@ async fn stream_output(
         tokio::select! {
             event_opt = rx.recv() => {
                 let Some(event) = event_opt else {
-                    // Channel closed — flush remaining batch and card, then exit
+                    // Channel closed — drain remaining batch into card and flush
                     tracing::info!(session_id = %session_id, batch_len = batch.len(), "stream_output: channel closed, flushing");
-                    flush_batch(&state, &channel_id, &thread_id, &session_id, &mut batch).await;
+                    drain_batch_to_card(&mut card, &state, &channel_id, &thread_id, &mut batch, &mut batch_bytes).await;
                     card.flush(&state, &channel_id, &thread_id).await;
                     break;
                 };
@@ -1441,8 +1628,7 @@ async fn stream_output(
                         state.liveness.update_activity(&session_id, "TextLine");
                         // Check for network request markers
                         if let Some(caps) = network_re.captures(&line) {
-                            flush_batch(&state, &channel_id, &thread_id, &session_id, &mut batch).await;
-                            batch_bytes = 0;
+                            drain_batch_to_card(&mut card, &state, &channel_id, &thread_id, &mut batch, &mut batch_bytes).await;
                             let domain = caps[1].trim();
                             handle_network_request(&state, &channel_id, &thread_id, &session_id, domain).await;
                             continue;
@@ -1452,10 +1638,9 @@ async fn stream_output(
                         batch_bytes += line.len() + 1; // +1 for newline separator
                         batch.push(line);
 
-                        // Flush if batch exceeds size or line limits
+                        // Drain if batch exceeds size or line limits
                         if batch_bytes >= BATCH_MAX_BYTES || batch.len() >= BATCH_MAX_LINES {
-                            flush_batch(&state, &channel_id, &thread_id, &session_id, &mut batch).await;
-                            batch_bytes = 0;
+                            drain_batch_to_card(&mut card, &state, &channel_id, &thread_id, &mut batch, &mut batch_bytes).await;
                         }
 
                         // Reset timer on each new line
@@ -1464,10 +1649,8 @@ async fn stream_output(
                     OutputEvent::ToolAction(action) => {
                         state.liveness.update_activity(&session_id, "ToolAction");
                         tracing::info!(session_id = %session_id, action = %action, "stream_output: ToolAction");
-                        // Flush any accumulated text batch before updating card
-                        flush_batch(&state, &channel_id, &thread_id, &session_id, &mut batch).await;
-                        batch_bytes = 0;
-                        // Append tool action to the live card
+                        // Drain any accumulated text into card before adding tool
+                        drain_batch_to_card(&mut card, &state, &channel_id, &thread_id, &mut batch, &mut batch_bytes).await;
                         card.add_tool_action(&action);
                         if card.can_update_now() {
                             card.flush(&state, &channel_id, &thread_id).await;
@@ -1475,8 +1658,7 @@ async fn stream_output(
                     }
                     OutputEvent::TitleGenerated(title) => {
                         state.liveness.update_activity(&session_id, "TitleGenerated");
-                        flush_batch(&state, &channel_id, &thread_id, &session_id, &mut batch).await;
-                        batch_bytes = 0;
+                        drain_batch_to_card(&mut card, &state, &channel_id, &thread_id, &mut batch, &mut batch_bytes).await;
                         let title = title.trim().trim_matches('"');
                         let label = format_root_label(&session_type, &project);
                         let _ = state.mm.update_post(&thread_id, &format!("{} — {}", label, title)).await;
@@ -1490,9 +1672,8 @@ async fn stream_output(
                             batch_len = batch.len(),
                             "stream_output: ResponseComplete"
                         );
-                        // Flush remaining text, then finalize the card
-                        flush_batch(&state, &channel_id, &thread_id, &session_id, &mut batch).await;
-                        batch_bytes = 0;
+                        // Drain remaining text into card, finalize, and flush
+                        drain_batch_to_card(&mut card, &state, &channel_id, &thread_id, &mut batch, &mut batch_bytes).await;
 
                         card.finalize(input_tokens, output_tokens);
                         card.flush(&state, &channel_id, &thread_id).await;
@@ -1514,8 +1695,7 @@ async fn stream_output(
                     }
                     OutputEvent::ProcessDied { exit_code, signal } => {
                         tracing::warn!(session_id = %session_id, ?exit_code, ?signal, "stream_output: ProcessDied");
-                        flush_batch(&state, &channel_id, &thread_id, &session_id, &mut batch).await;
-                        batch_bytes = 0;
+                        drain_batch_to_card(&mut card, &state, &channel_id, &thread_id, &mut batch, &mut batch_bytes).await;
 
                         card.finalize_error(exit_code, &signal);
                         card.flush(&state, &channel_id, &thread_id).await;
@@ -1524,14 +1704,12 @@ async fn stream_output(
                 }
             }
             _ = &mut batch_timer => {
-                // Timer expired — flush accumulated text batch and any dirty card updates
+                // Timer expired — drain accumulated text into card and flush
                 if !batch.is_empty() {
                     tracing::debug!(session_id = %session_id, batch_len = batch.len(), "stream_output: timer flush");
                 }
-                flush_batch(&state, &channel_id, &thread_id, &session_id, &mut batch).await;
-                batch_bytes = 0;
-                // Also flush any pending card updates that were throttled
-                if card.dirty {
+                drain_batch_to_card(&mut card, &state, &channel_id, &thread_id, &mut batch, &mut batch_bytes).await;
+                if card.dirty && card.can_update_now() {
                     card.flush(&state, &channel_id, &thread_id).await;
                 }
                 // Reset timer
@@ -1558,7 +1736,11 @@ async fn stream_output(
         channel_id = %channel_id,
         "Session stream ended"
     );
-    if let Err(e) = state.mm.post_in_thread(&channel_id, &thread_id, "Session ended.").await {
+    if let Err(e) = state
+        .mm
+        .post_in_thread(&channel_id, &thread_id, "Session ended.")
+        .await
+    {
         tracing::warn!(error = %e, "Failed to post session end message");
     }
 }
@@ -1573,7 +1755,11 @@ async fn handle_network_request(
     let start_time = std::time::Instant::now();
 
     // Deduplicate: check for existing pending request for same domain in session
-    match state.db.get_pending_request_by_domain_and_session(domain, session_id).await {
+    match state
+        .db
+        .get_pending_request_by_domain_and_session(domain, session_id)
+        .await
+    {
         Ok(Some(existing)) => {
             tracing::debug!(
                 domain = %domain,
@@ -1642,16 +1828,24 @@ async fn handle_network_request(
         }]
     });
 
-    match state.mm.post_with_props(channel_id, thread_id, "", props).await {
+    match state
+        .mm
+        .post_with_props(channel_id, thread_id, "", props)
+        .await
+    {
         Ok(post_id) => {
-            if let Err(e) = state.db.create_pending_request(
-                &request_id,
-                channel_id,
-                thread_id,
-                session_id,
-                domain,
-                &post_id,
-            ).await {
+            if let Err(e) = state
+                .db
+                .create_pending_request(
+                    &request_id,
+                    channel_id,
+                    thread_id,
+                    session_id,
+                    domain,
+                    &post_id,
+                )
+                .await
+            {
                 tracing::error!("Failed to persist pending request: {}", e);
             }
         }
@@ -1691,7 +1885,9 @@ async fn handle_callback(
     if !verify_signature(&s.callback_secret, request_id, action, signature) {
         tracing::warn!(
             "Invalid signature for request_id={} action={} from user={}",
-            request_id, action, payload.user_name
+            request_id,
+            action,
+            payload.user_name
         );
         return Json(CallbackResponse {
             ephemeral_text: Some("Invalid signature. Request rejected.".into()),
@@ -1723,13 +1919,31 @@ async fn handle_callback(
                 if let Err(e) = state.db.delete_pending_request(request_id).await {
                     tracing::error!("Failed to delete pending request: {}", e);
                 }
-                if let Err(e) = state.db.log_approval(request_id, &req.domain, action, &payload.user_name).await {
+                if let Err(e) = state
+                    .db
+                    .log_approval(request_id, &req.domain, action, &payload.user_name)
+                    .await
+                {
                     tracing::error!("Failed to log approval: {}", e);
                 }
-                if let Err(e) = state.mm.update_post(&req.post_id, &format!("`{}` approved by @{}", req.domain, payload.user_name)).await {
+                if let Err(e) = state
+                    .mm
+                    .update_post(
+                        &req.post_id,
+                        &format!("`{}` approved by @{}", req.domain, payload.user_name),
+                    )
+                    .await
+                {
                     tracing::warn!(error = %e, "Failed to update Mattermost post");
                 }
-                if let Err(e) = state.containers.send(&req.session_id, &format!("[NETWORK_APPROVED: {}]", req.domain)).await {
+                if let Err(e) = state
+                    .containers
+                    .send(
+                        &req.session_id,
+                        &format!("[NETWORK_APPROVED: {}]", req.domain),
+                    )
+                    .await
+                {
                     tracing::warn!(error = %e, "Failed to notify container");
                 }
                 counter!("approvals_total", "action" => "approve").increment(1);
@@ -1749,7 +1963,10 @@ async fn handle_callback(
                     "Failed to add domain to OPNsense - request NOT approved"
                 );
                 return Json(CallbackResponse {
-                    ephemeral_text: Some(format!("Failed to add domain to firewall: {}. Please try again.", e)),
+                    ephemeral_text: Some(format!(
+                        "Failed to add domain to firewall: {}. Please try again.",
+                        e
+                    )),
                     update: None,
                 });
             }
@@ -1758,13 +1975,31 @@ async fn handle_callback(
         if let Err(e) = state.db.delete_pending_request(request_id).await {
             tracing::error!("Failed to delete pending request: {}", e);
         }
-        if let Err(e) = state.db.log_approval(request_id, &req.domain, action, &payload.user_name).await {
+        if let Err(e) = state
+            .db
+            .log_approval(request_id, &req.domain, action, &payload.user_name)
+            .await
+        {
             tracing::error!("Failed to log denial: {}", e);
         }
-        if let Err(e) = state.mm.update_post(&req.post_id, &format!("`{}` denied by @{}", req.domain, payload.user_name)).await {
+        if let Err(e) = state
+            .mm
+            .update_post(
+                &req.post_id,
+                &format!("`{}` denied by @{}", req.domain, payload.user_name),
+            )
+            .await
+        {
             tracing::warn!(error = %e, "Failed to update Mattermost post");
         }
-        if let Err(e) = state.containers.send(&req.session_id, &format!("[NETWORK_DENIED: {}]", req.domain)).await {
+        if let Err(e) = state
+            .containers
+            .send(
+                &req.session_id,
+                &format!("[NETWORK_DENIED: {}]", req.domain),
+            )
+            .await
+        {
             tracing::warn!(error = %e, "Failed to notify container");
         }
         counter!("approvals_total", "action" => "deny").increment(1);
@@ -1785,4 +2020,3 @@ async fn handle_callback(
         update: Some(serde_json::json!({ "message": "" })),
     })
 }
-

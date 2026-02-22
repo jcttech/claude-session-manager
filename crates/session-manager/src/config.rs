@@ -105,38 +105,77 @@ pub struct Settings {
     #[serde(default = "default_container_idle_timeout_secs")]
     pub container_idle_timeout_secs: u64,
 
-    /// Seconds of inactivity before posting a liveness warning in the thread (0 = disabled)
-    #[serde(default = "default_session_liveness_timeout_secs")]
-    pub session_liveness_timeout_secs: u64,
-
     /// Starting port number for gRPC agent worker connections
     #[serde(default = "default_grpc_port_start")]
     pub grpc_port_start: u16,
 }
 
-fn default_vm_user() -> String { "claude".into() }
-fn default_ssh_key_path() -> String { "/secrets/ssh/id_ed25519".into() }
-fn default_container_runtime() -> String { "podman".into() }
-fn default_container_image() -> String { "claude-code:latest".into() }
-fn default_container_network() -> String { "isolated".into() }
-fn default_devcontainer_timeout_secs() -> u64 { 120 }
-fn default_channel_category() -> String { "CLAUDE-SESSIONS".into() }
-fn default_opnsense_alias() -> String { "llm_approved_domains".into() }
-fn default_opnsense_verify_tls() -> bool { true }
-fn default_opnsense_timeout() -> u64 { 30 }
-fn default_callback_url() -> String { "http://session-manager:8000/callback".into() }
-fn default_listen_addr() -> String { "0.0.0.0:8000".into() }
-fn default_bot_trigger() -> String { "@claude".into() }
-fn default_rate_limit_rps() -> u64 { 10 }
-fn default_rate_limit_burst() -> u32 { 20 }
-fn default_database_pool_size() -> u32 { 5 }
-fn default_ssh_timeout_secs() -> u64 { 30 }
-fn default_repos_base_path() -> String { "/home/claude/repos".into() }
-fn default_worktrees_path() -> String { "/home/claude/worktrees".into() }
-fn default_container_max_sessions() -> i32 { 5 }
-fn default_container_idle_timeout_secs() -> u64 { 1800 }
-fn default_session_liveness_timeout_secs() -> u64 { 120 }
-fn default_grpc_port_start() -> u16 { 50051 }
+fn default_vm_user() -> String {
+    "claude".into()
+}
+fn default_ssh_key_path() -> String {
+    "/secrets/ssh/id_ed25519".into()
+}
+fn default_container_runtime() -> String {
+    "podman".into()
+}
+fn default_container_image() -> String {
+    "claude-code:latest".into()
+}
+fn default_container_network() -> String {
+    "isolated".into()
+}
+fn default_devcontainer_timeout_secs() -> u64 {
+    120
+}
+fn default_channel_category() -> String {
+    "CLAUDE-SESSIONS".into()
+}
+fn default_opnsense_alias() -> String {
+    "llm_approved_domains".into()
+}
+fn default_opnsense_verify_tls() -> bool {
+    true
+}
+fn default_opnsense_timeout() -> u64 {
+    30
+}
+fn default_callback_url() -> String {
+    "http://session-manager:8000/callback".into()
+}
+fn default_listen_addr() -> String {
+    "0.0.0.0:8000".into()
+}
+fn default_bot_trigger() -> String {
+    "@claude".into()
+}
+fn default_rate_limit_rps() -> u64 {
+    10
+}
+fn default_rate_limit_burst() -> u32 {
+    20
+}
+fn default_database_pool_size() -> u32 {
+    5
+}
+fn default_ssh_timeout_secs() -> u64 {
+    30
+}
+fn default_repos_base_path() -> String {
+    "/home/claude/repos".into()
+}
+fn default_worktrees_path() -> String {
+    "/home/claude/worktrees".into()
+}
+fn default_container_max_sessions() -> i32 {
+    5
+}
+fn default_container_idle_timeout_secs() -> u64 {
+    1800
+}
+fn default_grpc_port_start() -> u16 {
+    50051
+}
 
 static SETTINGS: OnceLock<Settings> = OnceLock::new();
 
