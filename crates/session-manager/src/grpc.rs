@@ -47,11 +47,13 @@ impl GrpcExecutor {
     pub async fn open_session(&mut self) -> Result<GrpcSession> {
         let (tx, rx) = mpsc::channel(16);
         let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+        tracing::debug!("gRPC: Sending Session RPC (waiting for response headers)");
         let response = self
             .client
             .session(stream)
             .await
             .map_err(|e| anyhow!("Session RPC failed: {}", e))?;
+        tracing::debug!("gRPC: Session RPC connected (response headers received)");
         Ok(GrpcSession {
             request_tx: tx,
             response_stream: response.into_inner(),

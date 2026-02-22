@@ -642,13 +642,24 @@ async fn message_processor(
         }
     };
 
-    let mut session = match executor.open_session().await {
-        Ok(s) => s,
-        Err(e) => {
+    let mut session = match tokio::time::timeout(
+        Duration::from_secs(30),
+        executor.open_session(),
+    ).await {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => {
             tracing::error!(session_id = %session_id, error = %e, "Failed to open gRPC session");
             let _ = output_tx.send(OutputEvent::ProcessDied {
                 exit_code: Some(1),
                 signal: Some(format!("Failed to open gRPC session: {}", e)),
+            }).await;
+            return;
+        }
+        Err(_) => {
+            tracing::error!(session_id = %session_id, "gRPC open_session timed out after 30s (handshake deadlock?)");
+            let _ = output_tx.send(OutputEvent::ProcessDied {
+                exit_code: Some(1),
+                signal: Some("gRPC session handshake timed out after 30s".to_string()),
             }).await;
             return;
         }

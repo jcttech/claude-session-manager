@@ -114,6 +114,12 @@ class AgentWorkerServicer(agent_pb2_grpc.AgentWorkerServicer):
         # doesn't block waiting for response headers (avoids deadlock).
         await context.send_initial_metadata(())
 
+        # grpcio buffers response headers until the first message is yielded.
+        # Yield an empty AgentEvent to force header flush over the wire.
+        # The Rust client skips events with no variant (process_turn_events line 145-148).
+        logger.debug("Session: yielding handshake event to flush headers")
+        yield agent_pb2.AgentEvent()
+
         client = None
         session_id = None
         events_yielded = 0
