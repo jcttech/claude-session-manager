@@ -44,86 +44,87 @@ class AgentWorkerServicer(agent_pb2_grpc.AgentWorkerServicer):
     def __init__(self) -> None:
         self.sessions = SessionManager()
 
-    async def _iter_sdk_messages(self, messages, start_time: float):
+    async def _iter_sdk_messages(self, msg_iter, start_time: float):
         """Shared async generator that iterates SDK messages and yields AgentEvents.
 
         Handles all message types (SystemMessage, AssistantMessage, ResultMessage,
         StreamEvent, UserMessage) and the parse-failure fix for ResultMessage.
+
+        The caller passes the long-lived async iterator (msg_iter) which persists
+        across conversation turns. This generator returns (not closes) on
+        ResultMessage, leaving msg_iter paused for the next turn.
         """
-        msg_iter = messages.__aiter__()
-        try:
-            while True:
-                try:
-                    message = await msg_iter.__anext__()
-                except StopAsyncIteration:
-                    break
-                except Exception as parse_exc:
-                    exc_str = str(parse_exc)
-                    if "rate_limit_event" in exc_str:
-                        logger.info("Rate limit event received: %s", parse_exc)
-                        try:
-                            from claude_agent_sdk._errors import MessageParseError
-                            raw_data = getattr(parse_exc, 'data', None)
-                            if isinstance(parse_exc, MessageParseError) and isinstance(raw_data, dict):
-                                logger.info("Rate limit details: %s", raw_data)
-                        except ImportError:
-                            pass
-                    else:
-                        logger.warning("Skipping unparseable message: %s", parse_exc)
-                        # Check if this is a ResultMessage parse failure — if so, force exit
-                        try:
-                            from claude_agent_sdk._errors import MessageParseError
-                            raw_data = getattr(parse_exc, 'data', None)
-                            if isinstance(parse_exc, MessageParseError) and isinstance(raw_data, dict):
-                                if raw_data.get("type") == "result":
-                                    logger.error(
-                                        "ResultMessage parse failed — forcing exit: %s",
-                                        parse_exc,
-                                    )
-                                    yield fallback_result_event(raw_data, start_time)
-                                    return
-                        except ImportError:
-                            pass
-                    continue
-
-                msg_type = type(message).__name__
-                if isinstance(message, SystemMessage):
-                    logger.debug("received SystemMessage (subtype=%s)", message.subtype)
-                    event = map_system_message(message)
-                    if event is not None:
-                        yield event
-
-                elif isinstance(message, AssistantMessage):
-                    block_count = len(message.content) if hasattr(message, 'content') else 0
-                    logger.debug("received AssistantMessage (%d blocks)", block_count)
-                    for event in map_assistant_message(message):
-                        yield event
-
-                elif isinstance(message, ResultMessage):
-                    logger.info("received ResultMessage (session=%s, turns=%s)",
-                                getattr(message, 'session_id', '?'),
-                                getattr(message, 'num_turns', '?'))
-                    yield map_result_message(message, start_time)
-                    return  # ResultMessage terminates the turn
-
-                elif isinstance(message, StreamEvent):
-                    raw = message.event or {}
-                    event_type = raw.get("type", "unknown")
-                    logger.debug("received StreamEvent (%s)", event_type)
-                    event = map_stream_event(message)
-                    if event is not None:
-                        yield event
-
-                elif isinstance(message, UserMessage):
-                    pass  # Tool results flowing back — not surfaced to chat
-
+        while True:
+            try:
+                message = await msg_iter.__anext__()
+            except StopAsyncIteration:
+                break
+            except Exception as parse_exc:
+                exc_str = str(parse_exc)
+                if "rate_limit_event" in exc_str:
+                    logger.info("Rate limit event received: %s", parse_exc)
+                    try:
+                        from claude_agent_sdk._errors import MessageParseError
+                        raw_data = getattr(parse_exc, 'data', None)
+                        if isinstance(parse_exc, MessageParseError) and isinstance(raw_data, dict):
+                            logger.info("Rate limit details: %s", raw_data)
+                    except ImportError:
+                        pass
                 else:
-                    logger.warning("Unhandled message type: %s", msg_type)
-        finally:
-            # Close the underlying SDK iterator to release the _message_receive channel.
-            # Without this, a dangling iterator blocks the follow-up turn.
-            if hasattr(msg_iter, 'aclose'):
-                await msg_iter.aclose()
+                    logger.warning("Skipping unparseable message: %s", parse_exc)
+                    # Check if this is a ResultMessage parse failure — if so, force exit
+                    try:
+                        from claude_agent_sdk._errors import MessageParseError
+                        raw_data = getattr(parse_exc, 'data', None)
+                        if isinstance(parse_exc, MessageParseError) and isinstance(raw_data, dict):
+                            if raw_data.get("type") == "result":
+                                logger.error(
+                                    "ResultMessage parse failed — forcing exit: %s",
+                                    parse_exc,
+                                )
+                                yield fallback_result_event(raw_data, start_time)
+                                return
+                    except ImportError:
+                        pass
+                continue
+
+            msg_type = type(message).__name__
+            if isinstance(message, SystemMessage):
+                logger.debug("received SystemMessage (subtype=%s)", message.subtype)
+                event = map_system_message(message)
+                if event is not None:
+                    yield event
+
+            elif isinstance(message, AssistantMessage):
+                block_count = len(message.content) if hasattr(message, 'content') else 0
+                logger.debug("received AssistantMessage (%d blocks)", block_count)
+                for event in map_assistant_message(message):
+                    # Skip text events — already delivered via StreamEvent partials.
+                    # Only forward tool_use and tool_result events (which carry
+                    # full input_json not available in streaming deltas).
+                    if not event.HasField("text"):
+                        yield event
+
+            elif isinstance(message, ResultMessage):
+                logger.info("received ResultMessage (session=%s, turns=%s)",
+                            getattr(message, 'session_id', '?'),
+                            getattr(message, 'num_turns', '?'))
+                yield map_result_message(message, start_time)
+                return  # ResultMessage terminates the turn
+
+            elif isinstance(message, StreamEvent):
+                raw = message.event or {}
+                event_type = raw.get("type", "unknown")
+                logger.debug("received StreamEvent (%s)", event_type)
+                event = map_stream_event(message)
+                if event is not None:
+                    yield event
+
+            elif isinstance(message, UserMessage):
+                pass  # Tool results flowing back — not surfaced to chat
+
+            else:
+                logger.warning("Unhandled message type: %s", msg_type)
 
     async def Session(self, request_iterator, context):
         """Bidirectional streaming: one gRPC stream = one SDK session lifecycle."""
@@ -140,6 +141,7 @@ class AgentWorkerServicer(agent_pb2_grpc.AgentWorkerServicer):
         client = None
         session_id = None
         events_yielded = 0
+        msg_stream = None  # Long-lived SDK message iterator (persists across turns)
 
         try:
             async for request in request_iterator:
@@ -159,8 +161,8 @@ class AgentWorkerServicer(agent_pb2_grpc.AgentWorkerServicer):
                         max_turns=req.max_turns or None,
                         max_thinking_tokens=req.max_thinking_tokens or None,
                     )
-                    msgs = client.receive_messages()
-                    async for event in self._iter_sdk_messages(msgs, turn_start):
+                    msg_stream = client.receive_messages().__aiter__()
+                    async for event in self._iter_sdk_messages(msg_stream, turn_start):
                         events_yielded += 1
                         if event.HasField("session_init"):
                             session_id = event.session_init.session_id
@@ -170,12 +172,13 @@ class AgentWorkerServicer(agent_pb2_grpc.AgentWorkerServicer):
                 elif input_type == "follow_up":
                     logger.info("Session: follow_up prompt=%s...",
                                 request.follow_up.prompt[:80])
-                    if client is None:
+                    if client is None or msg_stream is None:
                         yield error_event("No session created yet", "no_session")
                         continue
                     await client.query(request.follow_up.prompt)
-                    msgs = client.receive_response()
-                    async for event in self._iter_sdk_messages(msgs, turn_start):
+                    # Reuse the same msg_stream — don't create a new iterator.
+                    # The SDK pushes new messages into the same anyio channel.
+                    async for event in self._iter_sdk_messages(msg_stream, turn_start):
                         events_yielded += 1
                         yield event
 

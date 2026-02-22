@@ -32,7 +32,6 @@ impl GrpcExecutor {
         let channel = Channel::from_shared(addr.to_string())
             .map_err(|e| anyhow!("Invalid gRPC address '{}': {}", addr, e))?
             .connect_timeout(Duration::from_secs(5))
-            .timeout(Duration::from_secs(600)) // 10 min max per RPC
             .connect()
             .await
             .map_err(|e| anyhow!("Failed to connect to worker at {}: {}", addr, e))?;
