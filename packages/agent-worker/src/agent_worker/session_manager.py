@@ -42,6 +42,7 @@ class SessionManager:
             max_turns=max_turns,
             include_partial_messages=True,
             max_thinking_tokens=max_thinking_tokens or None,
+            disallowed_tools=["AskUserQuestion"],
         )
 
         client = ClaudeSDKClient(options)

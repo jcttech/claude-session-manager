@@ -1479,10 +1479,31 @@ impl LiveCard {
     fn finalize(&mut self, input_tokens: u64, output_tokens: u64) {
         let input_k = format_token_count(input_tokens);
         let output_k = format_token_count(output_tokens);
-        self.header = format!(
-            ":white_check_mark: Done ({} in / {} out · {})",
-            input_k, output_k, format_ctx_suffix(input_tokens)
-        );
+
+        // Check if response ends with a question — indicates Claude is waiting for user input
+        let is_question = self
+            .text_content
+            .lines()
+            .rev()
+            .find(|line| !line.trim().is_empty())
+            .map(|line| line.trim_end().ends_with('?'))
+            .unwrap_or(false);
+
+        self.header = if is_question {
+            format!(
+                ":speech_balloon: Awaiting reply ({} in / {} out · {})",
+                input_k,
+                output_k,
+                format_ctx_suffix(input_tokens)
+            )
+        } else {
+            format!(
+                ":white_check_mark: Done ({} in / {} out · {})",
+                input_k,
+                output_k,
+                format_ctx_suffix(input_tokens)
+            )
+        };
         self.last_input_tokens = input_tokens;
         self.started_at = None;
         self.dirty = true;
