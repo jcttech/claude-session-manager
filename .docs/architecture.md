@@ -30,7 +30,7 @@ Session Manager (Rust/K8s)              VM with Devcontainers
 ```
 claude-session-manager/
 ├── crates/                          ← Rust workspace
-│   ├── session-manager/             ← Main gateway application (~5,800 lines)
+│   ├── session-manager/             ← Main gateway application (~8,000 lines)
 │   ├── mattermost-client/           ← Mattermost WebSocket + REST (~600 lines)
 │   ├── common/                      ← Shared crypto, rate limiting (~500 lines)
 │   ├── graph-client/                ← Microsoft Graph (stub)
@@ -57,7 +57,7 @@ claude-session-manager/
 
 | Crate | Purpose | Lines |
 |-------|---------|-------|
-| **session-manager** | Main application: HTTP server, session lifecycle, gRPC client | ~5,800 |
+| **session-manager** | Main application: HTTP server, session lifecycle, gRPC client | ~8,000 |
 | **mattermost-client** | WebSocket listener + HTTP REST API client for Mattermost | ~600 |
 | **common** | Shared utilities: HMAC-SHA256 crypto, rate limiting middleware | ~500 |
 | **graph-client** | Microsoft Graph API client (stub, future use) | ~1 |
@@ -73,12 +73,12 @@ claude-session-manager/
 
 | Module | File | Lines | Responsibility |
 |--------|------|-------|----------------|
-| **HTTP Server & Router** | `main.rs` | 1,650 | Axum server, Mattermost command routing, stream output batching, Prometheus metrics |
-| **Session Lifecycle** | `container.rs` | 602 | Session creation/teardown, gRPC connection per container, message_processor task |
+| **HTTP Server & Router** | `main.rs` | 1,788 | Axum server, Mattermost command routing, stream output batching, Prometheus metrics |
+| **Session Lifecycle** | `container.rs` | 724 | Session creation/teardown, gRPC connection per container, message_processor task |
 | **Database** | `database.rs` | 691 | PostgreSQL ORM via sqlx: sessions, containers, pending requests, audit logs |
 | **Git Operations** | `git.rs` | 454 | Repo cloning, worktree management, `RepoRef` parsing (`org/repo@branch`) |
 | **Container Registry** | `container_registry.rs` | 409 | In-memory `RwLock<HashMap>` of running containers, keyed by `(repo, branch)` |
-| **gRPC Client** | `grpc.rs` | 305 | tonic client mapping `AgentEvent` stream → `OutputEvent` enum |
+| **gRPC Client** | `grpc.rs` | 377 | tonic client: bidirectional Session stream, `AgentEvent` → `OutputEvent` mapping |
 | **Devcontainer** | `devcontainer.rs` | 299 | devcontainer.json parsing (JSONC), auto-generation with gRPC worker config |
 | **Idle Monitor** | `idle_monitor.rs` | 272 | Periodic container teardown when no active sessions |
 | **Liveness Monitor** | `liveness.rs` | 263 | Per-session activity tracking via DashMap, stale session warnings |
@@ -91,9 +91,9 @@ claude-session-manager/
 
 | Module | File | Lines | Responsibility |
 |--------|------|-------|----------------|
-| **gRPC Server** | `server.py` | 177 | `AgentWorkerServicer` implementing Execute, SendMessage, Interrupt, Health RPCs |
-| **Event Mapper** | `event_mapper.py` | 136 | Maps SDK message types → protobuf `AgentEvent` messages |
-| **Session Manager** | `session_manager.py` | 83 | Manages `ClaudeSDKClient` instances keyed by session_id |
+| **gRPC Server** | `server.py` | 254 | `AgentWorkerServicer` implementing Session (bidirectional), Interrupt, Health RPCs |
+| **Event Mapper** | `event_mapper.py` | 178 | Maps SDK message types → protobuf `AgentEvent` messages |
+| **Session Manager** | `session_manager.py` | 89 | Manages `ClaudeSDKClient` instances keyed by session_id |
 
 ### External Integrations
 
@@ -112,24 +112,141 @@ claude-session-manager/
 
 The `proto/agent.proto` defines the communication contract between the Rust gateway and Python worker:
 
-| RPC | Direction | Purpose |
-|-----|-----------|---------|
-| **Execute** | Gateway → Worker (server stream) | Start new session, stream `AgentEvent`s back |
-| **SendMessage** | Gateway → Worker (server stream) | Continue existing session, stream response events |
-| **Interrupt** | Gateway → Worker (unary) | Interrupt a running session |
-| **Health** | Gateway → Worker (unary) | Check worker readiness after container start |
+| RPC | Type | Purpose |
+|-----|------|---------|
+| **Session** | Bidirectional stream (`stream SessionInput → stream AgentEvent`) | One stream = one SDK session lifecycle. First message is `CreateSession`, subsequent are `FollowUp` |
+| **Interrupt** | Unary | Interrupt a running session by session_id |
+| **Health** | Unary | Check worker readiness after container start |
+
+`SessionInput` is a `oneof { CreateSession, FollowUp }` — the first message on the stream must be `CreateSession` (with prompt, permission_mode, env, etc.), and all subsequent messages are `FollowUp` (prompt only).
 
 ### AgentEvent Types
 
 | Event | Maps to OutputEvent | Purpose |
 |-------|---------------------|---------|
 | `SessionInit` | _(captured internally)_ | Provides session_id for follow-up messages |
-| `TextContent` | `TextLine` | Response text from Claude |
+| `TextContent` | `TextLine` | Response text from Claude (partial streaming or complete) |
 | `ToolUse` | `ToolAction` | Tool invocation (Read, Bash, Edit, etc.) |
 | `ToolResult` | _(not surfaced)_ | Tool execution result (informational) |
 | `SubagentEvent` | _(logged)_ | Subagent start/finish (native SDK feature) |
-| `SessionResult` | `ResponseComplete` / `ProcessDied` | Final result with token usage |
-| `AgentError` | `ProcessDied` | Error with type and message |
+| `SessionResult` | `ResponseComplete` / `ProcessDied` | Final result with token usage — terminates one turn |
+| `AgentError` | `ProcessDied` | Error with type and message — terminates the turn |
+
+## gRPC Bidirectional Stream Architecture
+
+The system uses a single long-lived gRPC bidirectional stream per session. Understanding this architecture is critical for diagnosing session and message hangs.
+
+### Stream Setup (Handshake)
+
+```
+Rust (container.rs)                          Python (server.py)
+─────────────────                          ──────────────────
+1. open_stream():
+   tx, rx = mpsc::channel(16)
+   stream = ReceiverStream::new(rx)
+   client.session(stream)  ──────────────►  Session() handler starts
+        │                                    │
+        │  (blocks waiting for               2. send_initial_metadata(())
+        │   response headers)                3. yield AgentEvent()  ← empty, no variant
+        │                                    │  (forces grpcio to flush HTTP/2 headers)
+        ◄────────────────────────────────────┘
+4. Headers received!
+   GrpcStream { request_tx, response_stream }
+   │
+   process_turn_events() skips empty events (no variant)
+```
+
+**Why the handshake exists:** Without it, `client.session(stream)` blocks indefinitely because grpcio buffers response headers until the first message is yielded. The empty `AgentEvent` forces the header flush. The Rust side (`process_turn_events`) skips events with no variant set.
+
+### Turn 1 (CreateSession)
+
+```
+Rust message_processor                       Python Session handler
+───────────────────                          ──────────────────────
+1. message_rx.recv() → user message
+2. stream.create(prompt, ...) ────────────► async for request in request_iterator:
+        │                                      input_type == "create"
+        │                                    3. SessionManager.create_session()
+        │                                       → ClaudeSDKClient.connect() + .query(prompt)
+        │                                    4. msg_stream = client._query.receive_messages().__aiter__()
+        │                                       (long-lived iterator — persists across turns)
+        │                                    5. _iter_sdk_messages(msg_stream):
+        │                                       raw_data = await msg_stream.__anext__()
+        │                                       parse_message(raw_data) → typed message
+        │                                       map to AgentEvent → yield
+        │                                           │
+        ◄───────────────────────────────────────────┘  (AgentEvent stream)
+3. process_turn_events():                    6. On ResultMessage:
+   SessionInit → capture session_id             yield map_result_message()
+   TextContent → OutputEvent::TextLine          return  ← (not break! leaves msg_stream paused)
+   ToolUse → OutputEvent::ToolAction
+   SessionResult → return Ok(session_id)
+        │
+   Stream stays open. is_first_message = false.
+```
+
+### Turn 2+ (FollowUp)
+
+```
+Rust message_processor                       Python Session handler
+───────────────────                          ──────────────────────
+1. message_rx.recv() → next user message
+2. stream.follow_up(prompt) ──────────────► request_iterator yields next request
+        │                                      input_type == "follow_up"
+        │                                    3. await client.query(prompt)
+        │                                       (SDK pushes new messages into same anyio channel)
+        │                                    4. Reuses same msg_stream — resumes from where it paused
+        │                                       _iter_sdk_messages(msg_stream): same flow as Turn 1
+        │                                           │
+        ◄───────────────────────────────────────────┘  (AgentEvent stream)
+3. process_turn_events(): same as Turn 1
+```
+
+**Key insight:** The SDK's `receive_messages()` returns an async iterator over an anyio `MemoryObjectReceiveStream`. When `_iter_sdk_messages()` encounters a `ResultMessage`, it `return`s (not `break`s), leaving the underlying `msg_stream` paused mid-iteration. On the next turn, `client.query()` pushes new messages into the same anyio channel, and the same iterator resumes.
+
+### Stream Teardown
+
+When the Rust side drops `request_tx` (session stop, processor exit, or error), the Python `async for request in request_iterator` loop ends. The `finally` block calls `sessions.remove(session_id)` → `client.disconnect()`, cleaning up the SDK client and anyio task group.
+
+### Message Flow: Stdin/Stdout Mental Model
+
+```
+┌─ Mattermost (stdin) ─────────────────────────────────────────────┐
+│ User message in thread                                            │
+│       ↓                                                           │
+│ WebSocket → handle_messages() → session.message_tx.send(msg)      │
+│       ↓                                                           │
+│ message_processor: CreateSession|FollowUp → gRPC request_tx       │
+└───────────────────────────────┬───────────────────────────────────┘
+                                │ gRPC bidirectional stream
+                                ▼
+┌─ Agent Worker (claude process) ───────────────────────────────────┐
+│ request_iterator receives → SessionManager creates ClaudeSDKClient│
+│       ↓                                                           │
+│ client.query(prompt) ──→ SDK stdin (stream-json to claude process) │
+│       ↓                                                           │
+│ msg_stream iterates SDK stdout ──→ map to AgentEvent ──→ yield    │
+└───────────────────────────────┬───────────────────────────────────┘
+                                │ gRPC response stream
+                                ▼
+┌─ Mattermost (stdout) ────────────────────────────────────────────┐
+│ process_turn_events() → OutputEvent channel → stream_output()     │
+│       ↓                                                           │
+│ TextLine → batch + flush to MM thread (14KB/80 lines/200ms)       │
+│ ToolAction → live card update (throttled 500ms)                   │
+│ ResponseComplete → finalize card with token counts                │
+└───────────────────────────────────────────────────────────────────┘
+```
+
+### Where Hangs Occur
+
+| Scenario | Root Cause | Status |
+|----------|-----------|--------|
+| **Session open hangs (30s timeout)** | Python didn't flush HTTP/2 headers before first yield | **Fixed**: empty event handshake in `server.py` |
+| **FollowUp hangs indefinitely** | Creating new iterator per turn closes anyio channel for all iterators | **Fixed**: single persistent `msg_stream` reused across turns |
+| **Duplicate text in output** | Both `StreamEvent` partials AND `AssistantMessage` complete text forwarded | **Fixed**: `server.py` filters out text events from `AssistantMessage` |
+| **Turn never completes** | `ResultMessage` parse failure in SDK kills the async generator permanently | **Fixed**: iterate raw SDK dicts, call `parse_message()` externally with fallback |
+| **No per-turn timeout** | `process_turn_events()` loops until `SessionResult` with no deadline | **By design**: sessions can run for hours with tool use |
 
 ## Data Flow
 
@@ -148,26 +265,28 @@ Message Handler (main.rs)
                                           ▼
                                     message_processor (container.rs)
                                           │
-                                    ┌─────┴─────┐
-                                    │ First msg  │ Follow-up
-                                    ▼            ▼
-                              gRPC Execute  gRPC SendMessage
-                                    │            │
-                                    └─────┬──────┘
-                                          ▼
+                                    ┌─────┴──────────┐
+                                    │ First msg       │ Follow-up
+                                    ▼                 ▼
+                              CreateSession      FollowUp
+                              (on bidi stream)   (on same stream)
+                                    │                 │
+                                    └────────┬────────┘
+                                             ▼
                                     AgentEvent stream (grpc.rs)
-                                          │
-                                          ▼
+                                    process_turn_events()
+                                             │
+                                             ▼
                                     OutputEvent channel
-                                          │
-                                          ▼
+                                             │
+                                             ▼
                                     stream_output() batching (main.rs)
-                                          │
-                                    ┌─────┴─────┐
-                                    │           │
-                                    ▼           ▼
-                              Mattermost   Network Request
-                              thread reply  Detection
+                                             │
+                                    ┌────────┴────────┐
+                                    │                 │
+                                    ▼                 ▼
+                              Mattermost        Network Request
+                              thread reply       Detection
 ```
 
 ### Session Startup
@@ -195,7 +314,7 @@ ContainerRegistry::lookup(repo, branch)
                ▼
     Session::create_internal()
         ├── Allocate mpsc channels (message_tx, output_tx)
-        ├── Spawn message_processor (connects GrpcExecutor)
+        ├── Spawn message_processor (opens GrpcStream via GrpcExecutor)
         ├── Register in liveness tracker
         ├── Auto-follow Mattermost thread for session creator
         └── Persist to PostgreSQL
@@ -427,5 +546,5 @@ graph TB
 See `architecture.excalidraw` for detailed component diagrams.
 
 ---
-_Last updated: 2026-02-21_
+_Last updated: 2026-02-22_
 _Generated by /jcttech.architecture_

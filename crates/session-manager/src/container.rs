@@ -12,7 +12,7 @@ use crate::config::settings;
 use crate::container_registry::{ContainerRegistry, ContainerState};
 use crate::database::Database;
 use crate::devcontainer;
-use crate::grpc::{GrpcExecutor, GrpcSession};
+use crate::grpc::{GrpcExecutor, GrpcStream};
 use crate::ssh;
 use crate::stream_json::OutputEvent;
 
@@ -324,13 +324,13 @@ impl ContainerManager {
             }
         };
 
-        // Open bidirectional session with timeout
-        let grpc_session = tokio::time::timeout(
+        // Open bidirectional stream with timeout
+        let grpc_stream = tokio::time::timeout(
             Duration::from_secs(30),
-            executor.open_session(),
+            executor.open_stream(),
         ).await
-            .map_err(|_| anyhow!("gRPC open_session timed out after 30s (handshake deadlock?)"))?
-            .map_err(|e| anyhow!("Failed to open gRPC session: {}", e))?;
+            .map_err(|_| anyhow!("gRPC open_stream timed out after 30s (handshake deadlock?)"))?
+            .map_err(|e| anyhow!("Failed to open gRPC stream: {}", e))?;
 
         let (message_tx, message_rx) = mpsc::channel::<String>(32);
         let is_first_message = Arc::new(AtomicBool::new(true));
@@ -355,7 +355,7 @@ impl ContainerManager {
                 plan_mode_clone,
                 thinking_mode_clone,
                 pending_title_clone,
-                grpc_session,
+                grpc_stream,
             ).await;
         });
 
@@ -616,7 +616,7 @@ async fn ensure_worker_running(container_name: &str, grpc_addr: &str) -> Result<
     crate::grpc::wait_for_health(grpc_addr, 15, Duration::from_secs(1)).await
 }
 
-/// Per-message processor task. Uses an already-established gRPC Session stream.
+/// Per-message processor task. Uses an already-established gRPC stream.
 /// For each user message sends CreateSession (first) or FollowUp (subsequent)
 /// and processes the turn's events until SessionResult.
 #[allow(clippy::too_many_arguments)]
@@ -629,7 +629,7 @@ async fn message_processor(
     plan_mode: Arc<AtomicBool>,
     thinking_mode: Arc<AtomicBool>,
     pending_title: Arc<AtomicBool>,
-    mut session: GrpcSession,
+    mut stream: GrpcStream,
 ) {
     while let Some(message) = message_rx.recv().await {
         let stored_sid = claude_session_id.lock().unwrap().clone();
@@ -663,7 +663,7 @@ async fn message_processor(
 
         // Send appropriate request type
         let send_result = if is_first || stored_sid.is_none() {
-            session.create(
+            stream.create(
                 &message,
                 permission_mode,
                 std::collections::HashMap::new(),
@@ -671,7 +671,7 @@ async fn message_processor(
                 thinking_tokens,
             ).await
         } else {
-            session.follow_up(&message).await
+            stream.follow_up(&message).await
         };
 
         if let Err(e) = send_result {
@@ -688,7 +688,7 @@ async fn message_processor(
         }
 
         // Process events for this turn
-        match session.process_turn_events(&output_tx).await {
+        match stream.process_turn_events(&output_tx).await {
             Ok(new_sid) => {
                 tracing::info!(
                     session_id = %session_id,

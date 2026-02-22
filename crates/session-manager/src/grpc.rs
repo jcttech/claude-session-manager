@@ -19,9 +19,9 @@ pub struct GrpcExecutor {
     client: AgentWorkerClient<Channel>,
 }
 
-/// A bidirectional gRPC session. One stream = one SDK session lifetime.
+/// A bidirectional gRPC stream. One stream = one SDK session lifetime.
 /// Send CreateSession or FollowUp requests, then process turn events.
-pub struct GrpcSession {
+pub struct GrpcStream {
     request_tx: mpsc::Sender<proto::SessionInput>,
     response_stream: tonic::Streaming<proto::AgentEvent>,
 }
@@ -43,7 +43,7 @@ impl GrpcExecutor {
 
     /// Open a bidirectional Session stream. Returns handles for sending
     /// requests and processing events.
-    pub async fn open_session(&mut self) -> Result<GrpcSession> {
+    pub async fn open_stream(&mut self) -> Result<GrpcStream> {
         let (tx, rx) = mpsc::channel(16);
         let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
         tracing::debug!("gRPC: Sending Session RPC (waiting for response headers)");
@@ -53,7 +53,7 @@ impl GrpcExecutor {
             .await
             .map_err(|e| anyhow!("Session RPC failed: {}", e))?;
         tracing::debug!("gRPC: Session RPC connected (response headers received)");
-        Ok(GrpcSession {
+        Ok(GrpcStream {
             request_tx: tx,
             response_stream: response.into_inner(),
         })
@@ -87,7 +87,7 @@ impl GrpcExecutor {
     }
 }
 
-impl GrpcSession {
+impl GrpcStream {
     /// Send a CreateSession request (first message).
     pub async fn create(
         &mut self,

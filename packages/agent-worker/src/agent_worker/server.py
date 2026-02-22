@@ -7,6 +7,7 @@ import asyncio
 import logging
 import time
 
+from claude_agent_sdk._internal.message_parser import parse_message
 from claude_agent_sdk.types import (
     AssistantMessage,
     ResultMessage,
@@ -48,44 +49,42 @@ class AgentWorkerServicer(agent_pb2_grpc.AgentWorkerServicer):
         """Shared async generator that iterates SDK messages and yields AgentEvents.
 
         Handles all message types (SystemMessage, AssistantMessage, ResultMessage,
-        StreamEvent, UserMessage) and the parse-failure fix for ResultMessage.
+        StreamEvent, UserMessage) with resilient parsing.
 
-        The caller passes the long-lived async iterator (msg_iter) which persists
-        across conversation turns. This generator returns (not closes) on
-        ResultMessage, leaving msg_iter paused for the next turn.
+        The caller passes the long-lived async iterator (msg_iter) which yields
+        raw dicts from the SDK's internal query stream. We call parse_message()
+        ourselves so that parse errors (e.g. rate_limit_event) don't kill the
+        underlying async generator — they're caught in our code instead.
+
+        The iterator persists across conversation turns. This generator returns
+        (not closes) on ResultMessage, leaving msg_iter paused for the next turn.
         """
         while True:
             try:
-                message = await msg_iter.__anext__()
+                raw_data = await msg_iter.__anext__()
             except StopAsyncIteration:
                 break
+
+            # Parse raw dict → typed Message (outside the generator, so errors
+            # don't kill the iterator)
+            try:
+                message = parse_message(raw_data)
             except Exception as parse_exc:
                 exc_str = str(parse_exc)
                 if "rate_limit_event" in exc_str:
                     logger.info("Rate limit event received: %s", parse_exc)
-                    try:
-                        from claude_agent_sdk._errors import MessageParseError
-                        raw_data = getattr(parse_exc, 'data', None)
-                        if isinstance(parse_exc, MessageParseError) and isinstance(raw_data, dict):
-                            logger.info("Rate limit details: %s", raw_data)
-                    except ImportError:
-                        pass
+                    if isinstance(raw_data, dict):
+                        logger.info("Rate limit details: %s", raw_data)
+                elif isinstance(raw_data, dict) and raw_data.get("type") == "result":
+                    # ResultMessage parse failure — yield fallback to prevent deadlock
+                    logger.error(
+                        "ResultMessage parse failed — forcing exit: %s",
+                        parse_exc,
+                    )
+                    yield fallback_result_event(raw_data, start_time)
+                    return
                 else:
                     logger.warning("Skipping unparseable message: %s", parse_exc)
-                    # Check if this is a ResultMessage parse failure — if so, force exit
-                    try:
-                        from claude_agent_sdk._errors import MessageParseError
-                        raw_data = getattr(parse_exc, 'data', None)
-                        if isinstance(parse_exc, MessageParseError) and isinstance(raw_data, dict):
-                            if raw_data.get("type") == "result":
-                                logger.error(
-                                    "ResultMessage parse failed — forcing exit: %s",
-                                    parse_exc,
-                                )
-                                yield fallback_result_event(raw_data, start_time)
-                                return
-                    except ImportError:
-                        pass
                 continue
 
             msg_type = type(message).__name__
@@ -126,6 +125,11 @@ class AgentWorkerServicer(agent_pb2_grpc.AgentWorkerServicer):
             else:
                 logger.warning("Unhandled message type: %s", msg_type)
 
+        # Safety: iterator ended without ResultMessage — yield fallback error
+        # to prevent the Rust side from hanging indefinitely.
+        logger.error("SDK iterator ended without ResultMessage — yielding fallback error")
+        yield error_event("SDK message stream ended unexpectedly", "iterator_exhausted")
+
     async def Session(self, request_iterator, context):
         """Bidirectional streaming: one gRPC stream = one SDK session lifecycle."""
         # Send initial metadata immediately so the client's session() call
@@ -161,7 +165,7 @@ class AgentWorkerServicer(agent_pb2_grpc.AgentWorkerServicer):
                         max_turns=req.max_turns or None,
                         max_thinking_tokens=req.max_thinking_tokens or None,
                     )
-                    msg_stream = client.receive_messages().__aiter__()
+                    msg_stream = client._query.receive_messages().__aiter__()
                     async for event in self._iter_sdk_messages(msg_stream, turn_start):
                         events_yielded += 1
                         if event.HasField("session_init"):
