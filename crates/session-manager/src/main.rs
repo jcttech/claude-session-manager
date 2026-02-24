@@ -798,6 +798,33 @@ async fn handle_messages(
                             .await;
                         continue;
                     }
+                    if cmd == "interrupt" {
+                        match state.containers.interrupt(&session.session_id).await {
+                            Ok(true) => {
+                                let _ = state
+                                    .mm
+                                    .post_in_thread(channel_id, root_id, "Interrupted.")
+                                    .await;
+                            }
+                            Ok(false) => {
+                                let _ = state
+                                    .mm
+                                    .post_in_thread(channel_id, root_id, "No active session to interrupt.")
+                                    .await;
+                            }
+                            Err(e) => {
+                                let _ = state
+                                    .mm
+                                    .post_in_thread(
+                                        channel_id,
+                                        root_id,
+                                        &format!("Interrupt failed: {}", e),
+                                    )
+                                    .await;
+                            }
+                        }
+                        continue;
+                    }
                     if cmd == "stop --container" {
                         // Find the container's repo/branch from this session
                         let container_info = state
@@ -1325,6 +1352,7 @@ async fn handle_messages(
                         - Reply directly to send input\n\
                         - `{trigger} stop` — End the session\n\
                         - `{trigger} stop --container` — Stop all sessions sharing this container and tear it down\n\
+                        - `{trigger} interrupt` — Interrupt a running turn\n\
                         - `{trigger} compact` — Compact/summarize context\n\
                         - `{trigger} clear` — Clear conversation history\n\
                         - `{trigger} restart` — Restart Claude conversation\n\

@@ -88,6 +88,16 @@ impl GrpcExecutor {
 }
 
 impl GrpcStream {
+    /// Read the next event from the gRPC response stream.
+    /// Returns Ok(Some(event)) for a message, Ok(None) if the stream ended,
+    /// or Err on transport failure.
+    pub async fn next_event(&mut self) -> Result<Option<proto::AgentEvent>> {
+        self.response_stream
+            .message()
+            .await
+            .map_err(|e| anyhow!("gRPC stream error: {}", e))
+    }
+
     /// Send a CreateSession request (first message).
     pub async fn create(
         &mut self,
@@ -128,6 +138,7 @@ impl GrpcStream {
 
     /// Read events from the response stream until SessionResult.
     /// Returns captured session_id. Stream stays open for next turn.
+    #[allow(dead_code)]
     pub async fn process_turn_events(
         &mut self,
         output_tx: &mpsc::Sender<OutputEvent>,
@@ -305,7 +316,7 @@ impl GrpcStream {
 
 /// Format a tool action from gRPC ToolUse data.
 /// Parses the input_json to extract key parameters for display.
-fn format_grpc_tool_action(tool_name: &str, input_json: &str) -> String {
+pub fn format_grpc_tool_action(tool_name: &str, input_json: &str) -> String {
     let input: serde_json::Value = serde_json::from_str(input_json).unwrap_or_default();
 
     // Reuse the same formatting logic from stream_json

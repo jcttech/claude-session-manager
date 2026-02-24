@@ -12,7 +12,7 @@ use crate::config::settings;
 use crate::container_registry::{ContainerRegistry, ContainerState};
 use crate::database::Database;
 use crate::devcontainer;
-use crate::grpc::{GrpcExecutor, GrpcStream};
+use crate::grpc::{self, GrpcExecutor, GrpcStream};
 use crate::ssh;
 use crate::stream_json::OutputEvent;
 
@@ -58,6 +58,8 @@ struct Session {
     pending_title: Arc<AtomicBool>,
     /// Last known input_tokens from ResponseComplete (for context window display)
     last_input_tokens: Arc<AtomicU64>,
+    /// gRPC address for interrupt RPC (separate from the stream)
+    grpc_addr: String,
 }
 
 impl Default for ContainerManager {
@@ -377,6 +379,7 @@ impl ContainerManager {
                 thinking_mode: thinking_mode_flag,
                 pending_title: pending_title_flag,
                 last_input_tokens: last_input_tokens_flag,
+                grpc_addr: grpc_addr.clone(),
             },
         );
 
@@ -492,6 +495,24 @@ impl ContainerManager {
         if let Some(session) = self.sessions.get(session_id) {
             session.pending_title.store(true, Ordering::SeqCst);
         }
+    }
+
+    /// Interrupt a running Claude session via a separate gRPC unary RPC.
+    /// Returns Ok(true) if interrupted, Ok(false) if no active session.
+    pub async fn interrupt(&self, session_id: &str) -> Result<bool> {
+        let session = self.sessions.get(session_id)
+            .ok_or_else(|| anyhow!("Session {} not found", session_id))?;
+
+        let claude_sid = session.claude_session_id.lock().unwrap().clone();
+        let grpc_addr = session.grpc_addr.clone();
+        drop(session); // Release DashMap ref before async call
+
+        let Some(claude_sid) = claude_sid else {
+            return Ok(false);
+        };
+
+        let mut executor = GrpcExecutor::connect(&grpc_addr).await?;
+        executor.interrupt(&claude_sid).await
     }
 
     /// Store the last known input_tokens from a ResponseComplete event
@@ -629,9 +650,14 @@ async fn ensure_worker_running(container_name: &str, grpc_addr: &str) -> Result<
     crate::grpc::wait_for_health(grpc_addr, 15, Duration::from_secs(1)).await
 }
 
-/// Per-message processor task. Uses an already-established gRPC stream.
-/// For each user message sends CreateSession (first) or FollowUp (subsequent)
-/// and processes the turn's events until SessionResult.
+/// Per-session processor task. Uses an already-established gRPC stream.
+///
+/// Runs a continuous `select!` loop that simultaneously:
+/// - Accepts user messages from `message_rx` (when not already in a turn)
+/// - Reads gRPC events from the SDK stream (always, even between turns)
+///
+/// This allows background events (e.g. task completions) to flow through
+/// immediately, rather than buffering until the next user message.
 #[allow(clippy::too_many_arguments)]
 async fn message_processor(
     mut message_rx: mpsc::Receiver<String>,
@@ -644,91 +670,243 @@ async fn message_processor(
     pending_title: Arc<AtomicBool>,
     mut stream: GrpcStream,
 ) {
-    while let Some(message) = message_rx.recv().await {
-        let stored_sid = claude_session_id.lock().unwrap().clone();
-        let is_first = is_first_message.load(Ordering::SeqCst);
+    use grpc::proto::agent_event;
 
-        // Determine permission mode
-        let permission_mode = if plan_mode.load(Ordering::SeqCst) {
-            "plan"
-        } else {
-            "bypassPermissions"
-        };
+    let mut in_turn = false;
+    let mut in_background = false;
+    let mut partial_buf = String::new();
+    let mut event_count: u64 = 0;
 
-        let thinking_tokens = if thinking_mode.load(Ordering::SeqCst) { 10000 } else { 0 };
+    loop {
+        tokio::select! {
+            biased;
 
-        tracing::info!(
-            session_id = %session_id,
-            is_first,
-            has_session_id = stored_sid.is_some(),
-            permission_mode,
-            thinking_tokens,
-            "Sending message via gRPC"
-        );
+            // Accept new user messages only when not already processing a turn
+            msg = message_rx.recv(), if !in_turn => {
+                let Some(message) = msg else {
+                    // Channel closed — session dropped
+                    tracing::debug!(session_id = %session_id, "Message channel closed");
+                    break;
+                };
 
-        // Emit ProcessingStarted immediately so the UI shows feedback right away.
-        let _ = output_tx
-            .send(OutputEvent::ProcessingStarted { input_tokens: 0 })
-            .await;
+                let stored_sid = claude_session_id.lock().unwrap().clone();
+                let is_first = is_first_message.load(Ordering::SeqCst);
 
-        // If pending_title is set, we'll capture the response as a title
-        let _is_title_request = pending_title.swap(false, Ordering::SeqCst);
+                let permission_mode = if plan_mode.load(Ordering::SeqCst) {
+                    "plan"
+                } else {
+                    "bypassPermissions"
+                };
 
-        // Send appropriate request type
-        let send_result = if is_first || stored_sid.is_none() {
-            stream.create(
-                &message,
-                permission_mode,
-                std::collections::HashMap::new(),
-                "",
-                thinking_tokens,
-            ).await
-        } else {
-            stream.follow_up(&message).await
-        };
+                let thinking_tokens = if thinking_mode.load(Ordering::SeqCst) { 10000 } else { 0 };
 
-        if let Err(e) = send_result {
-            tracing::error!(
-                session_id = %session_id,
-                error = %e,
-                "Failed to send gRPC request"
-            );
-            let _ = output_tx.send(OutputEvent::ProcessDied {
-                exit_code: Some(1),
-                signal: Some(format!("gRPC send error: {}", e)),
-            }).await;
-            break; // Stream broken — exit processor
-        }
-
-        // Process events for this turn
-        match stream.process_turn_events(&output_tx).await {
-            Ok(new_sid) => {
                 tracing::info!(
                     session_id = %session_id,
                     is_first,
-                    "gRPC turn completed successfully"
+                    has_session_id = stored_sid.is_some(),
+                    permission_mode,
+                    thinking_tokens,
+                    "Sending message via gRPC"
                 );
-                if let Some(sid) = new_sid && stored_sid.is_none() {
-                    tracing::info!(
+
+                // Emit ProcessingStarted immediately
+                let _ = output_tx
+                    .send(OutputEvent::ProcessingStarted { input_tokens: 0 })
+                    .await;
+
+                let _is_title_request = pending_title.swap(false, Ordering::SeqCst);
+
+                let send_result = if is_first || stored_sid.is_none() {
+                    stream.create(
+                        &message,
+                        permission_mode,
+                        std::collections::HashMap::new(),
+                        "",
+                        thinking_tokens,
+                    ).await
+                } else {
+                    stream.follow_up(&message).await
+                };
+
+                if let Err(e) = send_result {
+                    tracing::error!(
                         session_id = %session_id,
-                        claude_session_id = %sid,
-                        "Captured Claude session ID from gRPC"
+                        error = %e,
+                        "Failed to send gRPC request"
                     );
-                    *claude_session_id.lock().unwrap() = Some(sid);
+                    let _ = output_tx.send(OutputEvent::ProcessDied {
+                        exit_code: Some(1),
+                        signal: Some(format!("gRPC send error: {}", e)),
+                    }).await;
+                    break;
                 }
-                is_first_message.store(false, Ordering::SeqCst);
+
+                in_turn = true;
+                in_background = false;
+                partial_buf.clear();
             }
-            Err(e) => {
-                tracing::error!(
-                    session_id = %session_id,
-                    error = %e,
-                    "gRPC turn failed"
-                );
-                let _ = output_tx.send(OutputEvent::ProcessDied {
-                    exit_code: Some(1),
-                    signal: Some(format!("gRPC error: {}", e)),
-                }).await;
-                break; // Stream broken — exit processor
+
+            // Continuously read gRPC events (both during and between turns)
+            event_result = stream.next_event() => {
+                match event_result {
+                    Ok(Some(event)) => {
+                        event_count += 1;
+                        let Some(event_variant) = event.event else {
+                            tracing::debug!(event_count, "gRPC: Empty event (no variant)");
+                            continue;
+                        };
+
+                        // If we're between turns, this is a background event —
+                        // emit ProcessingStarted once to create a LiveCard
+                        if !in_turn && !in_background {
+                            in_background = true;
+                            partial_buf.clear();
+                            let _ = output_tx
+                                .send(OutputEvent::ProcessingStarted { input_tokens: 0 })
+                                .await;
+                        }
+
+                        match event_variant {
+                            agent_event::Event::SessionInit(init) => {
+                                let stored_sid = claude_session_id.lock().unwrap().clone();
+                                if stored_sid.is_none() {
+                                    tracing::info!(session_id_grpc = %init.session_id, "gRPC: SessionInit received");
+                                    *claude_session_id.lock().unwrap() = Some(init.session_id);
+                                }
+                            }
+                            agent_event::Event::Text(text) => {
+                                if text.is_partial {
+                                    partial_buf.push_str(&text.text);
+                                    while let Some(newline_pos) = partial_buf.find('\n') {
+                                        let line = partial_buf[..newline_pos].to_string();
+                                        partial_buf = partial_buf[newline_pos + 1..].to_string();
+                                        if output_tx.send(OutputEvent::TextLine(line)).await.is_err() {
+                                            tracing::warn!("gRPC: output_tx closed during partial text");
+                                            return;
+                                        }
+                                    }
+                                } else {
+                                    // Complete text — flush partial buffer first
+                                    if !partial_buf.is_empty()
+                                        && output_tx
+                                            .send(OutputEvent::TextLine(std::mem::take(&mut partial_buf)))
+                                            .await
+                                            .is_err()
+                                    {
+                                        return;
+                                    }
+                                    for line in text.text.lines() {
+                                        if output_tx.send(OutputEvent::TextLine(line.to_string())).await.is_err() {
+                                            return;
+                                        }
+                                    }
+                                }
+                            }
+                            agent_event::Event::ToolUse(tool) => {
+                                if tool.input_json.is_empty() || tool.input_json == "{}" {
+                                    continue;
+                                }
+                                // Flush partial text before tool action
+                                if !partial_buf.is_empty() {
+                                    let _ = output_tx
+                                        .send(OutputEvent::TextLine(std::mem::take(&mut partial_buf)))
+                                        .await;
+                                }
+                                let action = grpc::format_grpc_tool_action(&tool.tool_name, &tool.input_json);
+                                if output_tx.send(OutputEvent::ToolAction(action)).await.is_err() {
+                                    return;
+                                }
+                            }
+                            agent_event::Event::ToolResult(_) => {
+                                // Informational — not surfaced to chat
+                            }
+                            agent_event::Event::Subagent(sub) => {
+                                let action = if sub.is_start { "started" } else { "finished" };
+                                tracing::debug!(
+                                    agent = %sub.agent_name,
+                                    parent_tool = %sub.parent_tool_use_id,
+                                    action,
+                                    "Subagent event"
+                                );
+                            }
+                            agent_event::Event::Result(result) => {
+                                // Flush partial text
+                                if !partial_buf.is_empty() {
+                                    let _ = output_tx
+                                        .send(OutputEvent::TextLine(std::mem::take(&mut partial_buf)))
+                                        .await;
+                                }
+
+                                let input_tokens = result.input_tokens;
+                                let output_tokens = result.output_tokens;
+                                tracing::info!(
+                                    event_count,
+                                    input_tokens,
+                                    output_tokens,
+                                    is_error = result.is_error,
+                                    "gRPC: Result received (turn complete)"
+                                );
+
+                                if result.is_error {
+                                    let _ = output_tx
+                                        .send(OutputEvent::ProcessDied {
+                                            exit_code: Some(1),
+                                            signal: None,
+                                        })
+                                        .await;
+                                } else {
+                                    let _ = output_tx
+                                        .send(OutputEvent::ResponseComplete {
+                                            input_tokens,
+                                            output_tokens,
+                                        })
+                                        .await;
+                                }
+
+                                // Turn/background burst complete
+                                if in_turn {
+                                    is_first_message.store(false, Ordering::SeqCst);
+                                }
+                                in_turn = false;
+                                in_background = false;
+                            }
+                            agent_event::Event::Error(err) => {
+                                tracing::error!(
+                                    event_count,
+                                    error_type = %err.error_type,
+                                    message = %err.message,
+                                    "gRPC: Agent error"
+                                );
+                                let _ = output_tx
+                                    .send(OutputEvent::ProcessDied {
+                                        exit_code: Some(1),
+                                        signal: Some(format!("{}: {}", err.error_type, err.message)),
+                                    })
+                                    .await;
+                                in_turn = false;
+                                in_background = false;
+                            }
+                        }
+                    }
+                    Ok(None) => {
+                        // Stream ended (server closed)
+                        tracing::info!(event_count, "gRPC: Response stream ended");
+                        if !partial_buf.is_empty() {
+                            let _ = output_tx
+                                .send(OutputEvent::TextLine(std::mem::take(&mut partial_buf)))
+                                .await;
+                        }
+                        break;
+                    }
+                    Err(e) => {
+                        tracing::error!(event_count, error = %e, "gRPC: Stream error");
+                        let _ = output_tx.send(OutputEvent::ProcessDied {
+                            exit_code: Some(1),
+                            signal: Some(format!("gRPC stream error: {}", e)),
+                        }).await;
+                        break;
+                    }
+                }
             }
         }
     }
