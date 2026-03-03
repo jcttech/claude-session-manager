@@ -10,7 +10,7 @@ requires-python = ">=3.13"
 dependencies = [
     "claude-agent-sdk>=0.1.44",
     "grpcio>=1.78.0",
-    "protobuf>=7.34.0",
+    "protobuf>=6.31.1,<7.0.0",
 ]
 
 [project.optional-dependencies]
