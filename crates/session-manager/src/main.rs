@@ -1446,8 +1446,10 @@ const CARD_UPDATE_MIN_INTERVAL: Duration = Duration::from_millis(500);
 const CARD_MAX_TOOL_LINES: usize = 20;
 /// Maximum post size before starting a new post (safety margin under Mattermost's 16KB limit)
 const POST_MAX_BYTES: usize = 15 * 1024;
-/// Maximum number of post updates before splitting into a new continuation post
-const CARD_MAX_UPDATES: u32 = 30;
+/// Minimum post size before a cycle-boundary split is considered
+const CARD_SPLIT_MIN_BYTES: usize = 6 * 1024;
+/// Fallback: maximum post updates before forcing a split (no cycle boundary needed)
+const CARD_MAX_UPDATES: u32 = 200;
 
 /// Heartbeat interval for updating the elapsed timer on the live card
 const CARD_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
@@ -1469,6 +1471,8 @@ struct LiveCard {
     last_input_tokens: u64,
     /// Number of times the current post has been flushed (for edit-count splitting)
     flush_count: u32,
+    /// Whether text has been appended since the last tool action (cycle boundary detection)
+    has_text_since_tools: bool,
 }
 
 impl LiveCard {
@@ -1483,6 +1487,7 @@ impl LiveCard {
             dirty: false,
             last_input_tokens: 0,
             flush_count: 0,
+            has_text_since_tools: false,
         }
     }
 
@@ -1501,11 +1506,13 @@ impl LiveCard {
         self.started_at = Some(tokio::time::Instant::now());
         self.dirty = true;
         self.flush_count = 0;
+        self.has_text_since_tools = false;
     }
 
     /// Append a tool action line to the card.
     fn add_tool_action(&mut self, action: &str) {
         self.tool_lines.push(format!("> {}", action));
+        self.has_text_since_tools = false;
         self.dirty = true;
     }
 
@@ -1584,6 +1591,7 @@ impl LiveCard {
             self.text_content.push('\n');
         }
         self.text_content.push_str(text);
+        self.has_text_since_tools = true;
         self.dirty = true;
     }
 
@@ -1600,6 +1608,7 @@ impl LiveCard {
         self.tool_lines.clear();
         self.dirty = true;
         self.flush_count = 0;
+        self.has_text_since_tools = false;
     }
 
     /// Whether the card has any content beyond the header.
@@ -1642,9 +1651,21 @@ impl LiveCard {
         self.last_update.elapsed() >= CARD_UPDATE_MIN_INTERVAL
     }
 
-    /// Whether the current post has exceeded the maximum edit count.
+    /// Whether the current post should split into a continuation.
+    ///
+    /// Prefers splitting at cycle boundaries (text→tool transitions) when the
+    /// post has grown large enough. Falls back to a hard edit-count limit for
+    /// pure-tool sessions with no text.
     fn should_split(&self) -> bool {
-        self.post_id.is_some() && self.flush_count >= CARD_MAX_UPDATES
+        if self.post_id.is_none() {
+            return false;
+        }
+        // Cycle boundary: text was written, now a new tool is starting
+        if self.has_text_since_tools && self.render().len() >= CARD_SPLIT_MIN_BYTES {
+            return true;
+        }
+        // Hard fallback for sessions with no text between tools
+        self.flush_count >= CARD_MAX_UPDATES
     }
 
     /// Finalize the current post with a "Continued below" header and flush it.
@@ -1678,6 +1699,7 @@ impl LiveCard {
         self.text_content.clear();
         self.tool_lines.clear();
         self.flush_count = 0;
+        self.has_text_since_tools = false;
         self.dirty = true;
         // Restore the processing header with current elapsed time
         self.update_elapsed();

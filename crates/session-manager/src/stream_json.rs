@@ -48,8 +48,11 @@ pub fn format_tool_action(name: &str, input: &serde_json::Value) -> String {
         "Bash" => {
             let cmd = input.get("command").and_then(|v| v.as_str()).unwrap_or("?");
             // Truncate long commands
-            let cmd_short = if cmd.len() > 80 { &cmd[..77] } else { cmd };
-            let suffix = if cmd.len() > 80 { "..." } else { "" };
+            let (cmd_short, suffix) = if cmd.len() > 80 {
+                (&cmd[..cmd.floor_char_boundary(77)], "...")
+            } else {
+                (cmd, "")
+            };
             format!("**Bash** `{}{}`", cmd_short, suffix)
         }
         "Glob" => {
