@@ -1446,6 +1446,8 @@ const CARD_UPDATE_MIN_INTERVAL: Duration = Duration::from_millis(500);
 const CARD_MAX_TOOL_LINES: usize = 20;
 /// Maximum post size before starting a new post (safety margin under Mattermost's 16KB limit)
 const POST_MAX_BYTES: usize = 15 * 1024;
+/// Maximum number of post updates before splitting into a new continuation post
+const CARD_MAX_UPDATES: u32 = 30;
 
 /// Heartbeat interval for updating the elapsed timer on the live card
 const CARD_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
@@ -1465,6 +1467,8 @@ struct LiveCard {
     dirty: bool,
     /// Last known input_tokens (for context window display in headers)
     last_input_tokens: u64,
+    /// Number of times the current post has been flushed (for edit-count splitting)
+    flush_count: u32,
 }
 
 impl LiveCard {
@@ -1478,6 +1482,7 @@ impl LiveCard {
             started_at: None,
             dirty: false,
             last_input_tokens: 0,
+            flush_count: 0,
         }
     }
 
@@ -1495,6 +1500,7 @@ impl LiveCard {
         self.text_content.clear();
         self.started_at = Some(tokio::time::Instant::now());
         self.dirty = true;
+        self.flush_count = 0;
     }
 
     /// Append a tool action line to the card.
@@ -1593,6 +1599,7 @@ impl LiveCard {
         self.text_content.clear();
         self.tool_lines.clear();
         self.dirty = true;
+        self.flush_count = 0;
     }
 
     /// Whether the card has any content beyond the header.
@@ -1635,6 +1642,47 @@ impl LiveCard {
         self.last_update.elapsed() >= CARD_UPDATE_MIN_INTERVAL
     }
 
+    /// Whether the current post has exceeded the maximum edit count.
+    fn should_split(&self) -> bool {
+        self.post_id.is_some() && self.flush_count >= CARD_MAX_UPDATES
+    }
+
+    /// Finalize the current post with a "Continued below" header and flush it.
+    async fn finalize_continuation(&mut self, state: &AppState, channel_id: &str, thread_id: &str) {
+        if let Some(started) = self.started_at {
+            let secs = started.elapsed().as_secs();
+            let elapsed_str = if secs >= 60 {
+                format!("{}m {}s", secs / 60, secs % 60)
+            } else {
+                format!("{}s", secs)
+            };
+            self.header = if self.last_input_tokens > 0 {
+                format!(
+                    ":arrow_down: Continued below ({}) · {}",
+                    elapsed_str,
+                    format_ctx_suffix(self.last_input_tokens)
+                )
+            } else {
+                format!(":arrow_down: Continued below ({})", elapsed_str)
+            };
+        } else {
+            self.header = ":arrow_down: Continued below".to_string();
+        }
+        self.dirty = true;
+        self.flush(state, channel_id, thread_id).await;
+    }
+
+    /// Start a new continuation post, preserving the elapsed timer.
+    fn start_continuation_post(&mut self) {
+        self.post_id = None;
+        self.text_content.clear();
+        self.tool_lines.clear();
+        self.flush_count = 0;
+        self.dirty = true;
+        // Restore the processing header with current elapsed time
+        self.update_elapsed();
+    }
+
     /// Send the card to Mattermost (create or update).
     async fn flush(&mut self, state: &AppState, channel_id: &str, thread_id: &str) {
         if !self.dirty {
@@ -1643,10 +1691,12 @@ impl LiveCard {
         let msg = self.render();
         if let Some(ref post_id) = self.post_id {
             let _ = state.mm.update_post(post_id, &msg).await;
+            self.flush_count += 1;
         } else {
             match state.mm.post_in_thread(channel_id, thread_id, &msg).await {
                 Ok(post_id) => {
                     self.post_id = Some(post_id);
+                    self.flush_count = 1;
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "Failed to create live card post");
@@ -1742,6 +1792,11 @@ async fn stream_output(
                         tracing::info!(session_id = %session_id, action = %action, "stream_output: ToolAction");
                         // Drain any accumulated text into card before adding tool
                         drain_batch_to_card(&mut card, &state, &channel_id, &thread_id, &mut batch, &mut batch_bytes).await;
+                        // Split into a new post if the current one has too many edits
+                        if card.should_split() {
+                            card.finalize_continuation(&state, &channel_id, &thread_id).await;
+                            card.start_continuation_post();
+                        }
                         card.add_tool_action(&action);
                         if card.can_update_now() {
                             card.flush(&state, &channel_id, &thread_id).await;

@@ -8,17 +8,17 @@ dynamic = ["version"]
 description = "gRPC Agent SDK worker for claude-session-manager"
 requires-python = ">=3.13"
 dependencies = [
-    "claude-agent-sdk>=0.1.0",
-    "grpcio>=1.60.0",
-    "protobuf>=4.25.0",
+    "claude-agent-sdk>=0.1.44",
+    "grpcio>=1.78.0",
+    "protobuf>=7.34.0",
 ]
 
 [project.optional-dependencies]
 dev = [
-    "pytest>=8.0",
-    "pytest-asyncio>=0.24.0",
-    "grpcio-tools>=1.60.0",
-    "ruff>=0.8.0",
+    "pytest>=9.0.2",
+    "pytest-asyncio>=1.3.0",
+    "grpcio-tools>=1.78.0",
+    "ruff>=0.15.4",
 ]
 
 [tool.hatch.version]
@@ -39,7 +39,10 @@ asyncio_mode = "auto"
 [tool.ruff]
 line-length = 100
 target-version = "py313"
-exclude = ["src/agent_worker/agent_pb2.py", "src/agent_worker/agent_pb2_grpc.py"]
+exclude = [
+    "src/agent_worker/agent_pb2.py",
+    "src/agent_worker/agent_pb2_grpc.py",
+]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "W"]
