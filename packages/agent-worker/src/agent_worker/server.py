@@ -133,10 +133,14 @@ class AgentWorkerServicer(agent_pb2_grpc.AgentWorkerServicer):
                     try:
                         raw_data = await msg_stream.__anext__()
                     except StopAsyncIteration:
-                        logger.error("SDK iterator ended without ResultMessage — pushing fallback error")
-                        await event_queue.put(
-                            error_event("SDK message stream ended unexpectedly", "iterator_exhausted")
+                        logger.error(
+                            "SDK iterator ended without ResultMessage"
+                            " — pushing fallback error"
                         )
+                        await event_queue.put(error_event(
+                            "SDK message stream ended unexpectedly",
+                            "iterator_exhausted",
+                        ))
                         await event_queue.put(None)  # Sentinel: stream ended
                         return
 
