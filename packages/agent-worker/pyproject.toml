@@ -8,7 +8,7 @@ dynamic = ["version"]
 description = "gRPC Agent SDK worker for claude-session-manager"
 requires-python = ">=3.13"
 dependencies = [
-    "claude-agent-sdk>=0.1.44",
+    "claude-agent-sdk>=0.1.45",
     "grpcio>=1.78.0",
     "protobuf>=6.31.1,<7.0.0",
 ]
