@@ -14,6 +14,12 @@ pub enum OutputEvent {
     TitleGenerated(String),
     /// Process died unexpectedly (non-zero exit, not user-initiated)
     ProcessDied { exit_code: Option<i32>, signal: Option<String> },
+    /// Worker disconnected (gRPC stream failed) — session stays alive for auto-reconnect
+    WorkerDisconnected { reason: String },
+    /// Worker reconnected after disconnection
+    WorkerReconnected,
+    /// Claude SDK session ID captured — persist to DB for resume
+    SessionIdCaptured(String),
 }
 
 /// Map common fatal exit codes to human-readable signal names.

@@ -25,6 +25,8 @@ pub struct StoredSession {
     pub last_activity_at: chrono::DateTime<chrono::Utc>,
     pub message_count: i32,
     pub compaction_count: i32,
+    pub claude_session_id: Option<String>,
+    pub status: String,
 }
 
 #[derive(Debug, FromRow)]
@@ -153,6 +155,22 @@ pub async fn create_schema(pool: &PgPool, schema: &str) -> Result<()> {
     // Migration: add user_id column to sessions table (for thread follow/unfollow)
     sqlx::query(&format!(
         "ALTER TABLE {}.sessions ADD COLUMN IF NOT EXISTS user_id TEXT",
+        schema
+    ))
+    .execute(pool)
+    .await?;
+
+    // Migration: add claude_session_id column (for session resume after worker death)
+    sqlx::query(&format!(
+        "ALTER TABLE {}.sessions ADD COLUMN IF NOT EXISTS claude_session_id TEXT",
+        schema
+    ))
+    .execute(pool)
+    .await?;
+
+    // Migration: add status column (active/stopped/disconnected)
+    sqlx::query(&format!(
+        "ALTER TABLE {}.sessions ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'active'",
         schema
     ))
     .execute(pool)
@@ -309,15 +327,34 @@ impl Database {
         Ok(())
     }
 
-    /// Primary routing query: find session by channel + thread
+    /// Primary routing query: find session by channel + thread.
+    /// Only returns active or disconnected sessions (not stopped).
     pub async fn get_session_by_thread(
         &self,
         channel_id: &str,
         thread_id: &str,
     ) -> Result<Option<StoredSession>> {
         let session = sqlx::query_as::<_, StoredSession>(&format!(
-            "SELECT session_id, channel_id, thread_id, project, project_path, container_name, container_id, session_type, parent_session_id, user_id, created_at, last_activity_at, message_count, compaction_count \
-             FROM {}.sessions WHERE channel_id = $1 AND thread_id = $2",
+            "SELECT session_id, channel_id, thread_id, project, project_path, container_name, container_id, session_type, parent_session_id, user_id, created_at, last_activity_at, message_count, compaction_count, claude_session_id, status \
+             FROM {}.sessions WHERE channel_id = $1 AND thread_id = $2 AND status IN ('active', 'disconnected')",
+            SCHEMA
+        ))
+        .bind(channel_id)
+        .bind(thread_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(session)
+    }
+
+    /// Find a stopped session by thread (for `resume` command).
+    pub async fn get_stopped_session_by_thread(
+        &self,
+        channel_id: &str,
+        thread_id: &str,
+    ) -> Result<Option<StoredSession>> {
+        let session = sqlx::query_as::<_, StoredSession>(&format!(
+            "SELECT session_id, channel_id, thread_id, project, project_path, container_name, container_id, session_type, parent_session_id, user_id, created_at, last_activity_at, message_count, compaction_count, claude_session_id, status \
+             FROM {}.sessions WHERE channel_id = $1 AND thread_id = $2 AND status = 'stopped'",
             SCHEMA
         ))
         .bind(channel_id)
@@ -336,7 +373,7 @@ impl Database {
         }
 
         let session = sqlx::query_as::<_, StoredSession>(&format!(
-            "SELECT session_id, channel_id, thread_id, project, project_path, container_name, container_id, session_type, parent_session_id, user_id, created_at, last_activity_at, message_count, compaction_count \
+            "SELECT session_id, channel_id, thread_id, project, project_path, container_name, container_id, session_type, parent_session_id, user_id, created_at, last_activity_at, message_count, compaction_count, claude_session_id, status \
              FROM {}.sessions WHERE session_id LIKE $1 LIMIT 1",
             SCHEMA
         ))
@@ -353,7 +390,7 @@ impl Database {
         channel_id: &str,
     ) -> Result<Vec<StoredSession>> {
         let sessions = sqlx::query_as::<_, StoredSession>(&format!(
-            "SELECT session_id, channel_id, thread_id, project, project_path, container_name, container_id, session_type, parent_session_id, user_id, created_at, last_activity_at, message_count, compaction_count \
+            "SELECT session_id, channel_id, thread_id, project, project_path, container_name, container_id, session_type, parent_session_id, user_id, created_at, last_activity_at, message_count, compaction_count, claude_session_id, status \
              FROM {}.sessions WHERE channel_id = $1 AND session_type != 'worker'",
             SCHEMA
         ))
@@ -382,7 +419,7 @@ impl Database {
 
     pub async fn get_all_sessions(&self) -> Result<Vec<StoredSession>> {
         let sessions = sqlx::query_as::<_, StoredSession>(&format!(
-            "SELECT session_id, channel_id, thread_id, project, project_path, container_name, container_id, session_type, parent_session_id, user_id, created_at, last_activity_at, message_count, compaction_count \
+            "SELECT session_id, channel_id, thread_id, project, project_path, container_name, container_id, session_type, parent_session_id, user_id, created_at, last_activity_at, message_count, compaction_count, claude_session_id, status \
              FROM {}.sessions",
             SCHEMA
         ))
@@ -411,6 +448,40 @@ impl Database {
             "UPDATE {}.sessions SET compaction_count = compaction_count + 1 WHERE session_id = $1",
             SCHEMA
         ))
+        .bind(session_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Store the Claude SDK session ID (for resume after worker death).
+    pub async fn update_claude_session_id(
+        &self,
+        session_id: &str,
+        claude_session_id: &str,
+    ) -> Result<()> {
+        sqlx::query(&format!(
+            "UPDATE {}.sessions SET claude_session_id = $1 WHERE session_id = $2",
+            SCHEMA
+        ))
+        .bind(claude_session_id)
+        .bind(session_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Update session status (active/stopped/disconnected).
+    pub async fn update_session_status(
+        &self,
+        session_id: &str,
+        status: &str,
+    ) -> Result<()> {
+        sqlx::query(&format!(
+            "UPDATE {}.sessions SET status = $1 WHERE session_id = $2",
+            SCHEMA
+        ))
+        .bind(status)
         .bind(session_id)
         .execute(&self.pool)
         .await?;
@@ -653,7 +724,7 @@ impl Database {
         container_id: i64,
     ) -> Result<Vec<StoredSession>> {
         let sessions = sqlx::query_as::<_, StoredSession>(&format!(
-            "SELECT session_id, channel_id, thread_id, project, project_path, container_name, container_id, session_type, parent_session_id, user_id, created_at, last_activity_at, message_count, compaction_count \
+            "SELECT session_id, channel_id, thread_id, project, project_path, container_name, container_id, session_type, parent_session_id, user_id, created_at, last_activity_at, message_count, compaction_count, claude_session_id, status \
              FROM {}.sessions WHERE container_id = $1",
             SCHEMA
         ))

@@ -350,6 +350,8 @@ impl ContainerManager {
         let plan_mode_clone = Arc::clone(&plan_mode_flag);
         let thinking_mode_clone = Arc::clone(&thinking_mode_flag);
         let pending_title_clone = Arc::clone(&pending_title_flag);
+        let container_name_owned = container_name.to_string();
+        let grpc_addr_owned = grpc_addr.clone();
         tokio::spawn(async move {
             message_processor(
                 message_rx,
@@ -361,6 +363,8 @@ impl ContainerManager {
                 thinking_mode_clone,
                 pending_title_clone,
                 grpc_stream,
+                container_name_owned,
+                grpc_addr_owned,
             ).await;
         });
 
@@ -650,14 +654,25 @@ async fn ensure_worker_running(container_name: &str, grpc_addr: &str) -> Result<
     crate::grpc::wait_for_health(grpc_addr, 15, Duration::from_secs(1)).await
 }
 
+/// Attempt to reconnect the gRPC stream to the agent-worker.
+/// Ensures the worker is running, connects, and opens a new bidirectional stream.
+async fn reconnect_stream(container_name: &str, grpc_addr: &str) -> Result<GrpcStream> {
+    ensure_worker_running(container_name, grpc_addr).await?;
+    let mut executor = GrpcExecutor::connect(grpc_addr).await?;
+    tokio::time::timeout(Duration::from_secs(30), executor.open_stream())
+        .await
+        .map_err(|_| anyhow!("Reconnect stream timed out"))?
+}
+
 /// Per-session processor task. Uses an already-established gRPC stream.
 ///
 /// Runs a continuous `select!` loop that simultaneously:
 /// - Accepts user messages from `message_rx` (when not already in a turn)
 /// - Reads gRPC events from the SDK stream (always, even between turns)
 ///
-/// This allows background events (e.g. task completions) to flow through
-/// immediately, rather than buffering until the next user message.
+/// When the gRPC stream fails, instead of exiting, the processor enters a
+/// "disconnected" state and waits for the next user message to attempt
+/// reconnection. This enables auto-recovery from agent-worker crashes.
 #[allow(clippy::too_many_arguments)]
 async fn message_processor(
     mut message_rx: mpsc::Receiver<String>,
@@ -668,7 +683,9 @@ async fn message_processor(
     plan_mode: Arc<AtomicBool>,
     thinking_mode: Arc<AtomicBool>,
     pending_title: Arc<AtomicBool>,
-    mut stream: GrpcStream,
+    stream: GrpcStream,
+    container_name: String,
+    grpc_addr: String,
 ) {
     use grpc::proto::agent_event;
 
@@ -676,8 +693,74 @@ async fn message_processor(
     let mut in_background = false;
     let mut partial_buf = String::new();
     let mut event_count: u64 = 0;
+    // Stream is Option: None = disconnected, Some = connected
+    let mut stream: Option<GrpcStream> = Some(stream);
 
     loop {
+        // When disconnected, only listen for user messages (to trigger reconnect)
+        if stream.is_none() {
+            let Some(message) = message_rx.recv().await else {
+                tracing::debug!(session_id = %session_id, "Message channel closed (disconnected)");
+                break;
+            };
+
+            tracing::info!(session_id = %session_id, "Attempting reconnect on user message");
+            match reconnect_stream(&container_name, &grpc_addr).await {
+                Ok(new_stream) => {
+                    stream = Some(new_stream);
+                    is_first_message.store(true, Ordering::SeqCst);
+                    let _ = output_tx.send(OutputEvent::WorkerReconnected).await;
+
+                    // Send the message as a CreateSession with resume_session_id
+                    let permission_mode = if plan_mode.load(Ordering::SeqCst) {
+                        "plan"
+                    } else {
+                        "bypassPermissions"
+                    };
+                    let thinking_tokens = if thinking_mode.load(Ordering::SeqCst) { 10000 } else { 0 };
+                    let resume_sid = claude_session_id.lock().unwrap().clone();
+
+                    let _ = output_tx
+                        .send(OutputEvent::ProcessingStarted { input_tokens: 0 })
+                        .await;
+
+                    let send_result = stream.as_mut().unwrap().create(
+                        &message,
+                        permission_mode,
+                        std::collections::HashMap::new(),
+                        "",
+                        thinking_tokens,
+                        resume_sid.as_deref(),
+                    ).await;
+
+                    if let Err(e) = send_result {
+                        tracing::error!(session_id = %session_id, error = %e, "Failed to send after reconnect");
+                        let _ = output_tx.send(OutputEvent::ProcessDied {
+                            exit_code: Some(1),
+                            signal: Some(format!("Reconnect send error: {}", e)),
+                        }).await;
+                        break;
+                    }
+
+                    in_turn = true;
+                    in_background = false;
+                    partial_buf.clear();
+                }
+                Err(e) => {
+                    tracing::error!(session_id = %session_id, error = %e, "Reconnect failed");
+                    let _ = output_tx.send(OutputEvent::ProcessDied {
+                        exit_code: Some(1),
+                        signal: Some(format!("Reconnect failed: {}", e)),
+                    }).await;
+                    break;
+                }
+            }
+            continue;
+        }
+
+        // Connected path — normal select! loop
+        let active_stream = stream.as_mut().unwrap();
+
         tokio::select! {
             biased;
 
@@ -717,15 +800,16 @@ async fn message_processor(
                 let _is_title_request = pending_title.swap(false, Ordering::SeqCst);
 
                 let send_result = if is_first || stored_sid.is_none() {
-                    stream.create(
+                    active_stream.create(
                         &message,
                         permission_mode,
                         std::collections::HashMap::new(),
                         "",
                         thinking_tokens,
+                        None,
                     ).await
                 } else {
-                    stream.follow_up(&message).await
+                    active_stream.follow_up(&message).await
                 };
 
                 if let Err(e) = send_result {
@@ -734,11 +818,14 @@ async fn message_processor(
                         error = %e,
                         "Failed to send gRPC request"
                     );
-                    let _ = output_tx.send(OutputEvent::ProcessDied {
-                        exit_code: Some(1),
-                        signal: Some(format!("gRPC send error: {}", e)),
+                    // Treat send failure as disconnection — enter reconnect mode
+                    let _ = output_tx.send(OutputEvent::WorkerDisconnected {
+                        reason: format!("gRPC send error: {}", e),
                     }).await;
-                    break;
+                    stream = None;
+                    in_turn = false;
+                    in_background = false;
+                    continue;
                 }
 
                 in_turn = true;
@@ -747,7 +834,7 @@ async fn message_processor(
             }
 
             // Continuously read gRPC events (both during and between turns)
-            event_result = stream.next_event() => {
+            event_result = active_stream.next_event() => {
                 match event_result {
                     Ok(Some(event)) => {
                         event_count += 1;
@@ -771,7 +858,9 @@ async fn message_processor(
                                 let stored_sid = claude_session_id.lock().unwrap().clone();
                                 if stored_sid.is_none() {
                                     tracing::info!(session_id_grpc = %init.session_id, "gRPC: SessionInit received");
-                                    *claude_session_id.lock().unwrap() = Some(init.session_id);
+                                    *claude_session_id.lock().unwrap() = Some(init.session_id.clone());
+                                    // Emit SessionIdCaptured for DB persistence
+                                    let _ = output_tx.send(OutputEvent::SessionIdCaptured(init.session_id)).await;
                                 }
                             }
                             agent_event::Event::Text(text) => {
@@ -889,22 +978,29 @@ async fn message_processor(
                         }
                     }
                     Ok(None) => {
-                        // Stream ended (server closed)
-                        tracing::info!(event_count, "gRPC: Response stream ended");
+                        // Stream ended (server closed) — enter disconnected state
+                        tracing::warn!(event_count, session_id = %session_id, "gRPC: Response stream ended, entering disconnected state");
                         if !partial_buf.is_empty() {
                             let _ = output_tx
                                 .send(OutputEvent::TextLine(std::mem::take(&mut partial_buf)))
                                 .await;
                         }
-                        break;
+                        let _ = output_tx.send(OutputEvent::WorkerDisconnected {
+                            reason: "gRPC stream closed by server".to_string(),
+                        }).await;
+                        stream = None;
+                        in_turn = false;
+                        in_background = false;
                     }
                     Err(e) => {
-                        tracing::error!(event_count, error = %e, "gRPC: Stream error");
-                        let _ = output_tx.send(OutputEvent::ProcessDied {
-                            exit_code: Some(1),
-                            signal: Some(format!("gRPC stream error: {}", e)),
+                        // Stream error — enter disconnected state
+                        tracing::warn!(event_count, error = %e, session_id = %session_id, "gRPC: Stream error, entering disconnected state");
+                        let _ = output_tx.send(OutputEvent::WorkerDisconnected {
+                            reason: format!("gRPC stream error: {}", e),
                         }).await;
-                        break;
+                        stream = None;
+                        in_turn = false;
+                        in_background = false;
                     }
                 }
             }

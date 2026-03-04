@@ -22,6 +22,7 @@ message CreateSession {
   string system_prompt_append = 4;
   int32 max_turns = 5;
   int32 max_thinking_tokens = 6;
+  string resume_session_id = 7;
 }
 
 message FollowUp {

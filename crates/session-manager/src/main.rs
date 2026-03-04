@@ -729,9 +729,68 @@ async fn cleanup_session(state: &AppState, session_id: &str) {
     tracing::info!(session_id = %session_id, "Session cleaned up");
 }
 
-/// Stop a session by ID, cleaning up container and database.
+/// Stop a session by ID — soft-delete (mark as "stopped" in DB) so it can be resumed.
+/// Still removes from in-memory state, decrements container session count, releases repo lock.
 async fn stop_session(state: &Arc<AppState>, session: &database::StoredSession) {
-    cleanup_session(state, &session.session_id).await;
+    // Atomic claim — only one caller will succeed
+    let Some(claimed) = state.containers.claim_session(&session.session_id) else {
+        tracing::debug!(session_id = %session.session_id, "Session already cleaned up by another path");
+        return;
+    };
+
+    // Remove from liveness tracking
+    state.liveness.remove(&session.session_id);
+
+    // Unfollow thread for the user
+    if let Some(ref uid) = session.user_id {
+        let mm = state.mm.clone();
+        let uid = uid.clone();
+        let tid = session.thread_id.clone();
+        tokio::spawn(async move {
+            if let Err(e) = mm.unfollow_thread(&uid, &tid).await {
+                tracing::debug!(user_id = %uid, error = %e, "Failed to auto-unfollow thread (non-fatal)");
+            }
+        });
+    }
+
+    // Decrement container session count
+    match state
+        .containers
+        .release_session(&state.db, &claimed.repo, &claimed.branch)
+        .await
+    {
+        Ok(remaining) => {
+            tracing::info!(
+                session_id = %session.session_id,
+                repo = %claimed.repo,
+                branch = %claimed.branch,
+                remaining_sessions = remaining,
+                "Session released from container"
+            );
+        }
+        Err(e) => {
+            tracing::warn!(
+                session_id = %session.session_id, error = %e,
+                "Failed to decrement container session count"
+            );
+        }
+    }
+
+    // Release repo lock
+    state.git.release_repo_by_session(&session.session_id);
+
+    // Clean up worktree if present
+    if let Some(ref wt_path) = claimed.worktree_path {
+        state.git.cleanup_worktree_by_path(wt_path).await;
+    }
+
+    // Soft-delete: mark as "stopped" instead of deleting
+    if let Err(e) = state.db.update_session_status(&session.session_id, "stopped").await {
+        tracing::warn!(session_id = %session.session_id, error = %e, "Failed to update session status to stopped");
+    }
+
+    gauge!("active_sessions").decrement(1.0);
+    tracing::info!(session_id = %session.session_id, "Session stopped (soft-deleted)");
 }
 
 /// Format a chrono::Duration as a human-readable string (e.g. "2h 15m", "5m", "30s")
@@ -1106,10 +1165,137 @@ async fn handle_messages(
                 // Track activity
                 let _ = state.db.touch_session(&session.session_id).await;
             } else if text.starts_with(bot_trigger) {
-                let _ = state
-                    .mm
-                    .post_in_thread(channel_id, root_id, "No active session in this thread.")
-                    .await;
+                let cmd = text.trim_start_matches(bot_trigger).trim();
+
+                // Check for `resume` command on a stopped session
+                if cmd == "resume" {
+                    match state.db.get_stopped_session_by_thread(channel_id, root_id).await {
+                        Ok(Some(stopped)) => {
+                            let _ = state
+                                .mm
+                                .post_in_thread(channel_id, root_id, "Resuming session...")
+                                .await;
+
+                            // Parse repo/branch from stored project
+                            let parts: Vec<&str> = stopped.project.splitn(2, '@').collect();
+                            let repo = parts[0].to_string();
+                            let branch = parts.get(1).unwrap_or(&"").to_string();
+
+                            // Get grpc_port from registry
+                            let grpc_port = state
+                                .containers
+                                .registry
+                                .get_container(&repo, &branch)
+                                .await
+                                .map(|e| {
+                                    if e.grpc_port == 0 {
+                                        config::settings().grpc_port_start
+                                    } else {
+                                        e.grpc_port
+                                    }
+                                })
+                                .unwrap_or(config::settings().grpc_port_start);
+
+                            let (output_tx, output_rx) = mpsc::channel::<OutputEvent>(100);
+                            let new_session_id = Uuid::new_v4().to_string();
+
+                            // Try to reuse the existing container
+                            match state.containers.reconnect(
+                                &new_session_id,
+                                &stopped.container_name,
+                                &stopped.project_path,
+                                &repo,
+                                &branch,
+                                &stopped.session_type,
+                                output_tx,
+                                grpc_port,
+                            ).await {
+                                Ok(()) => {
+                                    // Register liveness
+                                    state.liveness.register(&new_session_id);
+
+                                    // Increment container session count
+                                    let _ = state.containers.registry.increment_sessions(&state.db, &repo, &branch).await;
+
+                                    // Create new DB session record with the stored claude_session_id
+                                    if let Err(e) = state.db.create_session(
+                                        &new_session_id,
+                                        channel_id,
+                                        root_id,
+                                        &stopped.project,
+                                        &stopped.project_path,
+                                        &stopped.container_name,
+                                        &stopped.session_type,
+                                        None,
+                                        stopped.user_id.as_deref(),
+                                    ).await {
+                                        tracing::error!(error = %e, "Failed to persist resumed session");
+                                        let _ = state.mm.post_in_thread(channel_id, root_id, &format!("Resume failed: {}", e)).await;
+                                        continue;
+                                    }
+
+                                    // Copy claude_session_id from stopped session for future resume
+                                    if let Some(ref csid) = stopped.claude_session_id {
+                                        let _ = state.db.update_claude_session_id(&new_session_id, csid).await;
+                                    }
+
+                                    // Delete the old stopped session record
+                                    let _ = state.db.delete_session(&stopped.session_id).await;
+
+                                    gauge!("active_sessions").increment(1.0);
+
+                                    let _ = state
+                                        .mm
+                                        .post_in_thread(channel_id, root_id, "Session resumed.")
+                                        .await;
+
+                                    // Start output streaming
+                                    let state_clone = state.clone();
+                                    let channel_id_clone = channel_id.to_string();
+                                    let thread_id_clone = root_id.to_string();
+                                    let session_id_clone = new_session_id.clone();
+                                    let session_type_clone = stopped.session_type.clone();
+                                    let project_clone = stopped.project.clone();
+                                    tokio::spawn(async move {
+                                        stream_output(
+                                            state_clone,
+                                            channel_id_clone,
+                                            thread_id_clone,
+                                            session_id_clone,
+                                            session_type_clone,
+                                            project_clone,
+                                            output_rx,
+                                        )
+                                        .await;
+                                    });
+                                }
+                                Err(e) => {
+                                    let _ = state
+                                        .mm
+                                        .post_in_thread(channel_id, root_id, &format!("Resume failed: {}", e))
+                                        .await;
+                                }
+                            }
+                        }
+                        Ok(None) => {
+                            let _ = state
+                                .mm
+                                .post_in_thread(channel_id, root_id, "No stopped session in this thread to resume.")
+                                .await;
+                        }
+                        Err(e) => {
+                            let _ = state
+                                .mm
+                                .post_in_thread(channel_id, root_id, &format!("Error: {}", e))
+                                .await;
+                        }
+                    }
+                } else {
+                    let _ = state
+                        .mm
+                        .post_in_thread(channel_id, root_id, "No active session in this thread. Use `@claude resume` to restart a stopped session.")
+                        .await;
+                }
             }
             // Non-bot thread replies to non-session threads are silently ignored
         } else {
@@ -1871,6 +2057,36 @@ async fn stream_output(
                         card.finalize_error(exit_code, &signal);
                         card.flush(&state, &channel_id, &thread_id).await;
                         card.post_id = None;
+                    }
+                    OutputEvent::WorkerDisconnected { reason } => {
+                        tracing::warn!(session_id = %session_id, reason = %reason, "stream_output: WorkerDisconnected");
+                        drain_batch_to_card(&mut card, &state, &channel_id, &thread_id, &mut batch, &mut batch_bytes).await;
+
+                        card.finalize_error(None, &Some(format!("Worker disconnected: {}", reason)));
+                        card.flush(&state, &channel_id, &thread_id).await;
+                        card.post_id = None;
+
+                        // Update session status to disconnected in DB
+                        let _ = state.db.update_session_status(&session_id, "disconnected").await;
+
+                        let _ = state.mm.post_in_thread(
+                            &channel_id, &thread_id,
+                            ":warning: Worker disconnected. Send a message to reconnect automatically.",
+                        ).await;
+                    }
+                    OutputEvent::WorkerReconnected => {
+                        tracing::info!(session_id = %session_id, "stream_output: WorkerReconnected");
+                        // Update session status back to active
+                        let _ = state.db.update_session_status(&session_id, "active").await;
+
+                        let _ = state.mm.post_in_thread(
+                            &channel_id, &thread_id,
+                            ":white_check_mark: Worker reconnected. Resuming session.",
+                        ).await;
+                    }
+                    OutputEvent::SessionIdCaptured(claude_sid) => {
+                        tracing::info!(session_id = %session_id, claude_sid = %claude_sid, "stream_output: SessionIdCaptured");
+                        let _ = state.db.update_claude_session_id(&session_id, &claude_sid).await;
                     }
                 }
             }

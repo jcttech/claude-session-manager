@@ -180,6 +180,7 @@ class AgentWorkerServicer(agent_pb2_grpc.AgentWorkerServicer):
                             system_prompt_append=req.system_prompt_append,
                             max_turns=req.max_turns or None,
                             max_thinking_tokens=req.max_thinking_tokens or None,
+                            resume_session_id=req.resume_session_id or None,
                         )
                         msg_stream = client._query.receive_messages().__aiter__()
 

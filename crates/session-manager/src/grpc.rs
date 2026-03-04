@@ -106,6 +106,7 @@ impl GrpcStream {
         env: HashMap<String, String>,
         system_prompt_append: &str,
         max_thinking_tokens: i32,
+        resume_session_id: Option<&str>,
     ) -> Result<()> {
         let input = proto::SessionInput {
             input: Some(proto::session_input::Input::Create(proto::CreateSession {
@@ -115,6 +116,7 @@ impl GrpcStream {
                 system_prompt_append: system_prompt_append.to_string(),
                 max_turns: 0,
                 max_thinking_tokens,
+                resume_session_id: resume_session_id.unwrap_or("").to_string(),
             })),
         };
         self.request_tx

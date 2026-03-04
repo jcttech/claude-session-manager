@@ -28,6 +28,7 @@ class SessionManager:
         system_prompt_append: str = "",
         max_turns: int | None = None,
         max_thinking_tokens: int | None = None,
+        resume_session_id: str | None = None,
     ) -> ClaudeSDKClient:
         """Create a new ClaudeSDKClient and start an execution.
 
@@ -43,6 +44,7 @@ class SessionManager:
             include_partial_messages=True,
             max_thinking_tokens=max_thinking_tokens or None,
             disallowed_tools=["AskUserQuestion"],
+            resume=resume_session_id or None,
         )
 
         client = ClaudeSDKClient(options)
