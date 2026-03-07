@@ -18,7 +18,7 @@ use mattermost_client::{Mattermost, Post, sanitize_channel_name};
 use session_manager::config;
 use session_manager::container::ContainerManager;
 use session_manager::crypto::{sign_request, verify_signature};
-use session_manager::database::{self, Database, StoredTeamRole};
+use session_manager::database::{self, Database, StoredSession, StoredTeamRole};
 use session_manager::git::{GitManager, RepoRef};
 use session_manager::liveness::{LivenessState, format_duration_short};
 use session_manager::opnsense::OPNsense;
@@ -2193,7 +2193,8 @@ async fn stream_output(
                             // Check for [SPAWN:Role] marker
                             if let Some(caps) = spawn_re.captures(&line) {
                                 let role_name = caps[1].trim().to_string();
-                                let has_worktree = line.contains("--worktree");
+                                let bracket_end = line.find(']').unwrap_or(line.len());
+                                let has_worktree = line[..bracket_end].contains("--worktree");
                                 let initial_task = caps[2].trim().to_string();
                                 drain_batch_to_card(&mut card, &state, &channel_id, &thread_id, &mut batch, &mut batch_bytes).await;
                                 let spawn_state = state.clone();
@@ -2447,6 +2448,11 @@ async fn stream_output(
 /// Build the team context header prepended to every message delivered to a team member.
 async fn build_team_context_header(db: &Database, team_id: &str, recipient_role: &str) -> String {
     let members = db.get_team_members(team_id).await.unwrap_or_default();
+    format_team_context_header(&members, recipient_role)
+}
+
+/// Build context header from a pre-fetched member list (avoids repeated DB queries).
+fn format_team_context_header(members: &[StoredSession], recipient_role: &str) -> String {
     let member_list: Vec<String> = members
         .iter()
         .filter_map(|m| m.role.clone())
@@ -2566,11 +2572,12 @@ async fn route_team_message(
         }
     };
 
-    // Deliver to all matching sessions
+    // Deliver to all matching sessions (fetch member list once)
+    let members = state.db.get_team_members(team_id).await.unwrap_or_default();
     let mut delivered_roles = Vec::new();
     for target in &targets {
         let role = target.role.as_deref().unwrap_or(target_role);
-        let header = build_team_context_header(&state.db, team_id, role).await;
+        let header = format_team_context_header(&members, role);
         let formatted = format!("{}\n**From {}**: {}", header, sender_role, message);
         if let Err(e) = state.containers.send(&target.session_id, &formatted).await {
             tracing::warn!(error = %e, role, "Failed to deliver team message");
@@ -2618,7 +2625,7 @@ async fn broadcast_team_message(
             continue;
         }
         let target_role = member.role.as_deref().unwrap_or("Unknown");
-        let header = build_team_context_header(&state.db, team_id, target_role).await;
+        let header = format_team_context_header(&members, target_role);
         let formatted = format!("{}\n**From {} (broadcast)**: {}", header, sender_role, message);
         if state.containers.send(&member.session_id, &formatted).await.is_ok() {
             sent_count += 1;

@@ -1034,7 +1034,7 @@ impl Database {
         ))
         .bind(team_id)
         .bind(role)
-        .bind(format!("{} %", role))
+        .bind(format!("{} %", role.replace('%', "\\%").replace('_', "\\_")))
         .fetch_all(&self.pool)
         .await?;
         Ok(sessions)
@@ -1050,7 +1050,7 @@ impl Database {
             "UPDATE {}.sessions SET context_tokens = $1 WHERE session_id = $2",
             SCHEMA
         ))
-        .bind(tokens as i64)
+        .bind(i64::try_from(tokens).unwrap_or(i64::MAX))
         .bind(session_id)
         .execute(&self.pool)
         .await?;
