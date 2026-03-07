@@ -109,6 +109,14 @@ const SCHEMA: &str = "session_manager";
 /// Create schema and all tables/indexes for the given schema name.
 /// Used by both production initialization and integration tests.
 pub async fn create_schema(pool: &PgPool, schema: &str) -> Result<()> {
+    // Validate schema name to prevent SQL injection — only allow valid PG identifiers
+    if !schema.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        || schema.is_empty()
+        || schema.starts_with(|c: char| c.is_ascii_digit())
+    {
+        anyhow::bail!("Invalid schema name: {}", schema);
+    }
+
     sqlx::query(&format!("CREATE SCHEMA IF NOT EXISTS {}", schema))
         .execute(pool)
         .await?;
