@@ -2330,7 +2330,9 @@ async fn stream_output(
                                     "**Context Alert**: {} is at {}% context capacity ({}/200k).\nConsider sending them a `compact` or `clear` instruction, or reassigning remaining work.",
                                     role, usage_pct, format_token_count(input_tokens)
                                 );
-                                if let Ok(Some(lead)) = state.db.get_session_by_role(tid, "Team Lead").await {
+                                if let Ok(leads) = state.db.get_sessions_by_role(tid, "Team Lead").await
+                                    && let Some(lead) = leads.first()
+                                {
                                     let header = build_team_context_header(&state.db, tid, "Team Lead").await;
                                     let _ = state.containers.send(&lead.session_id, &format!("{}\n{}", header, alert_msg)).await;
                                 }
@@ -2344,7 +2346,8 @@ async fn stream_output(
                             let _ = state.containers.send(&session_id, "/compact").await;
                             let _ = state.db.record_compaction(&session_id).await;
                             if role != "Team Lead"
-                                && let Ok(Some(lead)) = state.db.get_session_by_role(tid, "Team Lead").await
+                                && let Ok(leads) = state.db.get_sessions_by_role(tid, "Team Lead").await
+                                && let Some(lead) = leads.first()
                             {
                                 let header = build_team_context_header(&state.db, tid, "Team Lead").await;
                                 let compact_msg = format!(
@@ -2533,7 +2536,8 @@ Each message you receive will include a [TEAM: ...] header with the current rost
     )
 }
 
-/// Route a message from one team member to another.
+/// Route a message from one team member to another (or all matching a role).
+/// `[TO:Developer]` fans out to "Developer", "Developer 1", "Developer 2", etc.
 async fn route_team_message(
     state: &AppState,
     sender_session_id: &str,
@@ -2543,12 +2547,10 @@ async fn route_team_message(
     team_id: &str,
     _channel_id: &str,
 ) {
-    // Find target session by role
-    let target = match state.db.get_session_by_role(team_id, target_role).await {
-        Ok(Some(s)) => s,
-        Ok(None) => {
+    // Find target sessions by role (exact + prefix match)
+    let targets = match state.db.get_sessions_by_role(team_id, target_role).await {
+        Ok(sessions) if sessions.is_empty() => {
             tracing::warn!(team_id, target_role, "Team message target not found");
-            // Notify sender about missing target
             if let Ok(Some(sender)) = state.db.get_session_by_id_prefix(&sender_session_id[..8.min(sender_session_id.len())]).await {
                 let _ = state.mm.post_in_thread(
                     &sender.channel_id, &sender.thread_id,
@@ -2557,27 +2559,39 @@ async fn route_team_message(
             }
             return;
         }
+        Ok(sessions) => sessions,
         Err(e) => {
             tracing::error!(error = %e, "Failed to look up team member by role");
             return;
         }
     };
 
-    // Build context header and formatted message
-    let header = build_team_context_header(&state.db, team_id, target_role).await;
-    let formatted = format!("{}\n**From {}**: {}", header, sender_role, message);
-
-    // Send to target session
-    if let Err(e) = state.containers.send(&target.session_id, &formatted).await {
-        tracing::warn!(error = %e, target_role, "Failed to deliver team message");
+    // Deliver to all matching sessions
+    let mut delivered_roles = Vec::new();
+    for target in &targets {
+        let role = target.role.as_deref().unwrap_or(target_role);
+        let header = build_team_context_header(&state.db, team_id, role).await;
+        let formatted = format!("{}\n**From {}**: {}", header, sender_role, message);
+        if let Err(e) = state.containers.send(&target.session_id, &formatted).await {
+            tracing::warn!(error = %e, role, "Failed to deliver team message");
+        } else {
+            delivered_roles.push(role.to_string());
+        }
     }
 
     // Post delivery note in sender's thread
-    if let Ok(Some(sender)) = state.db.get_session_by_id_prefix(&sender_session_id[..8.min(sender_session_id.len())]).await {
-        let _ = state.mm.post_in_thread(
-            &sender.channel_id, &sender.thread_id,
-            &format!(":arrow_right: Message sent to **{}**", target_role),
-        ).await;
+    if !delivered_roles.is_empty() {
+        if let Ok(Some(sender)) = state.db.get_session_by_id_prefix(&sender_session_id[..8.min(sender_session_id.len())]).await {
+            let label = if delivered_roles.len() == 1 {
+                delivered_roles[0].clone()
+            } else {
+                delivered_roles.join(", ")
+            };
+            let _ = state.mm.post_in_thread(
+                &sender.channel_id, &sender.thread_id,
+                &format!(":arrow_right: Message sent to **{}**", label),
+            ).await;
+        }
     }
 }
 
@@ -2789,9 +2803,13 @@ async fn find_team_role(db: &Database, name: &str) -> Option<StoredTeamRole> {
     if let Some(r) = roles.iter().find(|r| r.display_name.to_lowercase() == name_lower) {
         return Some(r.clone());
     }
-    // Prefix match (e.g., "Dev" matches "Developer")
-    if let Some(r) = roles.iter().find(|r| r.display_name.to_lowercase().starts_with(&name_lower)) {
-        return Some(r.clone());
+    // Prefix match — only if unambiguous (e.g., "QA" matches "QA Engineer" but "Dev" is
+    // ambiguous between "Developer" and "DevOps Engineer")
+    let prefix_matches: Vec<_> = roles.iter()
+        .filter(|r| r.display_name.to_lowercase().starts_with(&name_lower))
+        .collect();
+    if prefix_matches.len() == 1 {
+        return Some(prefix_matches[0].clone());
     }
     // role_name match (e.g., "developer" matches)
     if let Some(r) = roles.iter().find(|r| r.role_name.to_lowercase() == name_lower) {

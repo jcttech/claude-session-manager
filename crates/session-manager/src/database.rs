@@ -1012,22 +1012,24 @@ impl Database {
         Ok(())
     }
 
-    /// Find a team member by role name.
-    pub async fn get_session_by_role(
+    /// Find team members by role name. Matches exact role or role prefix
+    /// (e.g., "Developer" matches "Developer 1", "Developer 2").
+    pub async fn get_sessions_by_role(
         &self,
         team_id: &str,
         role: &str,
-    ) -> Result<Option<StoredSession>> {
-        let session = sqlx::query_as::<_, StoredSession>(&format!(
+    ) -> Result<Vec<StoredSession>> {
+        let sessions = sqlx::query_as::<_, StoredSession>(&format!(
             "SELECT session_id, channel_id, thread_id, project, project_path, container_name, container_id, session_type, parent_session_id, user_id, created_at, last_activity_at, message_count, compaction_count, claude_session_id, status, team_id, role, context_tokens \
-             FROM {}.sessions WHERE team_id = $1 AND role = $2 AND status IN ('active', 'disconnected')",
+             FROM {}.sessions WHERE team_id = $1 AND (role = $2 OR role LIKE $3) AND status IN ('active', 'disconnected')",
             SCHEMA
         ))
         .bind(team_id)
         .bind(role)
-        .fetch_optional(&self.pool)
+        .bind(format!("{} %", role))
+        .fetch_all(&self.pool)
         .await?;
-        Ok(session)
+        Ok(sessions)
     }
 
     /// Update context tokens for a session.
