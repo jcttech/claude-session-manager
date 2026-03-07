@@ -1,0 +1,19 @@
+name: Claude PR Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+  id-token: write
+
+jobs:
+  review:
+    uses: jcttech/.github/.github/workflows/claude-review.yml@main
+    with:
+      model: claude-opus-4-6
+      max-turns: 20
+    secrets: inherit

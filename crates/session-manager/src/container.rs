@@ -99,6 +99,7 @@ impl ContainerManager {
         plan_mode: bool,
         thinking_mode: bool,
         session_type: &str,
+        system_prompt_append: Option<&str>,
     ) -> Result<StartResult> {
         let s = settings();
         let mut warning: Option<String> = None;
@@ -177,6 +178,7 @@ impl ContainerManager {
         self.create_session_internal(
             session_id, &container_name, project_path, repo, branch,
             output_tx, plan_mode, thinking_mode, session_type, grpc_port,
+            system_prompt_append,
         ).await?;
 
         Ok(StartResult {
@@ -314,6 +316,7 @@ impl ContainerManager {
         thinking_mode: bool,
         session_type: &str,
         grpc_port: u16,
+        system_prompt_append: Option<&str>,
     ) -> Result<()> {
         let s = settings();
         let grpc_addr = format!("http://{}:{}", s.vm_host, grpc_port);
@@ -352,6 +355,7 @@ impl ContainerManager {
         let pending_title_clone = Arc::clone(&pending_title_flag);
         let container_name_owned = container_name.to_string();
         let grpc_addr_owned = grpc_addr.clone();
+        let system_prompt_owned = system_prompt_append.unwrap_or("").to_string();
         tokio::spawn(async move {
             message_processor(
                 message_rx,
@@ -365,6 +369,7 @@ impl ContainerManager {
                 grpc_stream,
                 container_name_owned,
                 grpc_addr_owned,
+                system_prompt_owned,
             ).await;
         });
 
@@ -407,7 +412,7 @@ impl ContainerManager {
     ) -> Result<()> {
         self.create_session_internal(
             session_id, container_name, project_path, repo, branch,
-            output_tx, false, false, session_type, grpc_port,
+            output_tx, false, false, session_type, grpc_port, None,
         ).await?;
 
         tracing::info!(
@@ -686,6 +691,7 @@ async fn message_processor(
     stream: GrpcStream,
     container_name: String,
     grpc_addr: String,
+    system_prompt_append: String,
 ) {
     use grpc::proto::agent_event;
 
@@ -728,7 +734,7 @@ async fn message_processor(
                         &message,
                         permission_mode,
                         std::collections::HashMap::new(),
-                        "",
+                        &system_prompt_append,
                         thinking_tokens,
                         resume_sid.as_deref(),
                     ).await;
@@ -804,7 +810,7 @@ async fn message_processor(
                         &message,
                         permission_mode,
                         std::collections::HashMap::new(),
-                        "",
+                        &system_prompt_append,
                         thinking_tokens,
                         None,
                     ).await
