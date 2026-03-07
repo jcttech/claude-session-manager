@@ -1,0 +1,24 @@
+project:
+  name: "claude-session-manager"
+  owner: "jcttech"
+  project_number: 4
+
+labels:
+  components: []
+
+review:
+  claude_review:
+    enabled: true
+    model: claude-opus-4-6
+    max_turns: 20
+  auto_merge:
+    enabled: false
+    require_ci: true
+    required_reviews: 1
+    eligible_labels: ["status:approved"]
+
+docs:
+  architecture: true
+  components: true
+  roadmap: true
+  changelog: true

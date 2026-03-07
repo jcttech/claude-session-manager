@@ -18,7 +18,7 @@ use mattermost_client::{Mattermost, Post, sanitize_channel_name};
 use session_manager::config;
 use session_manager::container::ContainerManager;
 use session_manager::crypto::{sign_request, verify_signature};
-use session_manager::database::{self, Database};
+use session_manager::database::{self, Database, StoredTeamRole};
 use session_manager::git::{GitManager, RepoRef};
 use session_manager::liveness::{LivenessState, format_duration_short};
 use session_manager::opnsense::OPNsense;
@@ -30,10 +30,46 @@ const APP_VERSION: &str = env!("APP_VERSION");
 
 /// Cached regex for network request detection (compiled once on first use)
 static NETWORK_REQUEST_RE: OnceLock<Regex> = OnceLock::new();
+/// Team marker regexes (compiled once on first use)
+static TEAM_SPAWN_RE: OnceLock<Regex> = OnceLock::new();
+static TEAM_MSG_RE: OnceLock<Regex> = OnceLock::new();
+static TEAM_BROADCAST_RE: OnceLock<Regex> = OnceLock::new();
+static TEAM_MSG_END_RE: OnceLock<Regex> = OnceLock::new();
+static TEAM_STATUS_RE: OnceLock<Regex> = OnceLock::new();
 
 fn network_request_regex() -> &'static Regex {
     NETWORK_REQUEST_RE.get_or_init(|| {
         Regex::new(r"\[NETWORK_REQUEST:\s*([^\]]+)\]").expect("Invalid regex pattern")
+    })
+}
+
+fn team_spawn_regex() -> &'static Regex {
+    TEAM_SPAWN_RE.get_or_init(|| {
+        Regex::new(r"\[SPAWN:([^\]]+?)(?:\s+--worktree)?\]\s*(.*)").expect("Invalid regex")
+    })
+}
+
+fn team_msg_regex() -> &'static Regex {
+    TEAM_MSG_RE.get_or_init(|| {
+        Regex::new(r"\[TO:([^\]]+)\]\s*(.*)").expect("Invalid regex")
+    })
+}
+
+fn team_broadcast_regex() -> &'static Regex {
+    TEAM_BROADCAST_RE.get_or_init(|| {
+        Regex::new(r"\[BROADCAST\]\s*(.*)").expect("Invalid regex")
+    })
+}
+
+fn team_msg_end_regex() -> &'static Regex {
+    TEAM_MSG_END_RE.get_or_init(|| {
+        Regex::new(r"\[/MSG\]").expect("Invalid regex")
+    })
+}
+
+fn team_status_regex() -> &'static Regex {
+    TEAM_STATUS_RE.get_or_init(|| {
+        Regex::new(r"\[TEAM_STATUS\]").expect("Invalid regex")
     })
 }
 
@@ -462,6 +498,9 @@ async fn start_session(
     plan_mode: bool,
     thinking_mode: bool,
     user_id: Option<&str>,
+    team_id: Option<&str>,
+    role: Option<&str>,
+    system_prompt: Option<&str>,
 ) -> Result<String> {
     use std::path::PathBuf;
 
@@ -500,11 +539,7 @@ async fn start_session(
     };
 
     // Post root message to create thread anchor
-    let root_msg = match session_type {
-        "worker" => format!("**Worker session** for **{}**", repo_ref.full_name()),
-        "reviewer" => format!("**Reviewer session** for **{}**", repo_ref.full_name()),
-        _ => format!("**Session** for **{}**", repo_ref.full_name()),
-    };
+    let root_msg = format_root_label(session_type, &repo_ref.full_name(), role);
     let thread_id = state.mm.post_root(channel_id, &root_msg).await?;
 
     let _ = state
@@ -529,6 +564,7 @@ async fn start_session(
             plan_mode,
             thinking_mode,
             session_type,
+            system_prompt,
         )
         .await
     {
@@ -579,6 +615,13 @@ async fn start_session(
                     "Failed to persist session to database: {}",
                     e
                 ));
+            }
+
+            // Link session to team if applicable
+            if let (Some(tid), Some(r)) = (team_id, role)
+                && let Err(e) = state.db.set_session_team(&session_id, tid, r).await
+            {
+                tracing::warn!(session_id = %session_id, error = %e, "Failed to link session to team");
             }
 
             // Auto-follow thread for the requesting user (fire-and-forget)
@@ -810,7 +853,10 @@ fn format_duration(d: chrono::Duration) -> String {
 }
 
 /// Format the root post label for a session thread (e.g. "**Session** for **org/repo**")
-fn format_root_label(session_type: &str, project: &str) -> String {
+fn format_root_label(session_type: &str, project: &str, role: Option<&str>) -> String {
+    if let Some(role) = role {
+        return format!("**{}** for **{}**", role, project);
+    }
     match session_type {
         "worker" => format!("**Worker session** for **{}**", project),
         "reviewer" => format!("**Reviewer session** for **{}**", project),
@@ -850,6 +896,18 @@ async fn handle_messages(
                 if text.starts_with(bot_trigger) {
                     let cmd = text.trim_start_matches(bot_trigger).trim();
                     if cmd == "stop" {
+                        // If this is a team lead, stop all team members first
+                        if session.session_type == "team_lead" {
+                            if let Some(ref tid) = session.team_id {
+                                stop_team(&state, tid, &session).await;
+                            }
+                        } else if session.team_id.is_some() {
+                            // Team member stopped — notify lead
+                            if let Some(ref tid) = session.team_id {
+                                let role_name = session.role.as_deref().unwrap_or("Unknown");
+                                notify_team_member_left(&state, tid, role_name, &session.session_id).await;
+                            }
+                        }
                         stop_session(&state, &session).await;
                         let _ = state
                             .mm
@@ -1051,7 +1109,7 @@ async fn handle_messages(
                                 .await;
                         } else {
                             // Manual title
-                            let label = format_root_label(&session.session_type, &session.project);
+                            let label = format_root_label(&session.session_type, &session.project, None);
                             let _ = state
                                 .mm
                                 .update_post(root_id, &format!("{} — {}", label, arg))
@@ -1149,13 +1207,22 @@ async fn handle_messages(
                         continue;
                     }
                 }
-                // Forward message to session
+                // Forward message to session (with team context if applicable)
                 tracing::info!(
                     session_id = %session.session_id,
                     text_len = text.len(),
                     "Forwarding thread message to session"
                 );
-                if let Err(e) = state.containers.send(&session.session_id, text).await {
+                let forwarded_text = if let Some(ref tid) = session.team_id {
+                    let header = build_team_context_header(
+                        &state.db, tid,
+                        session.role.as_deref().unwrap_or("Unknown"),
+                    ).await;
+                    format!("{}\n**From User**: {}", header, text)
+                } else {
+                    text.to_string()
+                };
+                if let Err(e) = state.containers.send(&session.session_id, &forwarded_text).await {
                     tracing::warn!(
                         session_id = %session.session_id,
                         error = %e,
@@ -1353,6 +1420,7 @@ async fn handle_messages(
                                     plan_mode,
                                     thinking_mode,
                                     Some(&post.user_id),
+                                    None, None, None,
                                 )
                                 .await
                                 {
@@ -1397,6 +1465,92 @@ async fn handle_messages(
                                     project_input,
                                 )).await;
                             }
+                        }
+                    }
+                    continue;
+                }
+
+                // --- team <org/repo> [--devs N] ---
+                if let Some(team_input) = cmd_text.strip_prefix("team ").map(|s| s.trim()) {
+                    if team_input.is_empty() {
+                        let _ = state.mm.post(channel_id, "Usage: `@claude team <org/repo> [--devs N]`").await;
+                        continue;
+                    }
+
+                    // Parse --devs N flag
+                    let words: Vec<&str> = team_input.split_whitespace().collect();
+                    let mut dev_count: i32 = 1;
+                    let mut project_words = Vec::new();
+                    let mut i = 0;
+                    while i < words.len() {
+                        if words[i] == "--devs"
+                            && let Some(n) = words.get(i + 1).and_then(|s| s.parse::<i32>().ok())
+                        {
+                            dev_count = n.clamp(1, 5);
+                            i += 2;
+                            continue;
+                        }
+                        project_words.push(words[i]);
+                        i += 1;
+                    }
+                    let project_input = project_words.join(" ");
+
+                    match resolve_project_channel(&state, &project_input, &post.user_id).await {
+                        Ok((proj_channel_id, channel_name, repo_ref)) => {
+                            let team_id = Uuid::new_v4().to_string();
+
+                            // Build Team Lead system prompt
+                            let lead_prompt = match build_team_lead_prompt(&state.db, dev_count).await {
+                                Ok(p) => p,
+                                Err(e) => {
+                                    let _ = state.mm.post(channel_id, &format!("Failed to build team prompt: {}", e)).await;
+                                    continue;
+                                }
+                            };
+
+                            match start_session(
+                                &state,
+                                &proj_channel_id,
+                                &project_input,
+                                &repo_ref,
+                                "team_lead",
+                                false,
+                                false,
+                                Some(&post.user_id),
+                                Some(&team_id),
+                                Some("Team Lead"),
+                                Some(&lead_prompt),
+                            )
+                            .await
+                            {
+                                Ok(session_id) => {
+                                    // Create team record
+                                    let project_path = match state.db.get_session_by_id_prefix(&session_id[..8]).await {
+                                        Ok(Some(s)) => s.project_path,
+                                        _ => String::new(),
+                                    };
+                                    if let Err(e) = state.db.create_team(
+                                        &team_id, &proj_channel_id, &project_input, &project_path,
+                                        &session_id, dev_count,
+                                    ).await {
+                                        tracing::warn!(error = %e, "Failed to create team record");
+                                    }
+
+                                    let _ = state.mm.post(
+                                        channel_id,
+                                        &format!(
+                                            "Team started in ~{}. Send your task to the Team Lead's thread.",
+                                            channel_name,
+                                        ),
+                                    ).await;
+                                }
+                                Err(e) => {
+                                    let _ = state.mm.post(channel_id, &format!("Failed: {}", e)).await;
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            let _ = state.mm.post(channel_id, &format!("Failed: {}", e)).await;
                         }
                     }
                     continue;
@@ -1499,16 +1653,33 @@ async fn handle_messages(
                                 msg.push('\n');
                             }
 
+                            // Show active teams
+                            if let Ok(teams) = state.db.get_active_teams().await
+                                && !teams.is_empty()
+                            {
+                                msg.push_str("**Active Teams:**\n| Team | Project | Members | Age |\n|------|---------|---------|-----|\n");
+                                for t in &teams {
+                                    let members = state.db.get_team_members(&t.team_id).await.unwrap_or_default();
+                                    let age = format_duration(now - t.created_at);
+                                    msg.push_str(&format!(
+                                        "| `{}` | {} | {} | {} |\n",
+                                        &t.team_id[..8], t.project, members.len(), age,
+                                    ));
+                                }
+                                msg.push('\n');
+                            }
+
                             msg.push_str("**Active Sessions:**\n");
                             for s in &sessions {
                                 let idle = now - s.last_activity_at;
+                                let role_str = s.role.as_deref().map(|r| format!(" [{}]", r)).unwrap_or_default();
                                 msg.push_str(&format!(
-                                    "- `{}` | {} | **{}** | {} msgs | {} compactions | idle {}\n",
+                                    "- `{}` | {}{} | **{}** | {} msgs | idle {}\n",
                                     &s.session_id[..8],
                                     s.session_type,
+                                    role_str,
                                     s.project,
                                     s.message_count,
-                                    s.compaction_count,
                                     format_duration(idle),
                                 ));
                             }
@@ -1529,6 +1700,7 @@ async fn handle_messages(
                         - `{trigger} start <repo> --worktree` — Start with isolated worktree\n\
                         - `{trigger} start <repo> --plan` — Start in plan mode (read-only analysis)\n\
                         - `{trigger} start <repo> --thinking` — Start with extended thinking enabled\n\
+                        - `{trigger} team <org/repo> [--devs N]` — Start a team with N developers (default 1)\n\
                         - `{trigger} stop <id-prefix>` — Stop a session by ID prefix\n\
                         - `{trigger} stop --all` — Stop all sessions and tear down all containers\n\
                         - `{trigger} status` — List all active sessions and containers\n\
@@ -1941,6 +2113,23 @@ async fn stream_output(
     mut rx: mpsc::Receiver<OutputEvent>,
 ) {
     let network_re = network_request_regex();
+    let spawn_re = team_spawn_regex();
+    let msg_re = team_msg_regex();
+    let broadcast_re = team_broadcast_regex();
+    let msg_end_re = team_msg_end_regex();
+    let status_re = team_status_regex();
+
+    // Look up team context for this session (cached once)
+    let team_info: Option<(String, String)> = {
+        if let Ok(Some(sess)) = state.db.get_session_by_id_prefix(&session_id[..8.min(session_id.len())]).await {
+            match (sess.team_id, sess.role) {
+                (Some(tid), Some(role)) => Some((tid, role)),
+                _ => None,
+            }
+        } else {
+            None
+        }
+    };
 
     let mut batch: Vec<String> = Vec::new();
     let mut batch_bytes: usize = 0;
@@ -1951,6 +2140,10 @@ async fn stream_output(
     tokio::pin!(heartbeat_timer);
 
     let mut card = LiveCard::new();
+
+    // Team messaging state machine
+    let mut team_msg_target: Option<String> = None; // "Role Name" or "__broadcast__"
+    let mut team_msg_buffer: Vec<String> = Vec::new();
 
     tracing::info!(session_id = %session_id, "stream_output: started");
 
@@ -1975,6 +2168,84 @@ async fn stream_output(
                     }
                     OutputEvent::TextLine(line) => {
                         state.liveness.update_activity(&session_id, "TextLine");
+
+                        // --- Team marker interception (only for team sessions) ---
+                        if let Some((tid, sender_role)) = &team_info {
+
+                            // Multi-line message accumulation mode
+                            if team_msg_target.is_some() {
+                                if msg_end_re.is_match(&line) {
+                                    // Flush accumulated message
+                                    let message = team_msg_buffer.join("\n");
+                                    team_msg_buffer.clear();
+                                    let target = team_msg_target.take().unwrap();
+                                    if target == "__broadcast__" {
+                                        broadcast_team_message(&state, &session_id, sender_role, &message, tid, &channel_id).await;
+                                    } else {
+                                        route_team_message(&state, &session_id, sender_role, &target, &message, tid, &channel_id).await;
+                                    }
+                                } else {
+                                    team_msg_buffer.push(line);
+                                }
+                                continue;
+                            }
+
+                            // Check for [SPAWN:Role] marker
+                            if let Some(caps) = spawn_re.captures(&line) {
+                                let role_name = caps[1].trim().to_string();
+                                let has_worktree = line.contains("--worktree");
+                                let initial_task = caps[2].trim().to_string();
+                                drain_batch_to_card(&mut card, &state, &channel_id, &thread_id, &mut batch, &mut batch_bytes).await;
+                                let spawn_state = state.clone();
+                                let spawn_tid = tid.clone();
+                                let spawn_cid = channel_id.clone();
+                                let spawn_sid = session_id.clone();
+                                let spawn_role = sender_role.clone();
+                                let spawn_project = project.clone();
+                                tokio::spawn(async move {
+                                    handle_team_spawn(
+                                        spawn_state, &spawn_tid, &spawn_cid, &spawn_sid, &spawn_role,
+                                        &role_name, has_worktree, &initial_task, &spawn_project,
+                                    ).await;
+                                });
+                                continue;
+                            }
+
+                            // Check for [TO:Role] marker
+                            if let Some(caps) = msg_re.captures(&line) {
+                                let target_role = caps[1].trim().to_string();
+                                let inline_msg = caps[2].trim().to_string();
+                                if inline_msg.is_empty() {
+                                    // Multi-line mode
+                                    team_msg_target = Some(target_role);
+                                    team_msg_buffer.clear();
+                                } else {
+                                    // Single-line message
+                                    route_team_message(&state, &session_id, sender_role, &target_role, &inline_msg, tid, &channel_id).await;
+                                }
+                                continue;
+                            }
+
+                            // Check for [BROADCAST] marker
+                            if let Some(caps) = broadcast_re.captures(&line) {
+                                let inline_msg = caps[1].trim().to_string();
+                                if inline_msg.is_empty() {
+                                    team_msg_target = Some("__broadcast__".to_string());
+                                    team_msg_buffer.clear();
+                                } else {
+                                    broadcast_team_message(&state, &session_id, sender_role, &inline_msg, tid, &channel_id).await;
+                                }
+                                continue;
+                            }
+
+                            // Check for [TEAM_STATUS] marker
+                            if status_re.is_match(&line) {
+                                handle_team_status(&state, &session_id, tid).await;
+                                continue;
+                            }
+                        }
+
+                        // --- Existing marker checks ---
                         // Check for network request markers
                         if let Some(caps) = network_re.captures(&line) {
                             drain_batch_to_card(&mut card, &state, &channel_id, &thread_id, &mut batch, &mut batch_bytes).await;
@@ -2014,7 +2285,7 @@ async fn stream_output(
                         state.liveness.update_activity(&session_id, "TitleGenerated");
                         drain_batch_to_card(&mut card, &state, &channel_id, &thread_id, &mut batch, &mut batch_bytes).await;
                         let title = title.trim().trim_matches('"');
-                        let label = format_root_label(&session_type, &project);
+                        let label = format_root_label(&session_type, &project, None);
                         let _ = state.mm.update_post(&thread_id, &format!("{} — {}", label, title)).await;
                         let _ = state.mm.post_in_thread(&channel_id, &thread_id, "Title updated.").await;
                     }
@@ -2036,6 +2307,8 @@ async fn stream_output(
 
                         // Persist last input_tokens for status display
                         state.containers.set_last_input_tokens(&session_id, input_tokens);
+                        // Persist to database for cross-restart availability
+                        let _ = state.db.update_context_tokens(&session_id, input_tokens).await;
 
                         counter!("tokens_input_total").increment(input_tokens);
                         counter!("tokens_output_total").increment(output_tokens);
@@ -2048,6 +2321,40 @@ async fn stream_output(
                                 usage_pct, input_tokens
                             );
                             let _ = state.mm.post_in_thread(&channel_id, &thread_id, &msg).await;
+
+                            // Team-aware: notify Team Lead about high context usage
+                            if let Some((ref tid, ref role)) = team_info
+                                && role != "Team Lead"
+                            {
+                                let alert_msg = format!(
+                                    "**Context Alert**: {} is at {}% context capacity ({}/200k).\nConsider sending them a `compact` or `clear` instruction, or reassigning remaining work.",
+                                    role, usage_pct, format_token_count(input_tokens)
+                                );
+                                if let Ok(Some(lead)) = state.db.get_session_by_role(tid, "Team Lead").await {
+                                    let header = build_team_context_header(&state.db, tid, "Team Lead").await;
+                                    let _ = state.containers.send(&lead.session_id, &format!("{}\n{}", header, alert_msg)).await;
+                                }
+                            }
+                        }
+
+                        // Auto-compact at 90% context for team sessions
+                        if input_tokens > 180_000
+                            && let Some((ref tid, ref role)) = team_info
+                        {
+                            let _ = state.containers.send(&session_id, "/compact").await;
+                            let _ = state.db.record_compaction(&session_id).await;
+                            if role != "Team Lead"
+                                && let Ok(Some(lead)) = state.db.get_session_by_role(tid, "Team Lead").await
+                            {
+                                let header = build_team_context_header(&state.db, tid, "Team Lead").await;
+                                let compact_msg = format!(
+                                    "{}\n**Auto-compact**: {} context auto-compacted at {}% ({}k/200k).",
+                                    header, role,
+                                    (input_tokens as f64 / 200_000.0 * 100.0) as u64,
+                                    input_tokens / 1000,
+                                );
+                                let _ = state.containers.send(&lead.session_id, &compact_msg).await;
+                            }
                         }
                     }
                     OutputEvent::ProcessDied { exit_code, signal } => {
@@ -2130,6 +2437,475 @@ async fn stream_output(
     {
         tracing::warn!(error = %e, "Failed to post session end message");
     }
+}
+
+// ==================== Team Functions ====================
+
+/// Build the team context header prepended to every message delivered to a team member.
+async fn build_team_context_header(db: &Database, team_id: &str, recipient_role: &str) -> String {
+    let members = db.get_team_members(team_id).await.unwrap_or_default();
+    let member_list: Vec<String> = members
+        .iter()
+        .filter_map(|m| m.role.clone())
+        .collect();
+    format!(
+        "[TEAM: You are {}. Active members: {}]",
+        recipient_role,
+        member_list.join(", ")
+    )
+}
+
+/// Build the Team Lead's system prompt (static, set at session creation).
+async fn build_team_lead_prompt(db: &Database, dev_count: i32) -> Result<String> {
+    let roles = db.get_all_team_roles().await?;
+    let mut roles_table = String::from("| Role | Description | Multiple | Worktree |\n|------|-------------|----------|----------|\n");
+    for r in &roles {
+        if r.role_name == "team_lead" {
+            continue;
+        }
+        roles_table.push_str(&format!(
+            "| {} | {} | {} | {} |\n",
+            r.display_name, r.description,
+            if r.allow_multiple { "yes" } else { "no" },
+            if r.default_worktree { "yes" } else { "no" },
+        ));
+    }
+
+    let lead_role = roles.iter().find(|r| r.role_name == "team_lead");
+    let responsibilities = lead_role.map(|r| r.responsibilities.as_str()).unwrap_or(
+        "Analyze tasks, spawn team members, coordinate work, resolve conflicts, review and complete PRs"
+    );
+
+    Ok(format!(
+        r#"You are the **Team Lead** of a development team coordinated through Mattermost.
+The user requested {dev_count} developer(s) for this team.
+
+## Available Roles
+{roles_table}
+
+## Spawning Team Members
+  [SPAWN:Developer] Initial task or context
+  [SPAWN:Developer --worktree] Force worktree isolation
+Developer roles are auto-numbered (Developer 1, Developer 2, ...). Other roles are singletons.
+
+## Communication Markers
+  [TO:Role Name] Single-line message
+  [TO:Role Name]
+  Multi-line message
+  [/MSG]
+  [BROADCAST] message [/MSG]
+  [TEAM_STATUS]
+
+Messages from team members arrive prefixed with their role.
+Each message you receive will include a [TEAM: ...] header with the current roster.
+
+## Your Responsibilities
+{responsibilities}
+
+## PR Review & Completion
+When team members create PRs:
+1. Review the PR and ensure automated checks pass
+2. If changes are needed, delegate fixes back to the appropriate team member via [TO:Role]
+3. Once the PR is approved and checks pass, complete/merge the PR"#,
+    ))
+}
+
+/// Build a team member's system prompt (static, set at session creation).
+fn build_team_member_prompt(role: &StoredTeamRole) -> String {
+    format!(
+        r#"You are the **{display_name}** on a development team.
+
+## Communication Markers
+  [TO:Role Name] message
+  [TO:Role Name]
+  multi-line content
+  [/MSG]
+  [BROADCAST] message [/MSG]
+  [TEAM_STATUS]
+
+Messages from other members arrive prefixed with their role.
+Each message you receive will include a [TEAM: ...] header with the current roster.
+
+## Your Responsibilities
+{responsibilities}"#,
+        display_name = role.display_name,
+        responsibilities = role.responsibilities,
+    )
+}
+
+/// Route a message from one team member to another.
+async fn route_team_message(
+    state: &AppState,
+    sender_session_id: &str,
+    sender_role: &str,
+    target_role: &str,
+    message: &str,
+    team_id: &str,
+    _channel_id: &str,
+) {
+    // Find target session by role
+    let target = match state.db.get_session_by_role(team_id, target_role).await {
+        Ok(Some(s)) => s,
+        Ok(None) => {
+            tracing::warn!(team_id, target_role, "Team message target not found");
+            // Notify sender about missing target
+            if let Ok(Some(sender)) = state.db.get_session_by_id_prefix(&sender_session_id[..8.min(sender_session_id.len())]).await {
+                let _ = state.mm.post_in_thread(
+                    &sender.channel_id, &sender.thread_id,
+                    &format!(":warning: No active team member with role **{}**.", target_role),
+                ).await;
+            }
+            return;
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "Failed to look up team member by role");
+            return;
+        }
+    };
+
+    // Build context header and formatted message
+    let header = build_team_context_header(&state.db, team_id, target_role).await;
+    let formatted = format!("{}\n**From {}**: {}", header, sender_role, message);
+
+    // Send to target session
+    if let Err(e) = state.containers.send(&target.session_id, &formatted).await {
+        tracing::warn!(error = %e, target_role, "Failed to deliver team message");
+    }
+
+    // Post delivery note in sender's thread
+    if let Ok(Some(sender)) = state.db.get_session_by_id_prefix(&sender_session_id[..8.min(sender_session_id.len())]).await {
+        let _ = state.mm.post_in_thread(
+            &sender.channel_id, &sender.thread_id,
+            &format!(":arrow_right: Message sent to **{}**", target_role),
+        ).await;
+    }
+}
+
+/// Broadcast a message to all team members except the sender.
+async fn broadcast_team_message(
+    state: &AppState,
+    sender_session_id: &str,
+    sender_role: &str,
+    message: &str,
+    team_id: &str,
+    _channel_id: &str,
+) {
+    let members = match state.db.get_team_members(team_id).await {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::error!(error = %e, "Failed to get team members for broadcast");
+            return;
+        }
+    };
+
+    let mut sent_count = 0;
+    for member in &members {
+        if member.session_id == sender_session_id {
+            continue;
+        }
+        let target_role = member.role.as_deref().unwrap_or("Unknown");
+        let header = build_team_context_header(&state.db, team_id, target_role).await;
+        let formatted = format!("{}\n**From {} (broadcast)**: {}", header, sender_role, message);
+        if state.containers.send(&member.session_id, &formatted).await.is_ok() {
+            sent_count += 1;
+        }
+    }
+
+    // Post delivery note in sender's thread
+    if let Ok(Some(sender)) = state.db.get_session_by_id_prefix(&sender_session_id[..8.min(sender_session_id.len())]).await {
+        let _ = state.mm.post_in_thread(
+            &sender.channel_id, &sender.thread_id,
+            &format!(":loudspeaker: Broadcast sent to {} member(s)", sent_count),
+        ).await;
+    }
+}
+
+/// Handle a [SPAWN:Role] marker from the Team Lead.
+/// Uses explicit boxed future return to break the async recursion cycle:
+/// start_session → stream_output → handle_team_spawn → start_session
+#[allow(clippy::too_many_arguments)]
+fn handle_team_spawn(
+    state: Arc<AppState>,
+    team_id: &str,
+    channel_id: &str,
+    lead_session_id: &str,
+    _lead_role: &str,
+    role_name: &str,
+    force_worktree: bool,
+    initial_task: &str,
+    project: &str,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+    // Own all string params for the async block
+    let team_id = team_id.to_string();
+    let channel_id = channel_id.to_string();
+    let lead_session_id = lead_session_id.to_string();
+    let role_name = role_name.to_string();
+    let initial_task = initial_task.to_string();
+    let project = project.to_string();
+    Box::pin(async move {
+    let team_id = team_id.as_str();
+    let channel_id = channel_id.as_str();
+    let lead_session_id = lead_session_id.as_str();
+    let role_name = role_name.as_str();
+    let initial_task = initial_task.as_str();
+    let project = project.as_str();
+    // Look up the team to get project info
+    let _team = match state.db.get_team(team_id).await {
+        Ok(Some(t)) => t,
+        _ => {
+            tracing::error!(team_id, "Team not found for spawn");
+            return;
+        }
+    };
+
+    // Look up the role in the team_roles table (case-insensitive fuzzy match)
+    let role_def = match find_team_role(&state.db, role_name).await {
+        Some(r) => r,
+        None => {
+            // Unknown role — create session with generic prompt
+            StoredTeamRole {
+                role_name: role_name.to_lowercase().replace(' ', "_"),
+                display_name: role_name.to_string(),
+                description: format!("Custom role: {}", role_name),
+                responsibilities: "Complete assigned tasks and communicate results to the team.".to_string(),
+                default_worktree: false,
+                allow_multiple: false,
+                sort_order: 99,
+            }
+        }
+    };
+
+    // Determine the actual role display name (with instance numbering for multi-instance roles)
+    let members = state.db.get_team_members(team_id).await.unwrap_or_default();
+    let display_name = if role_def.allow_multiple {
+        // Count existing instances of this base role
+        let existing_count = members.iter()
+            .filter(|m| m.role.as_deref().map(|r| r.starts_with(&role_def.display_name)).unwrap_or(false))
+            .count();
+        let instance_num = existing_count + 1;
+        format!("{} {}", role_def.display_name, instance_num)
+    } else {
+        // Singleton: check for duplicates
+        let already_exists = members.iter()
+            .any(|m| m.role.as_deref() == Some(&role_def.display_name));
+        if already_exists {
+            // Post error in Lead's thread
+            if let Ok(Some(lead)) = state.db.get_session_by_id_prefix(&lead_session_id[..8.min(lead_session_id.len())]).await {
+                let _ = state.mm.post_in_thread(
+                    &lead.channel_id, &lead.thread_id,
+                    &format!(":x: **{}** is already on the team. This role is a singleton.", role_def.display_name),
+                ).await;
+                let header = build_team_context_header(&state.db, team_id, "Team Lead").await;
+                let _ = state.containers.send(&lead.session_id, &format!(
+                    "{}\nSpawn rejected: {} is already on the team (singleton role).",
+                    header, role_def.display_name,
+                )).await;
+            }
+            return;
+        }
+        role_def.display_name.clone()
+    };
+
+    // Determine worktree flag
+    let use_worktree = force_worktree || role_def.default_worktree;
+
+    // Parse repo reference
+    let s = config::settings();
+    let repo_ref = match RepoRef::parse_with_default_org(project, s.default_org.as_deref()) {
+        Some(mut r) => {
+            if use_worktree {
+                r.worktree = Some(session_manager::git::WorktreeMode::Named(display_name.to_lowercase().replace(' ', "-")));
+            }
+            r
+        }
+        None => {
+            tracing::error!(project, "Failed to parse repo ref for team spawn");
+            return;
+        }
+    };
+
+    // Build member system prompt
+    let member_prompt = build_team_member_prompt(&role_def);
+
+    // Determine session type
+    let session_type = "team_member";
+
+    // Start the member session
+    let session_result: Result<String> = Box::pin(start_session(
+        &state,
+        channel_id,
+        project,
+        &repo_ref,
+        session_type,
+        false, false,
+        None, // user_id — agent-spawned, no user
+        Some(team_id),
+        Some(&display_name),
+        Some(&member_prompt),
+    )).await;
+    match session_result {
+        Ok(member_session_id) => {
+            // Send initial task if provided
+            if !initial_task.is_empty() {
+                let header = build_team_context_header(&state.db, team_id, &display_name).await;
+                let formatted_task = format!("{}\n**From Team Lead**: {}", header, initial_task);
+                let _ = state.containers.send(&member_session_id, &formatted_task).await;
+            }
+
+            // Notify Lead about successful spawn
+            if let Ok(Some(lead)) = state.db.get_session_by_id_prefix(&lead_session_id[..8.min(lead_session_id.len())]).await {
+                let _ = state.mm.post_in_thread(
+                    &lead.channel_id, &lead.thread_id,
+                    &format!(":white_check_mark: Spawned **{}**", display_name),
+                ).await;
+            }
+
+            // Broadcast roster update to all existing members
+            let update_msg = format!("**Team Roster Update**: {} has joined the team.", display_name);
+            broadcast_team_notification(&state, team_id, &update_msg, &member_session_id).await;
+        }
+        Err(e) => {
+            tracing::error!(error = %e, role = %display_name, "Failed to spawn team member");
+            if let Ok(Some(lead)) = state.db.get_session_by_id_prefix(&lead_session_id[..8.min(lead_session_id.len())]).await {
+                let _ = state.mm.post_in_thread(
+                    &lead.channel_id, &lead.thread_id,
+                    &format!(":x: Failed to spawn **{}**: {}", display_name, e),
+                ).await;
+                let header = build_team_context_header(&state.db, team_id, "Team Lead").await;
+                let _ = state.containers.send(&lead.session_id, &format!(
+                    "{}\nSpawn failed for {}: {}", header, display_name, e,
+                )).await;
+            }
+        }
+    }
+    }) // close Box::pin(async move {
+}
+
+/// Find a team role by display_name (case-insensitive fuzzy match).
+async fn find_team_role(db: &Database, name: &str) -> Option<StoredTeamRole> {
+    let roles = db.get_all_team_roles().await.ok()?;
+    let name_lower = name.to_lowercase();
+    // Exact match first
+    if let Some(r) = roles.iter().find(|r| r.display_name.to_lowercase() == name_lower) {
+        return Some(r.clone());
+    }
+    // Prefix match (e.g., "Dev" matches "Developer")
+    if let Some(r) = roles.iter().find(|r| r.display_name.to_lowercase().starts_with(&name_lower)) {
+        return Some(r.clone());
+    }
+    // role_name match (e.g., "developer" matches)
+    if let Some(r) = roles.iter().find(|r| r.role_name.to_lowercase() == name_lower) {
+        return Some(r.clone());
+    }
+    None
+}
+
+/// Handle [TEAM_STATUS] marker — send formatted status table to requesting session.
+async fn handle_team_status(state: &AppState, session_id: &str, team_id: &str) {
+    let members = match state.db.get_team_members(team_id).await {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::error!(error = %e, "Failed to get team members for status");
+            return;
+        }
+    };
+
+    let mut table = String::from("**Team Status:**\n| Role | Status | Context | Last Active |\n|------|--------|---------|-------------|\n");
+    for member in &members {
+        let role = member.role.as_deref().unwrap_or("Unknown");
+        let liveness = state.liveness.get_info(&member.session_id);
+        let last_active = match &liveness {
+            Some(li) => format!("{} ago", format_duration_short(li.idle_duration)),
+            None => "unknown".to_string(),
+        };
+
+        // Context from in-memory or DB
+        let ctx_tokens = state.containers.get_session_info(&member.session_id)
+            .map(|i| i.last_input_tokens)
+            .unwrap_or(member.context_tokens as u64);
+        let ctx_str = if ctx_tokens > 0 {
+            let pct = (ctx_tokens as f64 / 200_000.0 * 100.0) as u64;
+            format!("{}% ({}k/200k)", pct, ctx_tokens / 1000)
+        } else {
+            "—".to_string()
+        };
+
+        table.push_str(&format!(
+            "| {} | {} | {} | {} |\n",
+            role, member.status, ctx_str, last_active,
+        ));
+    }
+
+    // Send back to requesting session
+    if let Err(e) = state.containers.send(session_id, &table).await {
+        tracing::warn!(error = %e, "Failed to send team status");
+    }
+}
+
+/// Broadcast a notification to all team members (with context header).
+async fn broadcast_team_notification(state: &AppState, team_id: &str, message: &str, exclude_session_id: &str) {
+    let members = state.db.get_team_members(team_id).await.unwrap_or_default();
+    for member in &members {
+        if member.session_id == exclude_session_id {
+            continue;
+        }
+        let role = member.role.as_deref().unwrap_or("Unknown");
+        let header = build_team_context_header(&state.db, team_id, role).await;
+        let _ = state.containers.send(&member.session_id, &format!("{}\n{}", header, message)).await;
+    }
+}
+
+/// Stop an entire team (all members + lead).
+async fn stop_team(state: &AppState, team_id: &str, lead_session: &database::StoredSession) {
+    let members = state.db.get_team_members(team_id).await.unwrap_or_default();
+
+    // Stop all members except the lead (which is being stopped by the caller)
+    for member in &members {
+        if member.session_id == lead_session.session_id {
+            continue;
+        }
+        // Post in member's thread
+        let _ = state.mm.post_in_thread(
+            &member.channel_id, &member.thread_id,
+            "Team disbanded by Lead.",
+        ).await;
+        stop_session_by_ref(state, member).await;
+    }
+
+    // Mark team as completed
+    let _ = state.db.update_team_status(team_id, "completed").await;
+}
+
+/// Stop a session without the mutable borrow issues — takes a reference.
+async fn stop_session_by_ref(state: &AppState, session: &database::StoredSession) {
+    // Atomic claim — only one caller will succeed
+    let Some(claimed) = state.containers.claim_session(&session.session_id) else {
+        return;
+    };
+
+    state.liveness.remove(&session.session_id);
+
+    // Decrement container session count
+    let _ = state.containers.release_session(&state.db, &claimed.repo, &claimed.branch).await;
+
+    // Release repo lock
+    state.git.release_repo_by_session(&session.session_id);
+
+    // Clean up worktree if present
+    if let Some(ref wt_path) = claimed.worktree_path {
+        state.git.cleanup_worktree_by_path(wt_path).await;
+    }
+
+    // Soft-delete
+    let _ = state.db.update_session_status(&session.session_id, "stopped").await;
+
+    gauge!("active_sessions").decrement(1.0);
+}
+
+/// Notify team members when a member leaves.
+async fn notify_team_member_left(state: &AppState, team_id: &str, role_name: &str, session_id: &str) {
+    let msg = format!("**Team Roster Update**: {} has left the team.", role_name);
+    broadcast_team_notification(state, team_id, &msg, session_id).await;
 }
 
 async fn handle_network_request(

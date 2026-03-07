@@ -27,6 +27,34 @@ pub struct StoredSession {
     pub compaction_count: i32,
     pub claude_session_id: Option<String>,
     pub status: String,
+    pub team_id: Option<String>,
+    pub role: Option<String>,
+    pub context_tokens: i64,
+}
+
+#[derive(Debug, FromRow)]
+#[allow(dead_code)]
+pub struct StoredTeam {
+    pub team_id: String,
+    pub channel_id: String,
+    pub project: String,
+    pub project_path: String,
+    pub lead_session_id: String,
+    pub dev_count: i32,
+    pub status: String,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Debug, Clone, FromRow)]
+#[allow(dead_code)]
+pub struct StoredTeamRole {
+    pub role_name: String,
+    pub display_name: String,
+    pub description: String,
+    pub responsibilities: String,
+    pub default_worktree: bool,
+    pub allow_multiple: bool,
+    pub sort_order: i32,
 }
 
 #[derive(Debug, FromRow)]
@@ -272,6 +300,132 @@ pub async fn create_schema(pool: &PgPool, schema: &str) -> Result<()> {
     .execute(pool)
     .await?;
 
+    // Migration: add team_id and role columns to sessions table
+    sqlx::query(&format!(
+        "ALTER TABLE {}.sessions ADD COLUMN IF NOT EXISTS team_id TEXT",
+        schema
+    ))
+    .execute(pool)
+    .await?;
+
+    sqlx::query(&format!(
+        "ALTER TABLE {}.sessions ADD COLUMN IF NOT EXISTS role TEXT",
+        schema
+    ))
+    .execute(pool)
+    .await?;
+
+    // Migration: add context_tokens column to sessions table
+    sqlx::query(&format!(
+        "ALTER TABLE {}.sessions ADD COLUMN IF NOT EXISTS context_tokens BIGINT NOT NULL DEFAULT 0",
+        schema
+    ))
+    .execute(pool)
+    .await?;
+
+    // Teams table
+    sqlx::query(&format!(
+        r#"
+        CREATE TABLE IF NOT EXISTS {}.teams (
+            team_id TEXT PRIMARY KEY,
+            channel_id TEXT NOT NULL,
+            project TEXT NOT NULL,
+            project_path TEXT NOT NULL DEFAULT '',
+            lead_session_id TEXT NOT NULL,
+            dev_count INTEGER NOT NULL DEFAULT 1,
+            status TEXT NOT NULL DEFAULT 'active',
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+        "#,
+        schema
+    ))
+    .execute(pool)
+    .await?;
+
+    // Team roles table (reference data)
+    sqlx::query(&format!(
+        r#"
+        CREATE TABLE IF NOT EXISTS {}.team_roles (
+            role_name TEXT PRIMARY KEY,
+            display_name TEXT NOT NULL,
+            description TEXT NOT NULL,
+            responsibilities TEXT NOT NULL,
+            default_worktree BOOLEAN NOT NULL DEFAULT FALSE,
+            allow_multiple BOOLEAN NOT NULL DEFAULT FALSE,
+            sort_order INTEGER NOT NULL DEFAULT 0
+        )
+        "#,
+        schema
+    ))
+    .execute(pool)
+    .await?;
+
+    // Seed team_roles with default data
+    sqlx::query(&format!(
+        r#"
+        INSERT INTO {schema}.team_roles (role_name, display_name, description, responsibilities, default_worktree, allow_multiple, sort_order)
+        VALUES
+            ('team_lead', 'Team Lead', 'Coordinates the team, reviews PRs, and synthesizes results',
+             '- Interpret user requests and determine the right course of action — spawn an Architect for spec work, Developers for implementation, or both
+- Decide which roles to spawn based on the task''s requirements; prefer fewer roles when the task is simple
+- Use `/plan` to generate implementation stories from approved specs and delegate stories to Developers
+- Use `/analyze` to verify consistency and quality across specs and stories — run after planning to ensure stories align with the spec, and re-run after changes
+- Monitor progress by checking `[TEAM_STATUS]` periodically and following up on stalled members
+- Resolve conflicts when team members disagree or produce incompatible work
+- Review and manage PRs as described in the PR Review & Completion section below — this includes performing QA review yourself for straightforward PRs
+- Only spawn a QA Engineer when the task has significant complexity warranting dedicated testing
+- When PRs have review comments or requested changes, delegate the fixes back to the relevant Developer or Architect
+- Autonomously progress open spec and implementation PRs — review, request changes, or merge as appropriate
+- Synthesize the team''s work into a final summary for the user when the task is complete
+- Wind down the team when all work is done — don''t leave idle members running',
+             false, false, 0),
+            ('pm_architect', 'PM/Architect', 'Designs architecture and manages requirements',
+             '- Use `/blueprint` to define project architecture, roadmap, and milestones
+- Use `/architecture` to maintain the project''s architecture documentation
+- Use `/specify` to create spec issues from requirements — iterate with `/clarify` to resolve ambiguities before approving
+- Identify technical risks (performance bottlenecks, security concerns, compatibility issues) and propose mitigations
+- Define coding conventions, patterns, and directory structure for the team to follow
+- Use `/decision` to record important Architecture Decision Records (ADRs) with justification
+- Review Developer PRs for architectural consistency — flag deviations from the agreed design',
+             true, false, 1),
+            ('developer', 'Developer', 'Implements features end-to-end',
+             '- Use `/implement` to pull assigned Stories from GitHub, create a worktree, implement the tasks, and create a PR when complete
+- Write clean, idiomatic code that follows the project''s existing conventions and patterns
+- Write unit tests for all new code; aim for meaningful coverage of edge cases, not just happy paths
+- Fix bugs by first reproducing the issue, identifying the root cause, then implementing and testing the fix
+- Communicate blockers to the Team Lead immediately — don''t spin on problems silently
+- Notify the Team Lead when a PR has been created or updated
+- Address PR review feedback when delegated by the Team Lead',
+             true, true, 2),
+            ('qa_engineer', 'QA Engineer', 'Tests and validates quality',
+             '- Use `/checklist` to generate and validate requirements quality checklists against spec issues
+- Use `/bug` to file defects as GitHub Bug issues with clear reproduction steps, expected vs actual behavior, and severity
+- Write integration and end-to-end tests that validate the feature works as specified
+- Review Developer and Architect PRs for bugs, edge cases, error handling gaps, and security vulnerabilities
+- Validate that implementations match the original requirements — flag any deviations
+- Verify that fixes actually resolve reported defects and don''t introduce regressions',
+             false, false, 3),
+            ('devops_engineer', 'DevOps Engineer', 'Manages infrastructure and CI/CD',
+             '- Configure CI/CD pipelines for automated building, testing, and deployment
+- Write infrastructure as code (Terraform, Docker, Kubernetes manifests) following best practices
+- Set up environment configurations for development, staging, and production
+- Ensure security best practices: secrets management, least-privilege access, dependency scanning
+- Optimize build and deployment times — identify and fix bottlenecks in the pipeline
+- Document deployment procedures and runbooks for the team',
+             true, false, 4)
+        ON CONFLICT (role_name) DO NOTHING
+        "#,
+    ))
+    .execute(pool)
+    .await?;
+
+    sqlx::query(&format!(
+        "CREATE INDEX IF NOT EXISTS idx_sessions_team_id ON {}.sessions(team_id)",
+        schema
+    ))
+    .execute(pool)
+    .await?;
+
     Ok(())
 }
 
@@ -335,7 +489,7 @@ impl Database {
         thread_id: &str,
     ) -> Result<Option<StoredSession>> {
         let session = sqlx::query_as::<_, StoredSession>(&format!(
-            "SELECT session_id, channel_id, thread_id, project, project_path, container_name, container_id, session_type, parent_session_id, user_id, created_at, last_activity_at, message_count, compaction_count, claude_session_id, status \
+            "SELECT session_id, channel_id, thread_id, project, project_path, container_name, container_id, session_type, parent_session_id, user_id, created_at, last_activity_at, message_count, compaction_count, claude_session_id, status, team_id, role, context_tokens \
              FROM {}.sessions WHERE channel_id = $1 AND thread_id = $2 AND status IN ('active', 'disconnected')",
             SCHEMA
         ))
@@ -353,7 +507,7 @@ impl Database {
         thread_id: &str,
     ) -> Result<Option<StoredSession>> {
         let session = sqlx::query_as::<_, StoredSession>(&format!(
-            "SELECT session_id, channel_id, thread_id, project, project_path, container_name, container_id, session_type, parent_session_id, user_id, created_at, last_activity_at, message_count, compaction_count, claude_session_id, status \
+            "SELECT session_id, channel_id, thread_id, project, project_path, container_name, container_id, session_type, parent_session_id, user_id, created_at, last_activity_at, message_count, compaction_count, claude_session_id, status, team_id, role, context_tokens \
              FROM {}.sessions WHERE channel_id = $1 AND thread_id = $2 AND status = 'stopped'",
             SCHEMA
         ))
@@ -373,7 +527,7 @@ impl Database {
         }
 
         let session = sqlx::query_as::<_, StoredSession>(&format!(
-            "SELECT session_id, channel_id, thread_id, project, project_path, container_name, container_id, session_type, parent_session_id, user_id, created_at, last_activity_at, message_count, compaction_count, claude_session_id, status \
+            "SELECT session_id, channel_id, thread_id, project, project_path, container_name, container_id, session_type, parent_session_id, user_id, created_at, last_activity_at, message_count, compaction_count, claude_session_id, status, team_id, role, context_tokens \
              FROM {}.sessions WHERE session_id LIKE $1 LIMIT 1",
             SCHEMA
         ))
@@ -390,7 +544,7 @@ impl Database {
         channel_id: &str,
     ) -> Result<Vec<StoredSession>> {
         let sessions = sqlx::query_as::<_, StoredSession>(&format!(
-            "SELECT session_id, channel_id, thread_id, project, project_path, container_name, container_id, session_type, parent_session_id, user_id, created_at, last_activity_at, message_count, compaction_count, claude_session_id, status \
+            "SELECT session_id, channel_id, thread_id, project, project_path, container_name, container_id, session_type, parent_session_id, user_id, created_at, last_activity_at, message_count, compaction_count, claude_session_id, status, team_id, role, context_tokens \
              FROM {}.sessions WHERE channel_id = $1 AND session_type != 'worker'",
             SCHEMA
         ))
@@ -419,7 +573,7 @@ impl Database {
 
     pub async fn get_all_sessions(&self) -> Result<Vec<StoredSession>> {
         let sessions = sqlx::query_as::<_, StoredSession>(&format!(
-            "SELECT session_id, channel_id, thread_id, project, project_path, container_name, container_id, session_type, parent_session_id, user_id, created_at, last_activity_at, message_count, compaction_count, claude_session_id, status \
+            "SELECT session_id, channel_id, thread_id, project, project_path, container_name, container_id, session_type, parent_session_id, user_id, created_at, last_activity_at, message_count, compaction_count, claude_session_id, status, team_id, role, context_tokens \
              FROM {}.sessions",
             SCHEMA
         ))
@@ -724,7 +878,7 @@ impl Database {
         container_id: i64,
     ) -> Result<Vec<StoredSession>> {
         let sessions = sqlx::query_as::<_, StoredSession>(&format!(
-            "SELECT session_id, channel_id, thread_id, project, project_path, container_name, container_id, session_type, parent_session_id, user_id, created_at, last_activity_at, message_count, compaction_count, claude_session_id, status \
+            "SELECT session_id, channel_id, thread_id, project, project_path, container_name, container_id, session_type, parent_session_id, user_id, created_at, last_activity_at, message_count, compaction_count, claude_session_id, status, team_id, role, context_tokens \
              FROM {}.sessions WHERE container_id = $1",
             SCHEMA
         ))
@@ -769,5 +923,166 @@ impl Database {
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected())
+    }
+
+    // --- Team operations ---
+
+    /// Create a new team record.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_team(
+        &self,
+        team_id: &str,
+        channel_id: &str,
+        project: &str,
+        project_path: &str,
+        lead_session_id: &str,
+        dev_count: i32,
+    ) -> Result<()> {
+        sqlx::query(&format!(
+            "INSERT INTO {}.teams (team_id, channel_id, project, project_path, lead_session_id, dev_count) \
+             VALUES ($1, $2, $3, $4, $5, $6)",
+            SCHEMA
+        ))
+        .bind(team_id)
+        .bind(channel_id)
+        .bind(project)
+        .bind(project_path)
+        .bind(lead_session_id)
+        .bind(dev_count)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Get a team by ID.
+    pub async fn get_team(&self, team_id: &str) -> Result<Option<StoredTeam>> {
+        let team = sqlx::query_as::<_, StoredTeam>(&format!(
+            "SELECT team_id, channel_id, project, project_path, lead_session_id, dev_count, status, created_at \
+             FROM {}.teams WHERE team_id = $1",
+            SCHEMA
+        ))
+        .bind(team_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(team)
+    }
+
+    /// Get all team members (sessions) for a team.
+    pub async fn get_team_members(&self, team_id: &str) -> Result<Vec<StoredSession>> {
+        let sessions = sqlx::query_as::<_, StoredSession>(&format!(
+            "SELECT session_id, channel_id, thread_id, project, project_path, container_name, container_id, session_type, parent_session_id, user_id, created_at, last_activity_at, message_count, compaction_count, claude_session_id, status, team_id, role, context_tokens \
+             FROM {}.sessions WHERE team_id = $1 AND status IN ('active', 'disconnected')",
+            SCHEMA
+        ))
+        .bind(team_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(sessions)
+    }
+
+    /// Update team status (active/completed).
+    pub async fn update_team_status(&self, team_id: &str, status: &str) -> Result<()> {
+        sqlx::query(&format!(
+            "UPDATE {}.teams SET status = $1 WHERE team_id = $2",
+            SCHEMA
+        ))
+        .bind(status)
+        .bind(team_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Link a session to a team with a role.
+    pub async fn set_session_team(
+        &self,
+        session_id: &str,
+        team_id: &str,
+        role: &str,
+    ) -> Result<()> {
+        sqlx::query(&format!(
+            "UPDATE {}.sessions SET team_id = $1, role = $2 WHERE session_id = $3",
+            SCHEMA
+        ))
+        .bind(team_id)
+        .bind(role)
+        .bind(session_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Find a team member by role name.
+    pub async fn get_session_by_role(
+        &self,
+        team_id: &str,
+        role: &str,
+    ) -> Result<Option<StoredSession>> {
+        let session = sqlx::query_as::<_, StoredSession>(&format!(
+            "SELECT session_id, channel_id, thread_id, project, project_path, container_name, container_id, session_type, parent_session_id, user_id, created_at, last_activity_at, message_count, compaction_count, claude_session_id, status, team_id, role, context_tokens \
+             FROM {}.sessions WHERE team_id = $1 AND role = $2 AND status IN ('active', 'disconnected')",
+            SCHEMA
+        ))
+        .bind(team_id)
+        .bind(role)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(session)
+    }
+
+    /// Update context tokens for a session.
+    pub async fn update_context_tokens(
+        &self,
+        session_id: &str,
+        tokens: u64,
+    ) -> Result<()> {
+        sqlx::query(&format!(
+            "UPDATE {}.sessions SET context_tokens = $1 WHERE session_id = $2",
+            SCHEMA
+        ))
+        .bind(tokens as i64)
+        .bind(session_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Get all active teams.
+    pub async fn get_active_teams(&self) -> Result<Vec<StoredTeam>> {
+        let teams = sqlx::query_as::<_, StoredTeam>(&format!(
+            "SELECT team_id, channel_id, project, project_path, lead_session_id, dev_count, status, created_at \
+             FROM {}.teams WHERE status = 'active'",
+            SCHEMA
+        ))
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(teams)
+    }
+
+    // --- Team role operations ---
+
+    /// Get all team roles (ordered by sort_order).
+    pub async fn get_all_team_roles(&self) -> Result<Vec<StoredTeamRole>> {
+        let roles = sqlx::query_as::<_, StoredTeamRole>(&format!(
+            "SELECT role_name, display_name, description, responsibilities, default_worktree, allow_multiple, sort_order \
+             FROM {}.team_roles ORDER BY sort_order",
+            SCHEMA
+        ))
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(roles)
+    }
+
+    /// Get a specific team role by name.
+    pub async fn get_team_role(&self, role_name: &str) -> Result<Option<StoredTeamRole>> {
+        let role = sqlx::query_as::<_, StoredTeamRole>(&format!(
+            "SELECT role_name, display_name, description, responsibilities, default_worktree, allow_multiple, sort_order \
+             FROM {}.team_roles WHERE role_name = $1",
+            SCHEMA
+        ))
+        .bind(role_name)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(role)
     }
 }
