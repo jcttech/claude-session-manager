@@ -2773,12 +2773,18 @@ fn handle_team_spawn(
                 let _ = state.containers.send(&member_session_id, &formatted_task).await;
             }
 
-            // Notify Lead about successful spawn
+            // Notify Lead about successful spawn (both Mattermost and session input)
             if let Ok(Some(lead)) = state.db.get_session_by_id_prefix(&lead_session_id[..8.min(lead_session_id.len())]).await {
                 let _ = state.mm.post_in_thread(
                     &lead.channel_id, &lead.thread_id,
                     &format!(":white_check_mark: Spawned **{}**", display_name),
                 ).await;
+                // Feed confirmation back into the lead's Claude session so it can continue
+                let header = build_team_context_header(&state.db, team_id, "Team Lead").await;
+                let _ = state.containers.send(&lead.session_id, &format!(
+                    "{}\nSpawn confirmed: {} is now active and has been assigned the task.",
+                    header, display_name,
+                )).await;
             }
 
             // Broadcast roster update to all existing members

@@ -122,8 +122,9 @@ impl ContainerManager {
                 ));
             }
 
-            // Warn about same-branch concurrent sessions
-            if entry.session_count > 0 {
+            // Warn about same-branch concurrent sessions (skip for team members —
+            // they're expected to share a container)
+            if entry.session_count > 0 && session_type != "team_member" {
                 warning = Some(format!(
                     "Warning: Another session is already active on `{}@{}`. \
                      Concurrent file writes on the same branch may cause conflicts. \
