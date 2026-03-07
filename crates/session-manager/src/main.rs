@@ -2587,18 +2587,18 @@ async fn route_team_message(
     }
 
     // Post delivery note in sender's thread
-    if !delivered_roles.is_empty() {
-        if let Ok(Some(sender)) = state.db.get_session_by_id_prefix(&sender_session_id[..8.min(sender_session_id.len())]).await {
-            let label = if delivered_roles.len() == 1 {
-                delivered_roles[0].clone()
-            } else {
-                delivered_roles.join(", ")
-            };
-            let _ = state.mm.post_in_thread(
-                &sender.channel_id, &sender.thread_id,
-                &format!(":arrow_right: Message sent to **{}**", label),
-            ).await;
-        }
+    if !delivered_roles.is_empty()
+        && let Ok(Some(sender)) = state.db.get_session_by_id_prefix(&sender_session_id[..8.min(sender_session_id.len())]).await
+    {
+        let label = if delivered_roles.len() == 1 {
+            delivered_roles[0].clone()
+        } else {
+            delivered_roles.join(", ")
+        };
+        let _ = state.mm.post_in_thread(
+            &sender.channel_id, &sender.thread_id,
+            &format!(":arrow_right: Message sent to **{}**", label),
+        ).await;
     }
 }
 
