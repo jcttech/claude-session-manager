@@ -67,6 +67,20 @@ def map_assistant_message(msg: AssistantMessage) -> list[agent_pb2.AgentEvent]:
     return events
 
 
+def _total_input_tokens(usage: dict) -> int:
+    """Compute total context size including cached tokens.
+
+    The Claude API splits input tokens across three fields when prompt caching
+    is active: input_tokens (non-cached), cache_read_input_tokens, and
+    cache_creation_input_tokens. The sum represents the actual context window usage.
+    """
+    return (
+        usage.get("input_tokens", 0)
+        + usage.get("cache_read_input_tokens", 0)
+        + usage.get("cache_creation_input_tokens", 0)
+    )
+
+
 def map_result_message(
     msg: ResultMessage, start_time: float
 ) -> agent_pb2.AgentEvent:
@@ -77,7 +91,7 @@ def map_result_message(
     return agent_pb2.AgentEvent(
         result=agent_pb2.SessionResult(
             session_id=msg.session_id or "",
-            input_tokens=usage.get("input_tokens", 0),
+            input_tokens=_total_input_tokens(usage),
             output_tokens=usage.get("output_tokens", 0),
             cost_usd=msg.total_cost_usd or 0.0,
             num_turns=msg.num_turns or 0,
@@ -167,7 +181,7 @@ def fallback_result_event(
     return agent_pb2.AgentEvent(
         result=agent_pb2.SessionResult(
             session_id=raw_data.get("session_id", ""),
-            input_tokens=usage.get("input_tokens", 0),
+            input_tokens=_total_input_tokens(usage),
             output_tokens=usage.get("output_tokens", 0),
             cost_usd=raw_data.get("total_cost_usd", 0.0) or 0.0,
             num_turns=raw_data.get("num_turns", 0) or 0,

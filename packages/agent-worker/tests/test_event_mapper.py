@@ -198,6 +198,24 @@ class TestMapResultMessage:
         assert event.result.result_text == "All done"
         assert event.result.duration_ms > 0
 
+    def test_cached_tokens_included(self):
+        msg = ResultMessage(
+            session_id="sess-cached",
+            usage={
+                "input_tokens": 7,
+                "cache_read_input_tokens": 45000,
+                "cache_creation_input_tokens": 5000,
+                "output_tokens": 631,
+            },
+            total_cost_usd=0.02,
+            num_turns=1,
+            is_error=False,
+            result="Done",
+        )
+        event = map_result_message(msg, start_time=0)
+        assert event.result.input_tokens == 50007  # 7 + 45000 + 5000
+        assert event.result.output_tokens == 631
+
     def test_error_result(self):
         msg = ResultMessage(
             session_id="sess-2",
