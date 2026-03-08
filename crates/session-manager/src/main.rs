@@ -492,7 +492,6 @@ async fn setup_sidebar_category(state: &AppState, channel_id: &str, _user_id: &s
 async fn start_session(
     state: &Arc<AppState>,
     channel_id: &str,
-    _project_input: &str,
     repo_ref: &RepoRef,
     session_type: &str,
     plan_mode: bool,
@@ -1390,7 +1389,13 @@ async fn handle_messages(
                     let thinking_mode = project_input.split_whitespace().any(|w| w == "--thinking");
                     let project_input_clean = project_input
                         .split_whitespace()
-                        .filter(|w| !w.starts_with("--"))
+                        .filter(|w| {
+                            let is_flag = w.starts_with("--");
+                            if is_flag {
+                                tracing::debug!(flag = %w, "Stripped flag from project input");
+                            }
+                            !is_flag
+                        })
                         .collect::<Vec<_>>()
                         .join(" ");
                     let project_input = project_input_clean.as_str();
@@ -1414,7 +1419,6 @@ async fn handle_messages(
                                 match start_session(
                                     &state,
                                     &proj_channel_id,
-                                    project_input,
                                     &repo_ref,
                                     "standard",
                                     plan_mode,
@@ -1511,7 +1515,6 @@ async fn handle_messages(
                             match start_session(
                                 &state,
                                 &proj_channel_id,
-                                &project_input,
                                 &repo_ref,
                                 "team_lead",
                                 false,
@@ -2755,7 +2758,6 @@ fn handle_team_spawn(
     let session_result: Result<String> = Box::pin(start_session(
         &state,
         channel_id,
-        project,
         &repo_ref,
         session_type,
         false, false,
@@ -2781,10 +2783,12 @@ fn handle_team_spawn(
                 ).await;
                 // Feed confirmation back into the lead's Claude session so it can continue
                 let header = build_team_context_header(&state.db, team_id, "Team Lead").await;
-                let _ = state.containers.send(&lead.session_id, &format!(
+                if let Err(e) = state.containers.send(&lead.session_id, &format!(
                     "{}\nSpawn confirmed: {} is now active and has been assigned the task.",
                     header, display_name,
-                )).await;
+                )).await {
+                    tracing::warn!(error = %e, "Failed to send spawn confirmation to Team Lead session");
+                }
             }
 
             // Broadcast roster update to all existing members
