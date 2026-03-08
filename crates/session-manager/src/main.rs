@@ -492,7 +492,7 @@ async fn setup_sidebar_category(state: &AppState, channel_id: &str, _user_id: &s
 async fn start_session(
     state: &Arc<AppState>,
     channel_id: &str,
-    project_input: &str,
+    _project_input: &str,
     repo_ref: &RepoRef,
     session_type: &str,
     plan_mode: bool,
@@ -525,7 +525,7 @@ async fn start_session(
                 `@claude start {} --worktree`",
                 repo_ref.full_name(),
                 &existing_session[..8.min(existing_session.len())],
-                project_input
+                repo_ref.full_name()
             ));
         }
 
@@ -596,7 +596,7 @@ async fn start_session(
                     &session_id,
                     channel_id,
                     &thread_id,
-                    project_input,
+                    &repo_ref.full_name(),
                     &project_path,
                     &result.container_name,
                     session_type,
@@ -639,7 +639,7 @@ async fn start_session(
             tracing::info!(
                 session_id = %session_id,
                 container = %result.container_name,
-                project = %project_input,
+                project = %repo_ref.full_name(),
                 session_type = %session_type,
                 reused = result.reused,
                 "Session started"
@@ -1390,7 +1390,7 @@ async fn handle_messages(
                     let thinking_mode = project_input.split_whitespace().any(|w| w == "--thinking");
                     let project_input_clean = project_input
                         .split_whitespace()
-                        .filter(|w| *w != "--plan" && *w != "--thinking")
+                        .filter(|w| !w.starts_with("--"))
                         .collect::<Vec<_>>()
                         .join(" ");
                     let project_input = project_input_clean.as_str();
