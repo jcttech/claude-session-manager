@@ -122,8 +122,12 @@ impl ContainerManager {
                 ));
             }
 
-            // Warn about same-branch concurrent sessions
-            if entry.session_count > 0 {
+            // Warn about same-branch concurrent sessions (skip for team/worktree sessions —
+            // teams share a container by design, worktrees have file isolation)
+            let is_team = session_type == "team_member" || session_type == "team_lead";
+            // Worktree paths always contain /worktrees/ (from SM_WORKTREES_PATH config)
+            let is_worktree = project_path.contains("/worktrees/");
+            if entry.session_count > 0 && !is_team && !is_worktree {
                 warning = Some(format!(
                     "Warning: Another session is already active on `{}@{}`. \
                      Concurrent file writes on the same branch may cause conflicts. \
