@@ -2598,9 +2598,15 @@ async fn route_team_message(
         } else {
             delivered_roles.join(", ")
         };
+        // Show the outgoing message content so the user has full visibility
+        let preview = if message.len() > 500 {
+            format!("{}…", &message[..500])
+        } else {
+            message.to_string()
+        };
         let _ = state.mm.post_in_thread(
             &sender.channel_id, &sender.thread_id,
-            &format!(":arrow_right: Message sent to **{}**", label),
+            &format!(":arrow_right: **To {}:**\n{}", label, preview),
         ).await;
     }
 }
@@ -2637,9 +2643,15 @@ async fn broadcast_team_message(
 
     // Post delivery note in sender's thread
     if let Ok(Some(sender)) = state.db.get_session_by_id_prefix(&sender_session_id[..8.min(sender_session_id.len())]).await {
+        // Show the broadcast content so the user has full visibility
+        let preview = if message.len() > 500 {
+            format!("{}…", &message[..500])
+        } else {
+            message.to_string()
+        };
         let _ = state.mm.post_in_thread(
             &sender.channel_id, &sender.thread_id,
-            &format!(":loudspeaker: Broadcast sent to {} member(s)", sent_count),
+            &format!(":loudspeaker: **Broadcast to {} member(s):**\n{}", sent_count, preview),
         ).await;
     }
 }
@@ -2655,7 +2667,7 @@ fn handle_team_spawn(
     lead_session_id: &str,
     _lead_role: &str,
     role_name: &str,
-    force_worktree: bool,
+    _force_worktree: bool,
     initial_task: &str,
     project: &str,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
@@ -2730,8 +2742,10 @@ fn handle_team_spawn(
         role_def.display_name.clone()
     };
 
-    // Determine worktree flag
-    let use_worktree = force_worktree || role_def.default_worktree;
+    // Team-spawned sessions always use worktrees for isolation.
+    // The Team Lead owns the main clone; members must work in worktrees
+    // to avoid repository lock conflicts (see #35).
+    let use_worktree = true; // force_worktree and role_def.default_worktree are subsumed
 
     // Parse repo reference
     let s = config::settings();
@@ -2777,9 +2791,20 @@ fn handle_team_spawn(
 
             // Notify Lead about successful spawn (both Mattermost and session input)
             if let Ok(Some(lead)) = state.db.get_session_by_id_prefix(&lead_session_id[..8.min(lead_session_id.len())]).await {
+                // Show spawn confirmation with initial task for full visibility
+                let spawn_msg = if initial_task.is_empty() {
+                    format!(":white_check_mark: Spawned **{}**", display_name)
+                } else {
+                    let preview = if initial_task.len() > 500 {
+                        format!("{}…", &initial_task[..500])
+                    } else {
+                        initial_task.to_string()
+                    };
+                    format!(":white_check_mark: Spawned **{}:**\n{}", display_name, preview)
+                };
                 let _ = state.mm.post_in_thread(
                     &lead.channel_id, &lead.thread_id,
-                    &format!(":white_check_mark: Spawned **{}**", display_name),
+                    &spawn_msg,
                 ).await;
                 // Feed confirmation back into the lead's Claude session so it can continue
                 let header = build_team_context_header(&state.db, team_id, "Team Lead").await;
