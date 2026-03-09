@@ -3,6 +3,8 @@ name: Release - Agent Worker
 on:
   push:
     tags: ['agent-worker/v*']
+  workflow_dispatch:
+    # Manual trigger: gh workflow run release-agent-worker.yml --ref agent-worker/v1.0.0
 
 permissions:
   contents: write

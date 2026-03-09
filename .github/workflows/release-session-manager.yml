@@ -3,6 +3,8 @@ name: Release
 on:
   push:
     tags: ['session-manager/v*']
+  workflow_dispatch:
+    # Manual trigger: gh workflow run release-session-manager.yml --ref session-manager/v2.3.1
 
 permissions:
   contents: write
