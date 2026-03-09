@@ -2196,8 +2196,6 @@ async fn stream_output(
                             // Check for [SPAWN:Role] marker
                             if let Some(caps) = spawn_re.captures(&line) {
                                 let role_name = caps[1].trim().to_string();
-                                let bracket_end = line.find(']').unwrap_or(line.len());
-                                let has_worktree = line[..bracket_end].contains("--worktree");
                                 let initial_task = caps[2].trim().to_string();
                                 drain_batch_to_card(&mut card, &state, &channel_id, &thread_id, &mut batch, &mut batch_bytes).await;
                                 let spawn_state = state.clone();
@@ -2209,7 +2207,7 @@ async fn stream_output(
                                 tokio::spawn(async move {
                                     handle_team_spawn(
                                         spawn_state, &spawn_tid, &spawn_cid, &spawn_sid, &spawn_role,
-                                        &role_name, has_worktree, &initial_task, &spawn_project,
+                                        &role_name, &initial_task, &spawn_project,
                                     ).await;
                                 });
                                 continue;
@@ -2545,6 +2543,20 @@ Each message you receive will include a [TEAM: ...] header with the current rost
     )
 }
 
+/// Truncate a string to at most `max_bytes` at a valid UTF-8 char boundary, appending "…" if truncated.
+fn truncate_preview(s: &str, max_bytes: usize) -> String {
+    if s.len() > max_bytes {
+        let end = s.char_indices()
+            .map(|(i, _)| i)
+            .take_while(|&i| i <= max_bytes)
+            .last()
+            .unwrap_or(0);
+        format!("{}…", &s[..end])
+    } else {
+        s.to_string()
+    }
+}
+
 /// Route a message from one team member to another (or all matching a role).
 /// `[TO:Developer]` fans out to "Developer", "Developer 1", "Developer 2", etc.
 async fn route_team_message(
@@ -2598,9 +2610,10 @@ async fn route_team_message(
         } else {
             delivered_roles.join(", ")
         };
+        // Show the outgoing message content so the user has full visibility
         let _ = state.mm.post_in_thread(
             &sender.channel_id, &sender.thread_id,
-            &format!(":arrow_right: Message sent to **{}**", label),
+            &format!(":arrow_right: **To {}:**\n{}", label, truncate_preview(message, 500)),
         ).await;
     }
 }
@@ -2637,9 +2650,10 @@ async fn broadcast_team_message(
 
     // Post delivery note in sender's thread
     if let Ok(Some(sender)) = state.db.get_session_by_id_prefix(&sender_session_id[..8.min(sender_session_id.len())]).await {
+        // Show the broadcast content so the user has full visibility
         let _ = state.mm.post_in_thread(
             &sender.channel_id, &sender.thread_id,
-            &format!(":loudspeaker: Broadcast sent to {} member(s)", sent_count),
+            &format!(":loudspeaker: **Broadcast to {} member(s):**\n{}", sent_count, truncate_preview(message, 500)),
         ).await;
     }
 }
@@ -2655,7 +2669,6 @@ fn handle_team_spawn(
     lead_session_id: &str,
     _lead_role: &str,
     role_name: &str,
-    force_worktree: bool,
     initial_task: &str,
     project: &str,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
@@ -2730,8 +2743,10 @@ fn handle_team_spawn(
         role_def.display_name.clone()
     };
 
-    // Determine worktree flag
-    let use_worktree = force_worktree || role_def.default_worktree;
+    // Team-spawned sessions always use worktrees for isolation.
+    // The Team Lead owns the main clone; members must work in worktrees
+    // to avoid repository lock conflicts (see #35).
+    let use_worktree = true; // force_worktree and role_def.default_worktree are subsumed
 
     // Parse repo reference
     let s = config::settings();
@@ -2777,9 +2792,15 @@ fn handle_team_spawn(
 
             // Notify Lead about successful spawn (both Mattermost and session input)
             if let Ok(Some(lead)) = state.db.get_session_by_id_prefix(&lead_session_id[..8.min(lead_session_id.len())]).await {
+                // Show spawn confirmation with initial task for full visibility
+                let spawn_msg = if initial_task.is_empty() {
+                    format!(":white_check_mark: Spawned **{}**", display_name)
+                } else {
+                    format!(":white_check_mark: Spawned **{}:**\n{}", display_name, truncate_preview(&initial_task, 500))
+                };
                 let _ = state.mm.post_in_thread(
                     &lead.channel_id, &lead.thread_id,
-                    &format!(":white_check_mark: Spawned **{}**", display_name),
+                    &spawn_msg,
                 ).await;
                 // Feed confirmation back into the lead's Claude session so it can continue
                 let header = build_team_context_header(&state.db, team_id, "Team Lead").await;
