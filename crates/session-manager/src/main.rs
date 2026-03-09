@@ -2459,7 +2459,8 @@ fn format_team_context_header(members: &[StoredSession], recipient_role: &str) -
         .filter_map(|m| m.role.clone())
         .collect();
     format!(
-        "[TEAM: You are {}. Active members: {}]",
+        "[TEAM: You are {}. Active members: {}. \
+         Use markers to communicate: [SPAWN:Role] task, [TO:Role] message, [BROADCAST] message, [TEAM_STATUS]]",
         recipient_role,
         member_list.join(", ")
     )
