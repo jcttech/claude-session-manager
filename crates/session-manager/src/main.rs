@@ -2797,7 +2797,7 @@ fn handle_team_spawn(
                 let spawn_msg = if initial_task.is_empty() {
                     format!(":white_check_mark: Spawned **{}**", display_name)
                 } else {
-                    format!(":white_check_mark: Spawned **{}:**\n{}", display_name, truncate_preview(&initial_task, 500))
+                    format!(":white_check_mark: Spawned **{}:**\n{}", display_name, truncate_preview(initial_task, 500))
                 };
                 let _ = state.mm.post_in_thread(
                     &lead.channel_id, &lead.thread_id,
