@@ -96,7 +96,36 @@ from agent_worker.event_mapper import (  # noqa: E402
     map_result_message,
     map_stream_event,
     map_system_message,
+    extract_context_tokens_from_stream,
 )
+
+
+class TestExtractContextTokens:
+    def test_message_start_with_usage(self):
+        event = StreamEvent(
+            event={
+                "type": "message_start",
+                "message": {
+                    "usage": {
+                        "input_tokens": 50000,
+                        "cache_read_input_tokens": 140000,
+                        "cache_creation_input_tokens": 5000,
+                    }
+                },
+            }
+        )
+        result = extract_context_tokens_from_stream(event)
+        assert result == 195000  # 50000 + 140000 + 5000
+
+    def test_non_message_start_returns_none(self):
+        event = StreamEvent(
+            event={"type": "content_block_delta", "delta": {"type": "text_delta", "text": "hi"}}
+        )
+        assert extract_context_tokens_from_stream(event) is None
+
+    def test_message_start_no_usage_returns_none(self):
+        event = StreamEvent(event={"type": "message_start", "message": {}})
+        assert extract_context_tokens_from_stream(event) is None
 
 
 class TestMapSystemMessage:
@@ -197,6 +226,8 @@ class TestMapResultMessage:
         assert event.result.is_error is False
         assert event.result.result_text == "All done"
         assert event.result.duration_ms > 0
+        # Without context_tokens arg, falls back to cumulative input_tokens
+        assert event.result.context_tokens == 1000
 
     def test_cached_tokens_included(self):
         msg = ResultMessage(
@@ -215,6 +246,28 @@ class TestMapResultMessage:
         event = map_result_message(msg, start_time=0)
         assert event.result.input_tokens == 50007  # 7 + 45000 + 5000
         assert event.result.output_tokens == 631
+        assert event.result.context_tokens == 50007  # fallback when no context_tokens
+
+    def test_context_tokens_from_last_api_call(self):
+        """When context_tokens is provided, it should represent the last API
+        call's input tokens (actual context window), distinct from cumulative."""
+        msg = ResultMessage(
+            session_id="sess-ctx",
+            usage={
+                "input_tokens": 21,
+                "cache_read_input_tokens": 1400000,  # cumulative across 7 tool loops
+                "cache_creation_input_tokens": 0,
+                "output_tokens": 5000,
+            },
+            total_cost_usd=1.0,
+            num_turns=7,
+            is_error=False,
+            result="Done",
+        )
+        # Simulate last API call had 195k context
+        event = map_result_message(msg, start_time=0, context_tokens=195000)
+        assert event.result.input_tokens == 1400021  # cumulative (for billing)
+        assert event.result.context_tokens == 195000  # actual context window
 
     def test_error_result(self):
         msg = ResultMessage(

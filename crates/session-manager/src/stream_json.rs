@@ -9,7 +9,9 @@ pub enum OutputEvent {
     /// A tool action status line (formatted markdown, not wrapped in code fence)
     ToolAction(String),
     /// Response is complete (emitted on message_stop when stop_reason != "tool_use")
-    ResponseComplete { input_tokens: u64, output_tokens: u64 },
+    /// `input_tokens` = cumulative across all API calls (for billing)
+    /// `context_tokens` = last API call's input tokens (actual context window usage)
+    ResponseComplete { input_tokens: u64, output_tokens: u64, context_tokens: u64 },
     /// Generated thread title (from `title` command)
     TitleGenerated(String),
     /// Process died unexpectedly (non-zero exit, not user-initiated)

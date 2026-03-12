@@ -30,6 +30,8 @@ pub struct StoredSession {
     pub team_id: Option<String>,
     pub role: Option<String>,
     pub context_tokens: i64,
+    pub pending_task_from: Option<String>,
+    pub current_task: Option<String>,
 }
 
 #[derive(Debug, FromRow)]
@@ -43,6 +45,7 @@ pub struct StoredTeam {
     pub dev_count: i32,
     pub status: String,
     pub created_at: chrono::DateTime<chrono::Utc>,
+    pub coordination_thread_id: Option<String>,
 }
 
 #[derive(Debug, Clone, FromRow)]
@@ -331,6 +334,21 @@ pub async fn create_schema(pool: &PgPool, schema: &str) -> Result<()> {
     .execute(pool)
     .await?;
 
+    // Migration: add pending_task_from and current_task columns to sessions table
+    sqlx::query(&format!(
+        "ALTER TABLE {}.sessions ADD COLUMN IF NOT EXISTS pending_task_from TEXT",
+        schema
+    ))
+    .execute(pool)
+    .await?;
+
+    sqlx::query(&format!(
+        "ALTER TABLE {}.sessions ADD COLUMN IF NOT EXISTS current_task TEXT",
+        schema
+    ))
+    .execute(pool)
+    .await?;
+
     // Teams table
     sqlx::query(&format!(
         r#"
@@ -345,6 +363,14 @@ pub async fn create_schema(pool: &PgPool, schema: &str) -> Result<()> {
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )
         "#,
+        schema
+    ))
+    .execute(pool)
+    .await?;
+
+    // Migration: add coordination_thread_id column to teams table
+    sqlx::query(&format!(
+        "ALTER TABLE {}.teams ADD COLUMN IF NOT EXISTS coordination_thread_id TEXT",
         schema
     ))
     .execute(pool)
@@ -378,6 +404,10 @@ pub async fn create_schema(pool: &PgPool, schema: &str) -> Result<()> {
 - Decide which roles to spawn based on the task''s requirements; prefer fewer roles when the task is simple
 - Use `/plan` to generate implementation stories from approved specs and delegate stories to Developers
 - Use `/analyze` to verify consistency and quality across specs and stories — run after planning to ensure stories align with the spec, and re-run after changes
+- After assigning a task via [TO:Role] or [SPAWN:Role], WAIT for that member to respond before sending another task
+- The system enforces this — sending to a member with a pending task will be rejected
+- Use [TEAM_STATUS] to check member status and current task assignments before sending follow-up tasks
+- Do NOT assign the same task to multiple developers unless you explicitly want parallel approaches
 - Monitor progress by checking `[TEAM_STATUS]` periodically and following up on stalled members
 - Resolve conflicts when team members disagree or produce incompatible work
 - Review and manage PRs as described in the PR Review & Completion section below — this includes performing QA review yourself for straightforward PRs
@@ -394,16 +424,21 @@ pub async fn create_schema(pool: &PgPool, schema: &str) -> Result<()> {
 - Identify technical risks (performance bottlenecks, security concerns, compatibility issues) and propose mitigations
 - Define coding conventions, patterns, and directory structure for the team to follow
 - Use `/decision` to record important Architecture Decision Records (ADRs) with justification
-- Review Developer PRs for architectural consistency — flag deviations from the agreed design',
+- Review Developer PRs for architectural consistency when delegated by Team Lead — flag deviations from the agreed design
+- Run `/architecture` to update project docs after implementation PRs are merged
+- Verify implementations match the spec before approving PRs',
              true, false, 1),
             ('developer', 'Developer', 'Implements features end-to-end',
-             '- Use `/implement` to pull assigned Stories from GitHub, create a worktree, implement the tasks, and create a PR when complete
+             '- Wait for task assignment from the Team Lead before starting work
+- Use `/implement` to pull assigned Stories from GitHub, create a worktree, implement the tasks, and create a PR when complete
 - Write clean, idiomatic code that follows the project''s existing conventions and patterns
 - Write unit tests for all new code; aim for meaningful coverage of edge cases, not just happy paths
 - Fix bugs by first reproducing the issue, identifying the root cause, then implementing and testing the fix
 - Communicate blockers to the Team Lead immediately — don''t spin on problems silently
-- Notify the Team Lead when a PR has been created or updated
-- Address PR review feedback when delegated by the Team Lead',
+- After creating a PR, notify Team Lead: [TO:Team Lead] PR #N ready for review
+- Address PR review feedback promptly when delegated by the Team Lead
+- Do NOT start new work until your current PR is merged or you are reassigned
+- One task at a time — finish current work before accepting new assignments',
              true, true, 2),
             ('qa_engineer', 'QA Engineer', 'Tests and validates quality',
              '- Use `/checklist` to generate and validate requirements quality checklists against spec issues
@@ -497,7 +532,7 @@ impl Database {
         thread_id: &str,
     ) -> Result<Option<StoredSession>> {
         let session = sqlx::query_as::<_, StoredSession>(&format!(
-            "SELECT session_id, channel_id, thread_id, project, project_path, container_name, container_id, session_type, parent_session_id, user_id, created_at, last_activity_at, message_count, compaction_count, claude_session_id, status, team_id, role, context_tokens \
+            "SELECT session_id, channel_id, thread_id, project, project_path, container_name, container_id, session_type, parent_session_id, user_id, created_at, last_activity_at, message_count, compaction_count, claude_session_id, status, team_id, role, context_tokens, pending_task_from, current_task \
              FROM {}.sessions WHERE channel_id = $1 AND thread_id = $2 AND status IN ('active', 'disconnected')",
             SCHEMA
         ))
@@ -515,7 +550,7 @@ impl Database {
         thread_id: &str,
     ) -> Result<Option<StoredSession>> {
         let session = sqlx::query_as::<_, StoredSession>(&format!(
-            "SELECT session_id, channel_id, thread_id, project, project_path, container_name, container_id, session_type, parent_session_id, user_id, created_at, last_activity_at, message_count, compaction_count, claude_session_id, status, team_id, role, context_tokens \
+            "SELECT session_id, channel_id, thread_id, project, project_path, container_name, container_id, session_type, parent_session_id, user_id, created_at, last_activity_at, message_count, compaction_count, claude_session_id, status, team_id, role, context_tokens, pending_task_from, current_task \
              FROM {}.sessions WHERE channel_id = $1 AND thread_id = $2 AND status = 'stopped'",
             SCHEMA
         ))
@@ -535,7 +570,7 @@ impl Database {
         }
 
         let session = sqlx::query_as::<_, StoredSession>(&format!(
-            "SELECT session_id, channel_id, thread_id, project, project_path, container_name, container_id, session_type, parent_session_id, user_id, created_at, last_activity_at, message_count, compaction_count, claude_session_id, status, team_id, role, context_tokens \
+            "SELECT session_id, channel_id, thread_id, project, project_path, container_name, container_id, session_type, parent_session_id, user_id, created_at, last_activity_at, message_count, compaction_count, claude_session_id, status, team_id, role, context_tokens, pending_task_from, current_task \
              FROM {}.sessions WHERE session_id LIKE $1 LIMIT 1",
             SCHEMA
         ))
@@ -552,7 +587,7 @@ impl Database {
         channel_id: &str,
     ) -> Result<Vec<StoredSession>> {
         let sessions = sqlx::query_as::<_, StoredSession>(&format!(
-            "SELECT session_id, channel_id, thread_id, project, project_path, container_name, container_id, session_type, parent_session_id, user_id, created_at, last_activity_at, message_count, compaction_count, claude_session_id, status, team_id, role, context_tokens \
+            "SELECT session_id, channel_id, thread_id, project, project_path, container_name, container_id, session_type, parent_session_id, user_id, created_at, last_activity_at, message_count, compaction_count, claude_session_id, status, team_id, role, context_tokens, pending_task_from, current_task \
              FROM {}.sessions WHERE channel_id = $1 AND session_type != 'worker'",
             SCHEMA
         ))
@@ -581,7 +616,7 @@ impl Database {
 
     pub async fn get_all_sessions(&self) -> Result<Vec<StoredSession>> {
         let sessions = sqlx::query_as::<_, StoredSession>(&format!(
-            "SELECT session_id, channel_id, thread_id, project, project_path, container_name, container_id, session_type, parent_session_id, user_id, created_at, last_activity_at, message_count, compaction_count, claude_session_id, status, team_id, role, context_tokens \
+            "SELECT session_id, channel_id, thread_id, project, project_path, container_name, container_id, session_type, parent_session_id, user_id, created_at, last_activity_at, message_count, compaction_count, claude_session_id, status, team_id, role, context_tokens, pending_task_from, current_task \
              FROM {}.sessions",
             SCHEMA
         ))
@@ -886,7 +921,7 @@ impl Database {
         container_id: i64,
     ) -> Result<Vec<StoredSession>> {
         let sessions = sqlx::query_as::<_, StoredSession>(&format!(
-            "SELECT session_id, channel_id, thread_id, project, project_path, container_name, container_id, session_type, parent_session_id, user_id, created_at, last_activity_at, message_count, compaction_count, claude_session_id, status, team_id, role, context_tokens \
+            "SELECT session_id, channel_id, thread_id, project, project_path, container_name, container_id, session_type, parent_session_id, user_id, created_at, last_activity_at, message_count, compaction_count, claude_session_id, status, team_id, role, context_tokens, pending_task_from, current_task \
              FROM {}.sessions WHERE container_id = $1",
             SCHEMA
         ))
@@ -965,7 +1000,7 @@ impl Database {
     /// Get a team by ID.
     pub async fn get_team(&self, team_id: &str) -> Result<Option<StoredTeam>> {
         let team = sqlx::query_as::<_, StoredTeam>(&format!(
-            "SELECT team_id, channel_id, project, project_path, lead_session_id, dev_count, status, created_at \
+            "SELECT team_id, channel_id, project, project_path, lead_session_id, dev_count, status, created_at, coordination_thread_id \
              FROM {}.teams WHERE team_id = $1",
             SCHEMA
         ))
@@ -978,7 +1013,7 @@ impl Database {
     /// Get all team members (sessions) for a team.
     pub async fn get_team_members(&self, team_id: &str) -> Result<Vec<StoredSession>> {
         let sessions = sqlx::query_as::<_, StoredSession>(&format!(
-            "SELECT session_id, channel_id, thread_id, project, project_path, container_name, container_id, session_type, parent_session_id, user_id, created_at, last_activity_at, message_count, compaction_count, claude_session_id, status, team_id, role, context_tokens \
+            "SELECT session_id, channel_id, thread_id, project, project_path, container_name, container_id, session_type, parent_session_id, user_id, created_at, last_activity_at, message_count, compaction_count, claude_session_id, status, team_id, role, context_tokens, pending_task_from, current_task \
              FROM {}.sessions WHERE team_id = $1 AND status IN ('active', 'disconnected')",
             SCHEMA
         ))
@@ -1028,7 +1063,7 @@ impl Database {
         role: &str,
     ) -> Result<Vec<StoredSession>> {
         let sessions = sqlx::query_as::<_, StoredSession>(&format!(
-            "SELECT session_id, channel_id, thread_id, project, project_path, container_name, container_id, session_type, parent_session_id, user_id, created_at, last_activity_at, message_count, compaction_count, claude_session_id, status, team_id, role, context_tokens \
+            "SELECT session_id, channel_id, thread_id, project, project_path, container_name, container_id, session_type, parent_session_id, user_id, created_at, last_activity_at, message_count, compaction_count, claude_session_id, status, team_id, role, context_tokens, pending_task_from, current_task \
              FROM {}.sessions WHERE team_id = $1 AND (role = $2 OR role LIKE $3) AND status IN ('active', 'disconnected')",
             SCHEMA
         ))
@@ -1057,10 +1092,70 @@ impl Database {
         Ok(())
     }
 
+    /// Set pending task state on a session (hard gate for duplicate task prevention).
+    pub async fn set_pending_task(
+        &self,
+        target_session_id: &str,
+        sender_session_id: &str,
+        task_summary: &str,
+    ) -> Result<()> {
+        // Truncate task summary to 500 chars
+        let truncated = if task_summary.len() > 500 {
+            let end = task_summary.char_indices()
+                .map(|(i, _)| i)
+                .take_while(|&i| i <= 500)
+                .last()
+                .unwrap_or(0);
+            format!("{}…", &task_summary[..end])
+        } else {
+            task_summary.to_string()
+        };
+        sqlx::query(&format!(
+            "UPDATE {}.sessions SET pending_task_from = $1, current_task = $2 WHERE session_id = $3",
+            SCHEMA
+        ))
+        .bind(sender_session_id)
+        .bind(&truncated)
+        .bind(target_session_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Clear pending task state (called when member responds).
+    /// Only clears pending_task_from; current_task persists until next assignment.
+    pub async fn clear_pending_task(&self, session_id: &str) -> Result<()> {
+        sqlx::query(&format!(
+            "UPDATE {}.sessions SET pending_task_from = NULL WHERE session_id = $1",
+            SCHEMA
+        ))
+        .bind(session_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Update the coordination thread ID for a team.
+    pub async fn update_team_coordination_thread(
+        &self,
+        team_id: &str,
+        thread_id: &str,
+    ) -> Result<()> {
+        sqlx::query(&format!(
+            "UPDATE {}.teams SET coordination_thread_id = $1 WHERE team_id = $2",
+            SCHEMA
+        ))
+        .bind(thread_id)
+        .bind(team_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     /// Get all active teams.
     pub async fn get_active_teams(&self) -> Result<Vec<StoredTeam>> {
         let teams = sqlx::query_as::<_, StoredTeam>(&format!(
-            "SELECT team_id, channel_id, project, project_path, lead_session_id, dev_count, status, created_at \
+            "SELECT team_id, channel_id, project, project_path, lead_session_id, dev_count, status, created_at, coordination_thread_id \
              FROM {}.teams WHERE status = 'active'",
             SCHEMA
         ))

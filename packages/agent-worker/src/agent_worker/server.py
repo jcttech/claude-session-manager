@@ -20,6 +20,7 @@ from grpc import aio as grpc_aio
 from . import agent_pb2, agent_pb2_grpc
 from .event_mapper import (
     error_event,
+    extract_context_tokens_from_stream,
     fallback_result_event,
     map_assistant_message,
     map_result_message,
@@ -45,11 +46,13 @@ class AgentWorkerServicer(agent_pb2_grpc.AgentWorkerServicer):
     def __init__(self) -> None:
         self.sessions = SessionManager()
 
-    def _parse_and_map_event(self, raw_data, turn_start: float):
+    def _parse_and_map_event(self, raw_data, turn_start: float, context_tokens: int = 0):
         """Parse a raw SDK message dict and map it to an AgentEvent (or None).
 
-        Returns (event_or_none, is_result) where is_result indicates a ResultMessage
-        was processed (turn boundary).
+        Returns (event_or_none, is_result, updated_context_tokens) where:
+        - event_or_none: AgentEvent, list of AgentEvents, or None
+        - is_result: True if a ResultMessage was processed (turn boundary)
+        - updated_context_tokens: last known per-call input tokens (context window)
         """
         try:
             message = parse_message(raw_data)
@@ -64,16 +67,16 @@ class AgentWorkerServicer(agent_pb2_grpc.AgentWorkerServicer):
                     "ResultMessage parse failed — forcing exit: %s",
                     parse_exc,
                 )
-                return fallback_result_event(raw_data, turn_start), True
+                return fallback_result_event(raw_data, turn_start, context_tokens), True, context_tokens
             else:
                 logger.warning("Skipping unparseable message: %s", parse_exc)
-            return None, False
+            return None, False, context_tokens
 
         msg_type = type(message).__name__
         if isinstance(message, SystemMessage):
             logger.debug("received SystemMessage (subtype=%s)", message.subtype)
             event = map_system_message(message)
-            return event, False
+            return event, False, context_tokens
 
         elif isinstance(message, AssistantMessage):
             block_count = len(message.content) if hasattr(message, 'content') else 0
@@ -83,27 +86,32 @@ class AgentWorkerServicer(agent_pb2_grpc.AgentWorkerServicer):
                 ev for ev in map_assistant_message(message)
                 if not ev.HasField("text")
             ]
-            return events, False
+            return events, False, context_tokens
 
         elif isinstance(message, ResultMessage):
             logger.info("received ResultMessage (session=%s, turns=%s)",
                         getattr(message, 'session_id', '?'),
                         getattr(message, 'num_turns', '?'))
-            return map_result_message(message, turn_start), True
+            return map_result_message(message, turn_start, context_tokens), True, context_tokens
 
         elif isinstance(message, StreamEvent):
             raw = message.event or {}
             event_type = raw.get("type", "unknown")
             logger.debug("received StreamEvent (%s)", event_type)
+            # Track per-API-call input tokens from message_start events
+            ctx = extract_context_tokens_from_stream(message)
+            if ctx is not None:
+                context_tokens = ctx
+                logger.debug("Context tokens updated: %d", context_tokens)
             event = map_stream_event(message)
-            return event, False
+            return event, False, context_tokens
 
         elif isinstance(message, UserMessage):
-            return None, False  # Tool results flowing back — not surfaced to chat
+            return None, False, context_tokens  # Tool results flowing back — not surfaced to chat
 
         else:
             logger.warning("Unhandled message type: %s", msg_type)
-            return None, False
+            return None, False, context_tokens
 
     async def Session(self, request_iterator, context):
         """Bidirectional streaming: one gRPC stream = one SDK session lifecycle.
@@ -128,6 +136,8 @@ class AgentWorkerServicer(agent_pb2_grpc.AgentWorkerServicer):
         async def sdk_reader():
             """Continuously read from SDK message stream and push events to queue."""
             nonlocal turn_start
+            # Track per-API-call context tokens (last message_start usage)
+            ctx_tokens = 0
             try:
                 while True:
                     try:
@@ -144,8 +154,9 @@ class AgentWorkerServicer(agent_pb2_grpc.AgentWorkerServicer):
                         await event_queue.put(None)  # Sentinel: stream ended
                         return
 
-                    result = self._parse_and_map_event(raw_data, turn_start)
-                    event_or_list, _is_result = result
+                    event_or_list, _is_result, ctx_tokens = self._parse_and_map_event(
+                        raw_data, turn_start, ctx_tokens,
+                    )
 
                     if event_or_list is None:
                         continue

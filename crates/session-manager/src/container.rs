@@ -938,10 +938,12 @@ async fn message_processor(
 
                                 let input_tokens = result.input_tokens;
                                 let output_tokens = result.output_tokens;
+                                let context_tokens = result.context_tokens;
                                 tracing::info!(
                                     event_count,
                                     input_tokens,
                                     output_tokens,
+                                    context_tokens,
                                     is_error = result.is_error,
                                     "gRPC: Result received (turn complete)"
                                 );
@@ -958,6 +960,7 @@ async fn message_processor(
                                         .send(OutputEvent::ResponseComplete {
                                             input_tokens,
                                             output_tokens,
+                                            context_tokens,
                                         })
                                         .await;
                                 }

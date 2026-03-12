@@ -250,10 +250,12 @@ impl GrpcStream {
                             }
                             let input_tokens = result.input_tokens;
                             let output_tokens = result.output_tokens;
+                            let context_tokens = result.context_tokens;
                             tracing::info!(
                                 event_count,
                                 input_tokens,
                                 output_tokens,
+                                context_tokens,
                                 is_error = result.is_error,
                                 result_text_len = result.result_text.len(),
                                 "gRPC: Result received (turn complete)"
@@ -271,6 +273,7 @@ impl GrpcStream {
                                     .send(OutputEvent::ResponseComplete {
                                         input_tokens,
                                         output_tokens,
+                                        context_tokens,
                                     })
                                     .await;
                             }

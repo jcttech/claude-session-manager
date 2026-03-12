@@ -82,22 +82,31 @@ def _total_input_tokens(usage: dict) -> int:
 
 
 def map_result_message(
-    msg: ResultMessage, start_time: float
+    msg: ResultMessage, start_time: float, context_tokens: int = 0,
 ) -> agent_pb2.AgentEvent:
-    """Map a ResultMessage to a SessionResult AgentEvent."""
+    """Map a ResultMessage to a SessionResult AgentEvent.
+
+    Args:
+        msg: The ResultMessage from the Claude Agent SDK.
+        start_time: Monotonic timestamp when the turn started.
+        context_tokens: Input tokens from the last API call (actual context
+            window usage). When 0, falls back to the cumulative usage total.
+    """
     usage = msg.usage or {}
     duration_ms = int((time.monotonic() - start_time) * 1000)
+    cumulative_input = _total_input_tokens(usage)
 
     return agent_pb2.AgentEvent(
         result=agent_pb2.SessionResult(
             session_id=msg.session_id or "",
-            input_tokens=_total_input_tokens(usage),
+            input_tokens=cumulative_input,
             output_tokens=usage.get("output_tokens", 0),
             cost_usd=msg.total_cost_usd or 0.0,
             num_turns=msg.num_turns or 0,
             duration_ms=duration_ms,
             is_error=msg.is_error or False,
             result_text=msg.result or "",
+            context_tokens=context_tokens if context_tokens > 0 else cumulative_input,
         )
     )
 
@@ -161,6 +170,27 @@ def map_stream_event(event: StreamEvent) -> agent_pb2.AgentEvent | None:
     return None
 
 
+def extract_context_tokens_from_stream(event: StreamEvent) -> int | None:
+    """Extract per-API-call input tokens from a message_start stream event.
+
+    The Anthropic API emits a message_start event at the beginning of each API
+    call with `usage.input_tokens` representing the context window consumed by
+    that single call. This is distinct from the cumulative usage reported in
+    the final ResultMessage.
+
+    Returns the input token count if this is a message_start event with usage,
+    otherwise None.
+    """
+    raw = event.event or {}
+    if raw.get("type") != "message_start":
+        return None
+    message = raw.get("message", {})
+    usage = message.get("usage", {})
+    if not usage:
+        return None
+    return _total_input_tokens(usage)
+
+
 def error_event(message: str, error_type: str = "internal") -> agent_pb2.AgentEvent:
     """Create an AgentError event."""
     return agent_pb2.AgentEvent(
@@ -169,7 +199,7 @@ def error_event(message: str, error_type: str = "internal") -> agent_pb2.AgentEv
 
 
 def fallback_result_event(
-    raw_data: dict, start_time: float
+    raw_data: dict, start_time: float, context_tokens: int = 0,
 ) -> agent_pb2.AgentEvent:
     """Build a SessionResult from raw dict when ResultMessage fails to parse.
 
@@ -177,16 +207,18 @@ def fallback_result_event(
     """
     usage = raw_data.get("usage", {}) or {}
     duration_ms = int((time.monotonic() - start_time) * 1000)
+    cumulative_input = _total_input_tokens(usage)
 
     return agent_pb2.AgentEvent(
         result=agent_pb2.SessionResult(
             session_id=raw_data.get("session_id", ""),
-            input_tokens=_total_input_tokens(usage),
+            input_tokens=cumulative_input,
             output_tokens=usage.get("output_tokens", 0),
             cost_usd=raw_data.get("total_cost_usd", 0.0) or 0.0,
             num_turns=raw_data.get("num_turns", 0) or 0,
             duration_ms=duration_ms,
             is_error=raw_data.get("is_error", False) or False,
             result_text=raw_data.get("result", "") or "",
+            context_tokens=context_tokens if context_tokens > 0 else cumulative_input,
         )
     )

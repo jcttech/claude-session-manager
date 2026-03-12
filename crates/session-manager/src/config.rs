@@ -108,6 +108,15 @@ pub struct Settings {
     /// Starting port number for gRPC agent worker connections
     #[serde(default = "default_grpc_port_start")]
     pub grpc_port_start: u16,
+
+    /// Maximum context window size for Claude models (tokens)
+    #[serde(default = "default_context_window_max")]
+    pub context_window_max: u64,
+
+    /// Mattermost channel ID for the shared team coordination log
+    /// If not set, will be auto-created on first team orchestration
+    #[serde(default)]
+    pub coordination_channel_id: Option<String>,
 }
 
 fn default_vm_user() -> String {
@@ -175,6 +184,9 @@ fn default_container_idle_timeout_secs() -> u64 {
 }
 fn default_grpc_port_start() -> u16 {
     50051
+}
+fn default_context_window_max() -> u64 {
+    200_000
 }
 
 static SETTINGS: OnceLock<Settings> = OnceLock::new();

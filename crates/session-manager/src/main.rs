@@ -8,6 +8,7 @@ use metrics::{counter, gauge, histogram};
 use metrics_exporter_prometheus::PrometheusBuilder;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use dashmap::DashMap;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -80,6 +81,10 @@ struct AppState {
     opnsense: OPNsense,
     db: Database,
     liveness: LivenessState,
+    /// Per-team mutex to serialize spawn operations (prevents race conditions)
+    spawn_locks: DashMap<String, Arc<tokio::sync::Mutex<()>>>,
+    /// Shared coordination channel ID for team coordination logs
+    coordination_channel_id: tokio::sync::RwLock<Option<String>>,
 }
 
 #[derive(Deserialize)]
@@ -133,6 +138,7 @@ async fn main() -> Result<()> {
 
     let liveness = LivenessState::new();
 
+    let coordination_channel_id = s.coordination_channel_id.clone();
     let state = Arc::new(AppState {
         mm,
         containers,
@@ -140,6 +146,8 @@ async fn main() -> Result<()> {
         opnsense,
         db,
         liveness,
+        spawn_locks: DashMap::new(),
+        coordination_channel_id: tokio::sync::RwLock::new(coordination_channel_id),
     });
 
     // Sync container registry from database
@@ -1158,11 +1166,13 @@ async fn handle_messages(
                         };
                         // Context window usage
                         let last_input = info.as_ref().map(|i| i.last_input_tokens).unwrap_or(0);
+                        let ctx_max = config::settings().context_window_max;
                         let context_line = if last_input > 0 {
-                            let usage_pct = (last_input as f64 / 200_000.0 * 100.0) as u64;
+                            let usage_pct = (last_input as f64 / ctx_max as f64 * 100.0) as u64;
                             format!(
-                                "| Context | {} / 200k ({}%) |",
+                                "| Context | {} / {}k ({}%) |",
                                 format_token_count(last_input),
+                                ctx_max / 1000,
                                 usage_pct
                             )
                         } else {
@@ -1538,6 +1548,9 @@ async fn handle_messages(
                                     ).await {
                                         tracing::warn!(error = %e, "Failed to create team record");
                                     }
+
+                                    // Create coordination thread for this team
+                                    setup_coordination_thread(&state, &team_id, &project_input).await;
 
                                     let _ = state.mm.post(
                                         channel_id,
@@ -2102,7 +2115,8 @@ fn format_token_count(tokens: u64) -> String {
 
 /// Format context window suffix (e.g. "45.2k/200k ctx")
 fn format_ctx_suffix(input_tokens: u64) -> String {
-    format!("{}/200k ctx", format_token_count(input_tokens))
+    let ctx_max_k = config::settings().context_window_max / 1000;
+    format!("{}/{}k ctx", format_token_count(input_tokens), ctx_max_k)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2182,6 +2196,8 @@ async fn stream_output(
                                     let message = team_msg_buffer.join("\n");
                                     team_msg_buffer.clear();
                                     let target = team_msg_target.take().unwrap();
+                                    // Clear pending task — member is responding
+                                    let _ = state.db.clear_pending_task(&session_id).await;
                                     if target == "__broadcast__" {
                                         broadcast_team_message(&state, &session_id, sender_role, &message, tid, &channel_id).await;
                                     } else {
@@ -2204,7 +2220,13 @@ async fn stream_output(
                                 let spawn_sid = session_id.clone();
                                 let spawn_role = sender_role.clone();
                                 let spawn_project = project.clone();
+                                // Acquire per-team spawn lock to serialize spawns and prevent race conditions
+                                let lock = spawn_state.spawn_locks
+                                    .entry(spawn_tid.clone())
+                                    .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                                    .clone();
                                 tokio::spawn(async move {
+                                    let _guard = lock.lock().await;
                                     handle_team_spawn(
                                         spawn_state, &spawn_tid, &spawn_cid, &spawn_sid, &spawn_role,
                                         &role_name, &initial_task, &spawn_project,
@@ -2217,6 +2239,8 @@ async fn stream_output(
                             if let Some(caps) = msg_re.captures(&line) {
                                 let target_role = caps[1].trim().to_string();
                                 let inline_msg = caps[2].trim().to_string();
+                                // Clear pending task — member is responding
+                                let _ = state.db.clear_pending_task(&session_id).await;
                                 if inline_msg.is_empty() {
                                     // Multi-line mode
                                     team_msg_target = Some(target_role);
@@ -2231,6 +2255,8 @@ async fn stream_output(
                             // Check for [BROADCAST] marker
                             if let Some(caps) = broadcast_re.captures(&line) {
                                 let inline_msg = caps[1].trim().to_string();
+                                // Clear pending task — member is responding
+                                let _ = state.db.clear_pending_task(&session_id).await;
                                 if inline_msg.is_empty() {
                                     team_msg_target = Some("__broadcast__".to_string());
                                     team_msg_buffer.clear();
@@ -2291,36 +2317,47 @@ async fn stream_output(
                         let _ = state.mm.update_post(&thread_id, &format!("{} — {}", label, title)).await;
                         let _ = state.mm.post_in_thread(&channel_id, &thread_id, "Title updated.").await;
                     }
-                    OutputEvent::ResponseComplete { input_tokens, output_tokens } => {
+                    OutputEvent::ResponseComplete { input_tokens, output_tokens, context_tokens } => {
                         state.liveness.update_activity(&session_id, "ResponseComplete");
+                        // context_tokens = actual context window usage (last API call)
+                        // input_tokens = cumulative across all API calls (for billing)
+                        let ctx_display = context_tokens;
                         tracing::info!(
                             session_id = %session_id,
-                            input_tokens, output_tokens,
+                            input_tokens, output_tokens, context_tokens,
                             batch_len = batch.len(),
                             "stream_output: ResponseComplete"
                         );
                         // Drain remaining text into card, finalize, and flush
                         drain_batch_to_card(&mut card, &state, &channel_id, &thread_id, &mut batch, &mut batch_bytes).await;
 
-                        card.finalize(input_tokens, output_tokens);
+                        card.finalize(ctx_display, output_tokens);
                         card.flush(&state, &channel_id, &thread_id).await;
                         // Reset card post_id so next turn creates a fresh card
                         card.post_id = None;
 
-                        // Persist last input_tokens for status display
-                        state.containers.set_last_input_tokens(&session_id, input_tokens);
+                        // Persist context_tokens (actual window size) for status display
+                        state.containers.set_last_input_tokens(&session_id, ctx_display);
                         // Persist to database for cross-restart availability
-                        let _ = state.db.update_context_tokens(&session_id, input_tokens).await;
+                        let _ = state.db.update_context_tokens(&session_id, ctx_display).await;
+
+                        // Clear pending task on response complete for team members
+                        if team_info.is_some() {
+                            let _ = state.db.clear_pending_task(&session_id).await;
+                        }
 
                         counter!("tokens_input_total").increment(input_tokens);
                         counter!("tokens_output_total").increment(output_tokens);
 
-                        // Warn when context window is getting full (>80% of 200k)
-                        if input_tokens > 160_000 {
-                            let usage_pct = (input_tokens as f64 / 200_000.0 * 100.0) as u64;
+                        // Warn when context window is getting full (>80%)
+                        let ctx_max = config::settings().context_window_max;
+                        let ctx_warn_threshold = ctx_max * 80 / 100;
+                        let ctx_compact_threshold = ctx_max * 90 / 100;
+                        if ctx_display > ctx_warn_threshold {
+                            let usage_pct = (ctx_display as f64 / ctx_max as f64 * 100.0) as u64;
                             let msg = format!(
-                                ":warning: **Context window {}% full** ({} / 200k tokens) — consider using `compact` or `clear`",
-                                usage_pct, input_tokens
+                                ":warning: **Context window {}% full** ({} / {}k tokens) — consider using `compact` or `clear`",
+                                usage_pct, ctx_display, ctx_max / 1000,
                             );
                             let _ = state.mm.post_in_thread(&channel_id, &thread_id, &msg).await;
 
@@ -2329,8 +2366,8 @@ async fn stream_output(
                                 && role != "Team Lead"
                             {
                                 let alert_msg = format!(
-                                    "**Context Alert**: {} is at {}% context capacity ({}/200k).\nConsider sending them a `compact` or `clear` instruction, or reassigning remaining work.",
-                                    role, usage_pct, format_token_count(input_tokens)
+                                    "**Context Alert**: {} is at {}% context capacity ({}/{}k).\nConsider sending them a `compact` or `clear` instruction, or reassigning remaining work.",
+                                    role, usage_pct, format_token_count(ctx_display), ctx_max / 1000,
                                 );
                                 if let Ok(leads) = state.db.get_sessions_by_role(tid, "Team Lead").await
                                     && let Some(lead) = leads.first()
@@ -2342,7 +2379,7 @@ async fn stream_output(
                         }
 
                         // Auto-compact at 90% context for team sessions
-                        if input_tokens > 180_000
+                        if ctx_display > ctx_compact_threshold
                             && let Some((ref tid, ref role)) = team_info
                         {
                             let _ = state.containers.send(&session_id, "/compact").await;
@@ -2353,10 +2390,10 @@ async fn stream_output(
                             {
                                 let header = build_team_context_header(&state.db, tid, "Team Lead").await;
                                 let compact_msg = format!(
-                                    "{}\n**Auto-compact**: {} context auto-compacted at {}% ({}k/200k).",
+                                    "{}\n**Auto-compact**: {} context auto-compacted at {}% ({}k/{}k).",
                                     header, role,
-                                    (input_tokens as f64 / 200_000.0 * 100.0) as u64,
-                                    input_tokens / 1000,
+                                    (ctx_display as f64 / ctx_max as f64 * 100.0) as u64,
+                                    ctx_display / 1000, ctx_max / 1000,
                                 );
                                 let _ = state.containers.send(&lead.session_id, &compact_msg).await;
                             }
@@ -2446,6 +2483,90 @@ async fn stream_output(
 
 // ==================== Team Functions ====================
 
+/// Ensure the shared coordination channel exists, creating it if needed.
+async fn ensure_coordination_channel(state: &AppState) -> Option<String> {
+    // Check if we already have it cached
+    {
+        let cached = state.coordination_channel_id.read().await;
+        if let Some(ref id) = *cached {
+            return Some(id.clone());
+        }
+    }
+
+    // Try to find or create the channel
+    let s = config::settings();
+    let channel_name = "team-coordination-log";
+    let channel_id = match state.mm.get_channel_by_name(&s.mattermost_team_id, channel_name).await {
+        Ok(Some(id)) => id,
+        Ok(None) => {
+            // Create the channel
+            match state.mm.create_channel(
+                &s.mattermost_team_id,
+                channel_name,
+                "Team Coordination Log",
+                "Shared coordination channel for all team activities",
+            ).await {
+                Ok(id) => id,
+                Err(e) => {
+                    tracing::error!(error = %e, "Failed to create coordination channel");
+                    return None;
+                }
+            }
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "Failed to look up coordination channel");
+            return None;
+        }
+    };
+
+    // Cache it
+    let mut cached = state.coordination_channel_id.write().await;
+    *cached = Some(channel_id.clone());
+    Some(channel_id)
+}
+
+/// Set up a per-team coordination thread in the shared coordination channel.
+async fn setup_coordination_thread(state: &AppState, team_id: &str, project: &str) {
+    let Some(coord_channel_id) = ensure_coordination_channel(state).await else {
+        return;
+    };
+
+    let team_id_prefix = &team_id[..8.min(team_id.len())];
+    let root_msg = format!(
+        "**Team Coordination Log** — {} (team {})",
+        project, team_id_prefix,
+    );
+
+    match state.mm.post_in_thread(&coord_channel_id, &coord_channel_id, &root_msg).await {
+        Ok(post_id) => {
+            if let Err(e) = state.db.update_team_coordination_thread(team_id, &post_id).await {
+                tracing::warn!(error = %e, "Failed to store coordination thread ID");
+            }
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to create coordination thread root post");
+        }
+    }
+}
+
+/// Post a message to the team's coordination log thread.
+async fn post_to_coordination_log(state: &AppState, team_id: &str, message: &str) {
+    let Some(coord_channel_id) = ensure_coordination_channel(state).await else {
+        return;
+    };
+
+    let team = match state.db.get_team(team_id).await {
+        Ok(Some(t)) => t,
+        _ => return,
+    };
+
+    let Some(thread_id) = team.coordination_thread_id else {
+        return;
+    };
+
+    let _ = state.mm.post_in_thread(&coord_channel_id, &thread_id, message).await;
+}
+
 /// Build the team context header prepended to every message delivered to a team member.
 async fn build_team_context_header(db: &Database, team_id: &str, recipient_role: &str) -> String {
     let members = db.get_team_members(team_id).await.unwrap_or_default();
@@ -2513,11 +2634,32 @@ Each message you receive will include a [TEAM: ...] header with the current rost
 ## Your Responsibilities
 {responsibilities}
 
+## Task Assignment Protocol
+- After assigning a task via [TO:Role] or [SPAWN:Role], WAIT for that member to respond before sending another task
+- The system enforces this — sending to a member with a pending task will be rejected
+- Do NOT assign the same task to multiple developers unless you explicitly want parallel approaches
+- Use [TEAM_STATUS] to check member status before sending follow-up tasks
+- If a member is stalled, check their status before re-assigning their task to someone else
+
+## Development Workflow (spec-flow)
+The team follows the spec-flow workflow. Coordinate members through these phases IN ORDER:
+
+1. **Specify** (PM/Architect): Spawn PM/Architect first to use `/specify` for spec issues, `/clarify` to resolve gaps
+2. **Plan** (You): Once specs are approved, use `/plan` to break specs into stories
+3. **Implement** (Developers): Only AFTER stories exist, spawn Developers who use `/implement` for each story
+4. **Review** (You): Review PRs using gh CLI, delegate fixes via [TO:Role], merge when CI passes
+
+IMPORTANT: Do NOT spawn Developers until stories have been planned from approved specs.
+
 ## PR Review & Completion
 When team members create PRs:
-1. Review the PR and ensure automated checks pass
-2. If changes are needed, delegate fixes back to the appropriate team member via [TO:Role]
-3. Once the PR is approved and checks pass, complete/merge the PR"#,
+1. Review the PR using `gh pr view <number>` and `gh pr diff <number>`
+2. Check CI status with `gh pr checks <number>`
+3. If changes needed, send SPECIFIC feedback via [TO:Role] with file paths and issues
+4. Wait for fixes before re-reviewing — do not merge until CI passes
+5. For architectural PRs, delegate review to PM/Architect via [TO:PM/Architect] — they verify alignment with specs
+6. After merging implementation PRs, ask PM/Architect to run `/architecture` to update project docs
+7. Merge with `gh pr merge <number> --squash` when approved"#,
     ))
 }
 
@@ -2538,7 +2680,14 @@ Messages from other members arrive prefixed with their role.
 Each message you receive will include a [TEAM: ...] header with the current roster.
 
 ## Your Responsibilities
-{responsibilities}"#,
+{responsibilities}
+
+## Workflow
+- Wait for task assignment from the Team Lead before starting work
+- After creating a PR, notify Team Lead: [TO:Team Lead] PR #N ready for review
+- Address review feedback promptly when delegated by Team Lead
+- Do NOT start new work until your current PR is merged or you are reassigned
+- One task at a time — finish current work before accepting new assignments"#,
         display_name = role.display_name,
         responsibilities = role.responsibilities,
     )
@@ -2593,16 +2742,39 @@ async fn route_team_message(
     let mut delivered_roles = Vec::new();
     for target in &targets {
         let role = target.role.as_deref().unwrap_or(target_role);
+
+        // Hard gate: check if target already has a pending task from the same sender
+        if let Some(ref pending_from) = target.pending_task_from
+            && pending_from == sender_session_id
+        {
+            // Reject — same sender already has a pending task
+            if let Ok(Some(sender)) = state.db.get_session_by_id_prefix(&sender_session_id[..8.min(sender_session_id.len())]).await {
+                let _ = state.mm.post_in_thread(
+                    &sender.channel_id, &sender.thread_id,
+                    &format!(":hourglass: **{}** already has a pending task. Wait for their response.", role),
+                ).await;
+                // Inject rejection into sender's Claude session
+                let header = format_team_context_header(&members, sender_role);
+                let _ = state.containers.send(&sender.session_id, &format!(
+                    "{}\nTask delivery rejected: {} already has a pending task from you. Wait for their response before sending another task.",
+                    header, role,
+                )).await;
+            }
+            continue;
+        }
+
         let header = format_team_context_header(&members, role);
         let formatted = format!("{}\n**From {}**: {}", header, sender_role, message);
         if let Err(e) = state.containers.send(&target.session_id, &formatted).await {
             tracing::warn!(error = %e, role, "Failed to deliver team message");
         } else {
             delivered_roles.push(role.to_string());
+            // Set pending task on the target
+            let _ = state.db.set_pending_task(&target.session_id, sender_session_id, message).await;
         }
     }
 
-    // Post delivery note in sender's thread
+    // Post delivery note in sender's thread + coordination log
     if !delivered_roles.is_empty()
         && let Ok(Some(sender)) = state.db.get_session_by_id_prefix(&sender_session_id[..8.min(sender_session_id.len())]).await
     {
@@ -2614,8 +2786,20 @@ async fn route_team_message(
         // Show the outgoing message content so the user has full visibility
         let _ = state.mm.post_in_thread(
             &sender.channel_id, &sender.thread_id,
-            &format!(":arrow_right: **To {}:**\n{}", label, truncate_preview(message, 500)),
+            &format!(":arrow_right: **To {}:**\n{}", label, truncate_preview(message, 4000)),
         ).await;
+
+        // Inject delivery receipt into sender's Claude session
+        let header = format_team_context_header(&members, sender_role);
+        let _ = state.containers.send(&sender.session_id, &format!(
+            "{}\nDelivery receipt: message delivered to {}. Wait for their response before sending another task.",
+            header, label,
+        )).await;
+
+        // Post to coordination log
+        post_to_coordination_log(state, team_id, &format!(
+            ":arrow_right: **{} → {}:** {}", sender_role, label, truncate_preview(message, 4000),
+        )).await;
     }
 }
 
@@ -2649,14 +2833,26 @@ async fn broadcast_team_message(
         }
     }
 
-    // Post delivery note in sender's thread
+    // Post delivery note in sender's thread + coordination log
     if let Ok(Some(sender)) = state.db.get_session_by_id_prefix(&sender_session_id[..8.min(sender_session_id.len())]).await {
         // Show the broadcast content so the user has full visibility
         let _ = state.mm.post_in_thread(
             &sender.channel_id, &sender.thread_id,
-            &format!(":loudspeaker: **Broadcast to {} member(s):**\n{}", sent_count, truncate_preview(message, 500)),
+            &format!(":loudspeaker: **Broadcast to {} member(s):**\n{}", sent_count, truncate_preview(message, 4000)),
         ).await;
+
+        // Inject delivery receipt into sender's Claude session
+        let header = format_team_context_header(&members, sender_role);
+        let _ = state.containers.send(&sender.session_id, &format!(
+            "{}\nDelivery receipt: broadcast delivered to {} member(s). Wait for responses before sending follow-up tasks.",
+            header, sent_count,
+        )).await;
     }
+
+    // Post to coordination log
+    post_to_coordination_log(state, team_id, &format!(
+        ":loudspeaker: **{} (broadcast):** {}", sender_role, truncate_preview(message, 4000),
+    )).await;
 }
 
 /// Handle a [SPAWN:Role] marker from the Team Lead.
@@ -2784,11 +2980,13 @@ fn handle_team_spawn(
     )).await;
     match session_result {
         Ok(member_session_id) => {
-            // Send initial task if provided
+            // Send initial task if provided + set pending task
             if !initial_task.is_empty() {
                 let header = build_team_context_header(&state.db, team_id, &display_name).await;
                 let formatted_task = format!("{}\n**From Team Lead**: {}", header, initial_task);
                 let _ = state.containers.send(&member_session_id, &formatted_task).await;
+                // Track the task assignment
+                let _ = state.db.set_pending_task(&member_session_id, lead_session_id, initial_task).await;
             }
 
             // Notify Lead about successful spawn (both Mattermost and session input)
@@ -2797,7 +2995,7 @@ fn handle_team_spawn(
                 let spawn_msg = if initial_task.is_empty() {
                     format!(":white_check_mark: Spawned **{}**", display_name)
                 } else {
-                    format!(":white_check_mark: Spawned **{}:**\n{}", display_name, truncate_preview(initial_task, 500))
+                    format!(":white_check_mark: Spawned **{}:**\n{}", display_name, truncate_preview(initial_task, 4000))
                 };
                 let _ = state.mm.post_in_thread(
                     &lead.channel_id, &lead.thread_id,
@@ -2806,12 +3004,20 @@ fn handle_team_spawn(
                 // Feed confirmation back into the lead's Claude session so it can continue
                 let header = build_team_context_header(&state.db, team_id, "Team Lead").await;
                 if let Err(e) = state.containers.send(&lead.session_id, &format!(
-                    "{}\nSpawn confirmed: {} is now active and has been assigned the task.",
+                    "{}\nSpawn confirmed: {} is now active and has been assigned the task. Wait for their response before sending another task.",
                     header, display_name,
                 )).await {
                     tracing::warn!(error = %e, "Failed to send spawn confirmation to Team Lead session");
                 }
             }
+
+            // Post to coordination log
+            let coord_msg = if initial_task.is_empty() {
+                format!(":rocket: **Spawned {}**", display_name)
+            } else {
+                format!(":rocket: **Spawned {}:** {}", display_name, truncate_preview(initial_task, 4000))
+            };
+            post_to_coordination_log(&state, team_id, &coord_msg).await;
 
             // Broadcast roster update to all existing members
             let update_msg = format!("**Team Roster Update**: {} has joined the team.", display_name);
@@ -2867,7 +3073,9 @@ async fn handle_team_status(state: &AppState, session_id: &str, team_id: &str) {
         }
     };
 
-    let mut table = String::from("**Team Status:**\n| Role | Status | Context | Last Active |\n|------|--------|---------|-------------|\n");
+    let ctx_max = config::settings().context_window_max;
+    let ctx_max_k = ctx_max / 1000;
+    let mut table = "**Team Status:**\n| Role | Status | Context | Current Task | Last Active |\n|------|--------|---------|--------------|-------------|\n".to_string();
     for member in &members {
         let role = member.role.as_deref().unwrap_or("Unknown");
         let liveness = state.liveness.get_info(&member.session_id);
@@ -2881,15 +3089,22 @@ async fn handle_team_status(state: &AppState, session_id: &str, team_id: &str) {
             .map(|i| i.last_input_tokens)
             .unwrap_or(member.context_tokens as u64);
         let ctx_str = if ctx_tokens > 0 {
-            let pct = (ctx_tokens as f64 / 200_000.0 * 100.0) as u64;
-            format!("{}% ({}k/200k)", pct, ctx_tokens / 1000)
+            let pct = (ctx_tokens as f64 / ctx_max as f64 * 100.0) as u64;
+            format!("{}% ({}k/{}k)", pct, ctx_tokens / 1000, ctx_max_k)
         } else {
             "—".to_string()
         };
 
+        // Current task display
+        let task_str = match (&member.current_task, &member.pending_task_from) {
+            (Some(task), Some(_)) => format!("{} (pending response)", truncate_preview(task, 60)),
+            (Some(task), None) => truncate_preview(task, 60),
+            (None, _) => "—".to_string(),
+        };
+
         table.push_str(&format!(
-            "| {} | {} | {} | {} |\n",
-            role, member.status, ctx_str, last_active,
+            "| {} | {} | {} | {} | {} |\n",
+            role, member.status, ctx_str, task_str, last_active,
         ));
     }
 

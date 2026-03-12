@@ -81,13 +81,14 @@ message SubagentEvent {
 
 message SessionResult {
   string session_id = 1;
-  uint64 input_tokens = 2;
-  uint64 output_tokens = 3;
+  uint64 input_tokens = 2;       // cumulative across all API calls (for billing display)
+  uint64 output_tokens = 3;      // cumulative across all API calls
   double cost_usd = 4;
   int32 num_turns = 5;
   int64 duration_ms = 6;
   bool is_error = 7;
   string result_text = 8;
+  uint64 context_tokens = 9;     // last API call's input tokens (actual context window usage)
 }
 
 message AgentError {
