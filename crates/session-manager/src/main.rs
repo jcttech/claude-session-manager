@@ -2644,7 +2644,7 @@ Each message you receive will include a [TEAM: ...] header with the current rost
 ## Development Workflow (spec-flow)
 The team follows the spec-flow workflow. Coordinate members through these phases IN ORDER:
 
-1. **Specify** (PM/Architect): Spawn PM/Architect first to use `/specify` for spec issues, `/clarify` to resolve gaps
+1. **Specify** (Architect): Spawn Architect first to use `/specify` for spec issues, `/clarify` to resolve gaps
 2. **Plan** (You): Once specs are approved, use `/plan` to break specs into stories
 3. **Implement** (Developers): Only AFTER stories exist, spawn Developers who use `/implement` for each story
 4. **Review** (You): Review PRs using gh CLI, delegate fixes via [TO:Role], merge when CI passes
@@ -2657,8 +2657,8 @@ When team members create PRs:
 2. Check CI status with `gh pr checks <number>`
 3. If changes needed, send SPECIFIC feedback via [TO:Role] with file paths and issues
 4. Wait for fixes before re-reviewing — do not merge until CI passes
-5. For architectural PRs, delegate review to PM/Architect via [TO:PM/Architect] — they verify alignment with specs
-6. After merging implementation PRs, ask PM/Architect to run `/architecture` to update project docs
+5. For architectural PRs, delegate review to Architect via [TO:Architect] — they verify alignment with specs
+6. After merging implementation PRs, ask Architect to run `/architecture` to update project docs
 7. Merge with `gh pr merge <number> --squash` when approved"#,
     ))
 }

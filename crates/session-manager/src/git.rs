@@ -164,10 +164,13 @@ impl GitManager {
             .join(&repo_ref.repo)
     }
 
-    /// Generate a worktree path
-    fn worktree_path(&self, _repo_ref: &RepoRef, name: &str) -> PathBuf {
+    /// Generate a worktree path, scoped under org/repo to avoid collisions
+    fn worktree_path(&self, repo_ref: &RepoRef, name: &str) -> PathBuf {
         let s = settings();
-        PathBuf::from(&s.worktrees_path).join(name)
+        PathBuf::from(&s.worktrees_path)
+            .join(&repo_ref.org)
+            .join(&repo_ref.repo)
+            .join(name)
     }
 
     /// Ensure a repository is cloned on the VM, return path to main clone
@@ -245,30 +248,42 @@ impl GitManager {
         let worktree_path = self.worktree_path(repo_ref, &worktree_name);
         let worktree_path_str = worktree_path.to_string_lossy();
 
-        // Ensure worktrees directory exists
-        let s = settings();
-        let mkdir_cmd = format!("mkdir -p {}", shell_escape(&s.worktrees_path));
+        // Ensure worktrees parent directory exists
+        let parent_dir = worktree_path.parent().ok_or_else(|| anyhow!("Invalid worktree path"))?;
+        let parent_str = parent_dir.to_string_lossy();
+        let mkdir_cmd = format!("mkdir -p {}", shell_escape(&parent_str));
         self.ssh_command(&mkdir_cmd).await?;
 
-        // Create worktree
-        let worktree_cmd = if let Some(branch) = &repo_ref.branch {
-            format!(
-                "git -C {} worktree add {} {}",
-                shell_escape(&repo_path_str),
-                shell_escape(&worktree_path_str),
-                shell_escape(branch)
-            )
-        } else {
-            format!(
-                "git -C {} worktree add {}",
-                shell_escape(&repo_path_str),
-                shell_escape(&worktree_path_str)
-            )
-        };
+        // Check if worktree already exists and reuse it
+        let check_cmd = format!("test -d {} && echo exists", shell_escape(&worktree_path_str));
+        let exists = self.ssh_command(&check_cmd).await.map(|s| s.contains("exists")).unwrap_or(false);
 
-        self.ssh_command(&worktree_cmd).await.map_err(|e| {
-            anyhow!("Failed to create worktree: {}", e)
-        })?;
+        if exists {
+            tracing::info!(
+                worktree = %worktree_path_str,
+                "Worktree already exists, reusing"
+            );
+        } else {
+            // Create worktree
+            let worktree_cmd = if let Some(branch) = &repo_ref.branch {
+                format!(
+                    "git -C {} worktree add {} {}",
+                    shell_escape(&repo_path_str),
+                    shell_escape(&worktree_path_str),
+                    shell_escape(branch)
+                )
+            } else {
+                format!(
+                    "git -C {} worktree add {}",
+                    shell_escape(&repo_path_str),
+                    shell_escape(&worktree_path_str)
+                )
+            };
+
+            self.ssh_command(&worktree_cmd).await.map_err(|e| {
+                anyhow!("Failed to create worktree: {}", e)
+            })?;
+        }
 
         Ok(worktree_path)
     }

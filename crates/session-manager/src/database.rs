@@ -417,7 +417,7 @@ pub async fn create_schema(pool: &PgPool, schema: &str) -> Result<()> {
 - Synthesize the team''s work into a final summary for the user when the task is complete
 - Wind down the team when all work is done — don''t leave idle members running',
              false, false, 0),
-            ('pm_architect', 'PM/Architect', 'Designs architecture and manages requirements',
+            ('pm_architect', 'Architect', 'Designs architecture and manages requirements',
              '- Use `/blueprint` to define project architecture, roadmap, and milestones
 - Use `/architecture` to maintain the project''s architecture documentation
 - Use `/specify` to create spec issues from requirements — iterate with `/clarify` to resolve ambiguities before approving
