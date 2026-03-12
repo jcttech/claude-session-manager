@@ -91,12 +91,12 @@ sys.modules["claude_agent_sdk.types"] = mock_sdk_types
 
 from agent_worker.event_mapper import (  # noqa: E402
     error_event,
+    extract_context_tokens_from_stream,
     fallback_result_event,
     map_assistant_message,
     map_result_message,
     map_stream_event,
     map_system_message,
-    extract_context_tokens_from_stream,
 )
 
 

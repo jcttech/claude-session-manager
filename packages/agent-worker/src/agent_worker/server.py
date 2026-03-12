@@ -67,7 +67,8 @@ class AgentWorkerServicer(agent_pb2_grpc.AgentWorkerServicer):
                     "ResultMessage parse failed — forcing exit: %s",
                     parse_exc,
                 )
-                return fallback_result_event(raw_data, turn_start, context_tokens), True, context_tokens
+                evt = fallback_result_event(raw_data, turn_start, context_tokens)
+                return evt, True, context_tokens
             else:
                 logger.warning("Skipping unparseable message: %s", parse_exc)
             return None, False, context_tokens
