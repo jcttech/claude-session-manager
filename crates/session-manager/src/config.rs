@@ -117,6 +117,10 @@ pub struct Settings {
     /// If not set, will be auto-created on first team orchestration
     #[serde(default)]
     pub coordination_channel_id: Option<String>,
+
+    /// Seconds before a session is considered stuck (0 = disabled)
+    #[serde(default = "default_session_stuck_timeout_secs")]
+    pub session_stuck_timeout_secs: u64,
 }
 
 fn default_vm_user() -> String {
@@ -187,6 +191,9 @@ fn default_grpc_port_start() -> u16 {
 }
 fn default_context_window_max() -> u64 {
     200_000
+}
+fn default_session_stuck_timeout_secs() -> u64 {
+    300
 }
 
 static SETTINGS: OnceLock<Settings> = OnceLock::new();

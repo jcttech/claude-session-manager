@@ -61,6 +61,22 @@ impl LivenessState {
             last_event_type: entry.last_event_type.clone(),
         })
     }
+
+    /// Get liveness info for all tracked sessions.
+    pub fn all_sessions(&self) -> Vec<(String, LivenessInfo)> {
+        self.entries
+            .iter()
+            .map(|entry| {
+                (
+                    entry.key().clone(),
+                    LivenessInfo {
+                        idle_duration: Instant::now().duration_since(entry.last_output_at),
+                        last_event_type: entry.last_event_type.clone(),
+                    },
+                )
+            })
+            .collect()
+    }
 }
 
 /// Format a Duration as a short human-readable string (e.g. "5s", "2m 30s", "1h 5m").
@@ -125,6 +141,30 @@ mod tests {
     fn update_activity_nonexistent_is_noop() {
         let state = LivenessState::new();
         state.update_activity("nope", "TextLine");
+    }
+
+    #[test]
+    fn all_sessions_returns_all() {
+        let state = LivenessState::new();
+        state.register("s1");
+        state.register("s2");
+        state.update_activity("s2", "ToolAction");
+
+        let all = state.all_sessions();
+        assert_eq!(all.len(), 2);
+
+        let ids: Vec<&str> = all.iter().map(|(id, _)| id.as_str()).collect();
+        assert!(ids.contains(&"s1"));
+        assert!(ids.contains(&"s2"));
+
+        let s2_info = all.iter().find(|(id, _)| id == "s2").unwrap();
+        assert_eq!(s2_info.1.last_event_type, "ToolAction");
+    }
+
+    #[test]
+    fn all_sessions_empty() {
+        let state = LivenessState::new();
+        assert!(state.all_sessions().is_empty());
     }
 
     #[test]

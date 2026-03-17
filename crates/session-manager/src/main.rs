@@ -191,6 +191,12 @@ async fn main() -> Result<()> {
                         }
                     })
                     .unwrap_or(config::settings().grpc_port_start);
+                // Reconstruct system prompt for team sessions
+                let reconnect_prompt = rebuild_system_prompt(
+                    &state.db, &session.session_type,
+                    session.team_id.as_deref(), session.role.as_deref(),
+                ).await;
+
                 if let Err(e) = state
                     .containers
                     .reconnect(
@@ -202,6 +208,7 @@ async fn main() -> Result<()> {
                         &session.session_type,
                         output_tx,
                         reconnect_grpc_port,
+                        reconnect_prompt.as_deref(),
                     )
                     .await
                 {
@@ -274,6 +281,12 @@ async fn main() -> Result<()> {
     let cancel_clone = cancel_token.clone();
     let cleanup_handle = tokio::spawn(async move {
         cleanup_stale_requests(state_clone, cancel_clone).await;
+    });
+
+    // Spawn session watchdog (stuck detection + automation nudging)
+    let watchdog_state = state.clone();
+    let _watchdog_handle = tokio::spawn(async move {
+        session_watchdog(watchdog_state).await;
     });
 
     // Configure rate limiting
@@ -903,10 +916,14 @@ async fn handle_messages(
                 if text.starts_with(bot_trigger) {
                     let cmd = text.trim_start_matches(bot_trigger).trim();
                     if cmd == "stop" {
-                        // If this is a team lead, stop all team members first
                         if session.session_type == "team_lead" {
+                            // Just stop the lead — team members keep running
                             if let Some(ref tid) = session.team_id {
-                                stop_team(&state, tid, &session).await;
+                                broadcast_team_notification(
+                                    &state, tid,
+                                    "**Team Roster Update**: Team Lead session paused. Members continue working.",
+                                    &session.session_id,
+                                ).await;
                             }
                         } else if session.team_id.is_some() {
                             // Team member stopped — notify lead
@@ -919,6 +936,24 @@ async fn handle_messages(
                         let _ = state
                             .mm
                             .post_in_thread(channel_id, root_id, "Stopped.")
+                            .await;
+                        continue;
+                    }
+                    if cmd == "disband" {
+                        if session.session_type != "team_lead" {
+                            let _ = state
+                                .mm
+                                .post_in_thread(channel_id, root_id, "Only the team lead can disband the team.")
+                                .await;
+                            continue;
+                        }
+                        if let Some(ref tid) = session.team_id {
+                            stop_team(&state, tid, &session).await;
+                        }
+                        stop_session(&state, &session).await;
+                        let _ = state
+                            .mm
+                            .post_in_thread(channel_id, root_id, "Team disbanded.")
                             .await;
                         continue;
                     }
@@ -1101,6 +1136,38 @@ async fn handle_messages(
                         let _ = state.mm.post_in_thread(channel_id, root_id, msg).await;
                         continue;
                     }
+                    if cmd == "auto" || cmd.starts_with("auto ") {
+                        if session.session_type != "team_lead" {
+                            let _ = state.mm.post_in_thread(channel_id, root_id, "Automation mode is only available for team leads.").await;
+                            continue;
+                        }
+                        if let Some(ref tid) = session.team_id {
+                            let arg = cmd.strip_prefix("auto").unwrap().trim();
+                            let new_state = match arg {
+                                "on" => true,
+                                "off" => false,
+                                "" => {
+                                    // Toggle based on current state
+                                    let team = state.db.get_team(tid).await.ok().flatten();
+                                    !team.map(|t| t.automation).unwrap_or(false)
+                                }
+                                _ => {
+                                    let _ = state.mm.post_in_thread(channel_id, root_id, "Usage: `@claude auto` (toggle), `@claude auto on`, `@claude auto off`").await;
+                                    continue;
+                                }
+                            };
+                            let _ = state.db.set_team_automation(tid, new_state).await;
+                            let msg = if new_state {
+                                "Automation mode **enabled**. Team lead will be nudged when idle."
+                            } else {
+                                "Automation mode **disabled**."
+                            };
+                            let _ = state.mm.post_in_thread(channel_id, root_id, msg).await;
+                        } else {
+                            let _ = state.mm.post_in_thread(channel_id, root_id, "Not in a team.").await;
+                        }
+                        continue;
+                    }
                     if cmd == "title" || cmd.starts_with("title ") {
                         let arg = cmd.strip_prefix("title").unwrap().trim();
                         if arg.is_empty() {
@@ -1126,6 +1193,14 @@ async fn handle_messages(
                                 .post_in_thread(channel_id, root_id, "Title updated.")
                                 .await;
                         }
+                        continue;
+                    }
+                    // Catch-all: forward any /slash-command directly to Claude CLI
+                    if cmd.starts_with('/') {
+                        if let Err(e) = state.containers.send(&session.session_id, cmd).await {
+                            tracing::warn!(session_id = %session.session_id, error = %e, "Failed to forward slash command");
+                        }
+                        let _ = state.db.touch_session(&session.session_id).await;
                         continue;
                     }
                     if cmd == "context" || cmd == "status" {
@@ -1275,6 +1350,12 @@ async fn handle_messages(
                             let (output_tx, output_rx) = mpsc::channel::<OutputEvent>(100);
                             let new_session_id = Uuid::new_v4().to_string();
 
+                            // Reconstruct system prompt for team sessions
+                            let system_prompt = rebuild_system_prompt(
+                                &state.db, &stopped.session_type,
+                                stopped.team_id.as_deref(), stopped.role.as_deref(),
+                            ).await;
+
                             // Try to reuse the existing container
                             match state.containers.reconnect(
                                 &new_session_id,
@@ -1285,6 +1366,7 @@ async fn handle_messages(
                                 &stopped.session_type,
                                 output_tx,
                                 grpc_port,
+                                system_prompt.as_deref(),
                             ).await {
                                 Ok(()) => {
                                     // Register liveness
@@ -1317,6 +1399,19 @@ async fn handle_messages(
 
                                     // Delete the old stopped session record
                                     let _ = state.db.delete_session(&stopped.session_id).await;
+
+                                    // Restore team membership if the stopped session was part of a team
+                                    if let (Some(tid), Some(role)) = (&stopped.team_id, &stopped.role) {
+                                        let _ = state.db.set_session_team(&new_session_id, tid, role).await;
+                                        if stopped.session_type == "team_lead" {
+                                            let _ = state.db.update_team_lead_session(tid, &new_session_id).await;
+                                        }
+                                        broadcast_team_notification(
+                                            &state, tid,
+                                            &format!("**Team Roster Update**: {} session resumed.", role),
+                                            &new_session_id,
+                                        ).await;
+                                    }
 
                                     gauge!("active_sessions").increment(1.0);
 
@@ -1724,7 +1819,8 @@ async fn handle_messages(
                         \n\
                         **In a session thread:**\n\
                         - Reply directly to send input\n\
-                        - `{trigger} stop` — End the session\n\
+                        - `{trigger} stop` — End the session (team members keep running)\n\
+                        - `{trigger} disband` — Stop all team members and disband the team (team lead only)\n\
                         - `{trigger} stop --container` — Stop all sessions sharing this container and tear it down\n\
                         - `{trigger} interrupt` — Interrupt a running turn\n\
                         - `{trigger} compact` — Compact/summarize context\n\
@@ -1732,8 +1828,10 @@ async fn handle_messages(
                         - `{trigger} restart` — Restart Claude conversation\n\
                         - `{trigger} plan` — Toggle plan mode (read-only analysis)\n\
                         - `{trigger} thinking` — Toggle extended thinking (takes effect on restart)\n\
+                        - `{trigger} auto` — Toggle automation mode (team lead only, nudges when idle)\n\
                         - `{trigger} title [text]` — Set thread title (auto-generate if no text)\n\
-                        - `{trigger} status` — Show session status and context health",
+                        - `{trigger} status` — Show session status and context health\n\
+                        - `{trigger} /command` — Forward any Claude CLI slash command",
                         trigger = bot_trigger,
                     )).await;
                     continue;
@@ -2185,6 +2283,7 @@ async fn stream_output(
                     }
                     OutputEvent::TextLine(line) => {
                         state.liveness.update_activity(&session_id, "TextLine");
+                        tracing::debug!(session_id = %session_id, line_len = line.len(), "stream_output: TextLine received");
 
                         // --- Team marker interception (only for team sessions) ---
                         if let Some((tid, sender_role)) = &team_info {
@@ -2199,8 +2298,14 @@ async fn stream_output(
                                     // Clear pending task — member is responding
                                     let _ = state.db.clear_pending_task(&session_id).await;
                                     if target == "__broadcast__" {
+                                        let preview = truncate_preview(&message, 80);
+                                        card.append_text(&format!("> :loudspeaker: **Broadcast**: {}", preview));
+                                        card.dirty = true;
                                         broadcast_team_message(&state, &session_id, sender_role, &message, tid, &channel_id).await;
                                     } else {
+                                        let preview = truncate_preview(&message, 80);
+                                        card.append_text(&format!("> :speech_balloon: **To {}**: {}", target, preview));
+                                        card.dirty = true;
                                         route_team_message(&state, &session_id, sender_role, &target, &message, tid, &channel_id).await;
                                     }
                                 } else {
@@ -2214,6 +2319,9 @@ async fn stream_output(
                                 let role_name = caps[1].trim().to_string();
                                 let initial_task = caps[2].trim().to_string();
                                 drain_batch_to_card(&mut card, &state, &channel_id, &thread_id, &mut batch, &mut batch_bytes).await;
+                                let task_preview = if initial_task.is_empty() { String::new() } else { format!(": {}", truncate_preview(&initial_task, 80)) };
+                                card.append_text(&format!("> :rocket: **Spawning {}**{}", role_name, task_preview));
+                                card.dirty = true;
                                 let spawn_state = state.clone();
                                 let spawn_tid = tid.clone();
                                 let spawn_cid = channel_id.clone();
@@ -2242,11 +2350,14 @@ async fn stream_output(
                                 // Clear pending task — member is responding
                                 let _ = state.db.clear_pending_task(&session_id).await;
                                 if inline_msg.is_empty() {
-                                    // Multi-line mode
+                                    // Multi-line mode — summary added on [/MSG]
                                     team_msg_target = Some(target_role);
                                     team_msg_buffer.clear();
                                 } else {
-                                    // Single-line message
+                                    // Single-line message — add summary to card
+                                    let preview = truncate_preview(&inline_msg, 80);
+                                    card.append_text(&format!("> :speech_balloon: **To {}**: {}", target_role, preview));
+                                    card.dirty = true;
                                     route_team_message(&state, &session_id, sender_role, &target_role, &inline_msg, tid, &channel_id).await;
                                 }
                                 continue;
@@ -2258,9 +2369,13 @@ async fn stream_output(
                                 // Clear pending task — member is responding
                                 let _ = state.db.clear_pending_task(&session_id).await;
                                 if inline_msg.is_empty() {
+                                    // Multi-line mode — summary added on [/MSG]
                                     team_msg_target = Some("__broadcast__".to_string());
                                     team_msg_buffer.clear();
                                 } else {
+                                    let preview = truncate_preview(&inline_msg, 80);
+                                    card.append_text(&format!("> :loudspeaker: **Broadcast**: {}", preview));
+                                    card.dirty = true;
                                     broadcast_team_message(&state, &session_id, sender_role, &inline_msg, tid, &channel_id).await;
                                 }
                                 continue;
@@ -2319,6 +2434,27 @@ async fn stream_output(
                     }
                     OutputEvent::ResponseComplete { input_tokens, output_tokens, context_tokens } => {
                         state.liveness.update_activity(&session_id, "ResponseComplete");
+
+                        // Flush any pending multi-line team message (response ended without [/MSG])
+                        if let Some(target) = team_msg_target.take()
+                            && let Some((tid, sender_role)) = &team_info
+                        {
+                            let message = team_msg_buffer.join("\n");
+                            team_msg_buffer.clear();
+                            let _ = state.db.clear_pending_task(&session_id).await;
+                            if target == "__broadcast__" {
+                                let preview = truncate_preview(&message, 80);
+                                card.append_text(&format!("> :loudspeaker: **Broadcast**: {}", preview));
+                                card.dirty = true;
+                                broadcast_team_message(&state, &session_id, sender_role, &message, tid, &channel_id).await;
+                            } else {
+                                let preview = truncate_preview(&message, 80);
+                                card.append_text(&format!("> :speech_balloon: **To {}**: {}", target, preview));
+                                card.dirty = true;
+                                route_team_message(&state, &session_id, sender_role, &target, &message, tid, &channel_id).await;
+                            }
+                        }
+
                         // context_tokens = actual context window usage (last API call)
                         // input_tokens = cumulative across all API calls (for billing)
                         let ctx_display = context_tokens;
@@ -2537,7 +2673,7 @@ async fn setup_coordination_thread(state: &AppState, team_id: &str, project: &st
         project, team_id_prefix,
     );
 
-    match state.mm.post_in_thread(&coord_channel_id, &coord_channel_id, &root_msg).await {
+    match state.mm.post_root(&coord_channel_id, &root_msg).await {
         Ok(post_id) => {
             if let Err(e) = state.db.update_team_coordination_thread(team_id, &post_id).await {
                 tracing::warn!(error = %e, "Failed to store coordination thread ID");
@@ -2644,9 +2780,9 @@ Each message you receive will include a [TEAM: ...] header with the current rost
 ## Development Workflow (spec-flow)
 The team follows the spec-flow workflow. Coordinate members through these phases IN ORDER:
 
-1. **Specify** (Architect): Spawn Architect first to use `/specify` for spec issues, `/clarify` to resolve gaps
-2. **Plan** (You): Once specs are approved, use `/plan` to break specs into stories
-3. **Implement** (Developers): Only AFTER stories exist, spawn Developers who use `/implement` for each story
+1. **Specify** (Architect): Spawn Architect first to use the spec-flow `specify` tool for spec issues, `clarify` to resolve gaps
+2. **Plan** (You): Once specs are approved, use the spec-flow `plan` tool to break specs into stories
+3. **Implement** (Developers): Only AFTER stories exist, spawn Developers who use the spec-flow `implement` tool for each story
 4. **Review** (You): Review PRs using gh CLI, delegate fixes via [TO:Role], merge when CI passes
 
 IMPORTANT: Do NOT spawn Developers until stories have been planned from approved specs.
@@ -2658,7 +2794,7 @@ When team members create PRs:
 3. If changes needed, send SPECIFIC feedback via [TO:Role] with file paths and issues
 4. Wait for fixes before re-reviewing — do not merge until CI passes
 5. For architectural PRs, delegate review to Architect via [TO:Architect] — they verify alignment with specs
-6. After merging implementation PRs, ask Architect to run `/architecture` to update project docs
+6. After merging implementation PRs, ask Architect to run the spec-flow `architecture` tool to update project docs
 7. Merge with `gh pr merge <number> --squash` when approved"#,
     ))
 }
@@ -2684,13 +2820,66 @@ Each message you receive will include a [TEAM: ...] header with the current rost
 
 ## Workflow
 - Wait for task assignment from the Team Lead before starting work
+- ALWAYS report back to the Team Lead when your task is complete using [TO:Team Lead] with a summary of what you did
 - After creating a PR, notify Team Lead: [TO:Team Lead] PR #N ready for review
+- After completing any assigned work (reviews, architecture updates, analysis), notify Team Lead: [TO:Team Lead] with results
 - Address review feedback promptly when delegated by Team Lead
 - Do NOT start new work until your current PR is merged or you are reassigned
-- One task at a time — finish current work before accepting new assignments"#,
+- One task at a time — finish current work before accepting new assignments
+- IMPORTANT: Never finish a response without sending [TO:Team Lead] — the Team Lead cannot see your work unless you explicitly send it"#,
         display_name = role.display_name,
         responsibilities = role.responsibilities,
     )
+}
+
+/// Reconstruct the system prompt for a session based on its type and team role.
+/// Used on resume/reconnect to restore the session's identity and available commands.
+async fn rebuild_system_prompt(
+    db: &Database,
+    session_type: &str,
+    team_id: Option<&str>,
+    role: Option<&str>,
+) -> Option<String> {
+    match session_type {
+        "team_lead" => {
+            if let Some(tid) = team_id {
+                let dev_count = db.get_team(tid).await.ok().flatten()
+                    .map(|t| t.dev_count)
+                    .unwrap_or(1);
+                match build_team_lead_prompt(db, dev_count).await {
+                    Ok(prompt) => Some(prompt),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Failed to rebuild team lead prompt on resume");
+                        None
+                    }
+                }
+            } else {
+                None
+            }
+        }
+        "team_member" => {
+            if let Some(role_name) = role {
+                // Map display name back to role_name for DB lookup
+                let role_key = match role_name.split_whitespace().next().unwrap_or(role_name) {
+                    "Developer" => "developer",
+                    "Architect" | "PM/Architect" => "architect",
+                    "QA" => "qa_engineer",
+                    "DevOps" => "devops_engineer",
+                    _ => role_name,
+                };
+                match db.get_team_role(role_key).await {
+                    Ok(Some(role_def)) => Some(build_team_member_prompt(&role_def)),
+                    _ => {
+                        tracing::warn!(role = %role_name, "Failed to find role definition for resume");
+                        None
+                    }
+                }
+            } else {
+                None
+            }
+        }
+        _ => None, // Standard sessions don't have a system prompt
+    }
 }
 
 /// Truncate a string to at most `max_bytes` at a valid UTF-8 char boundary, appending "…" if truncated.
@@ -2771,6 +2960,11 @@ async fn route_team_message(
             delivered_roles.push(role.to_string());
             // Set pending task on the target
             let _ = state.db.set_pending_task(&target.session_id, sender_session_id, message).await;
+            // Post incoming message in receiver's Mattermost thread for visibility
+            let _ = state.mm.post_in_thread(
+                &target.channel_id, &target.thread_id,
+                &format!(":arrow_left: **From {}:**\n{}", sender_role, truncate_preview(message, 4000)),
+            ).await;
         }
     }
 
@@ -2830,6 +3024,11 @@ async fn broadcast_team_message(
         let formatted = format!("{}\n**From {} (broadcast)**: {}", header, sender_role, message);
         if state.containers.send(&member.session_id, &formatted).await.is_ok() {
             sent_count += 1;
+            // Post incoming broadcast in receiver's Mattermost thread for visibility
+            let _ = state.mm.post_in_thread(
+                &member.channel_id, &member.thread_id,
+                &format!(":arrow_left: **From {} (broadcast):**\n{}", sender_role, truncate_preview(message, 4000)),
+            ).await;
         }
     }
 
@@ -3075,12 +3274,25 @@ async fn handle_team_status(state: &AppState, session_id: &str, team_id: &str) {
 
     let ctx_max = config::settings().context_window_max;
     let ctx_max_k = ctx_max / 1000;
-    let mut table = "**Team Status:**\n| Role | Status | Context | Current Task | Last Active |\n|------|--------|---------|--------------|-------------|\n".to_string();
+    let stuck_timeout = config::settings().session_stuck_timeout_secs;
+    let mut table = "**Team Status:**\n| Role | Status | Context | Activity | Current Task | Last Active |\n|------|--------|---------|----------|--------------|-------------|\n".to_string();
     for member in &members {
         let role = member.role.as_deref().unwrap_or("Unknown");
         let liveness = state.liveness.get_info(&member.session_id);
         let last_active = match &liveness {
             Some(li) => format!("{} ago", format_duration_short(li.idle_duration)),
+            None => "unknown".to_string(),
+        };
+
+        // Activity column: show last event type + stuck warning
+        let activity_str = match &liveness {
+            Some(li) => {
+                if stuck_timeout > 0 && li.idle_duration.as_secs() > stuck_timeout {
+                    format!(":warning: idle {}", format_duration_short(li.idle_duration))
+                } else {
+                    li.last_event_type.clone()
+                }
+            }
             None => "unknown".to_string(),
         };
 
@@ -3103,8 +3315,8 @@ async fn handle_team_status(state: &AppState, session_id: &str, team_id: &str) {
         };
 
         table.push_str(&format!(
-            "| {} | {} | {} | {} | {} |\n",
-            role, member.status, ctx_str, task_str, last_active,
+            "| {} | {} | {} | {} | {} | {} |\n",
+            role, member.status, ctx_str, activity_str, task_str, last_active,
         ));
     }
 
@@ -3178,6 +3390,99 @@ async fn stop_session_by_ref(state: &AppState, session: &database::StoredSession
 async fn notify_team_member_left(state: &AppState, team_id: &str, role_name: &str, session_id: &str) {
     let msg = format!("**Team Roster Update**: {} has left the team.", role_name);
     broadcast_team_notification(state, team_id, &msg, session_id).await;
+}
+
+/// Session watchdog: periodically checks for stuck sessions and nudges idle
+/// team leads when automation mode is enabled.
+async fn session_watchdog(state: Arc<AppState>) {
+    // Rate-limit tracker for automation nudges
+    let nudge_tracker: DashMap<String, std::time::Instant> = DashMap::new();
+    let mut tick = tokio::time::interval(Duration::from_secs(60));
+
+    loop {
+        tick.tick().await;
+
+        let timeout = config::settings().session_stuck_timeout_secs;
+        if timeout == 0 {
+            continue;
+        }
+
+        // --- Stuck session detection ---
+        for (session_id, info) in state.liveness.all_sessions() {
+            // Look up session in DB
+            let session = match state.db.get_session_by_id_prefix(&session_id).await {
+                Ok(Some(s)) => s,
+                _ => continue,
+            };
+
+            if session.status != "active" && session.status != "stuck" {
+                continue;
+            }
+
+            if info.idle_duration.as_secs() > timeout && session.status == "active" {
+                // Mark as stuck in DB (no Mattermost spam)
+                let _ = state.db.update_session_status(&session_id, "stuck").await;
+                tracing::info!(
+                    session_id = %session_id,
+                    idle_secs = info.idle_duration.as_secs(),
+                    last_event = %info.last_event_type,
+                    role = session.role.as_deref().unwrap_or("solo"),
+                    "Session marked as stuck"
+                );
+            } else if info.idle_duration.as_secs() <= timeout && session.status == "stuck" {
+                // Session recovered — mark active again
+                let _ = state.db.update_session_status(&session_id, "active").await;
+                tracing::info!(
+                    session_id = %session_id,
+                    "Session recovered from stuck state"
+                );
+            }
+        }
+
+        // --- Automation nudging ---
+        let teams = state.db.get_active_teams().await.unwrap_or_default();
+        for team in teams {
+            if !team.automation {
+                continue;
+            }
+
+            let Some(info) = state.liveness.get_info(&team.lead_session_id) else {
+                continue;
+            };
+
+            if info.idle_duration.as_secs() <= timeout {
+                continue;
+            }
+
+            // Rate-limit: only nudge once per timeout interval
+            let should_nudge = match nudge_tracker.get(&team.team_id) {
+                Some(last) => last.elapsed().as_secs() > timeout,
+                None => true,
+            };
+
+            if !should_nudge {
+                continue;
+            }
+
+            tracing::info!(
+                team_id = %team.team_id,
+                lead_session = %team.lead_session_id,
+                idle_secs = info.idle_duration.as_secs(),
+                "Nudging idle team lead (automation mode)"
+            );
+
+            let _ = state
+                .containers
+                .send(
+                    &team.lead_session_id,
+                    "Check for any approved specs that need implementation. \
+                     Use [TEAM_STATUS] to review member availability, then assign work.",
+                )
+                .await;
+
+            nudge_tracker.insert(team.team_id.clone(), std::time::Instant::now());
+        }
+    }
 }
 
 async fn handle_network_request(

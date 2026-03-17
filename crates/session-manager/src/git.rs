@@ -280,9 +280,61 @@ impl GitManager {
                 )
             };
 
-            self.ssh_command(&worktree_cmd).await.map_err(|e| {
-                anyhow!("Failed to create worktree: {}", e)
-            })?;
+            if let Err(e) = self.ssh_command(&worktree_cmd).await {
+                // Branch may be locked by a stale worktree (e.g. after role rename).
+                // List worktrees to find the conflicting one, remove it, prune, and retry.
+                tracing::warn!(error = %e, "Worktree add failed, attempting to remove conflicting worktree");
+
+                let list_cmd = format!(
+                    "git -C {} worktree list --porcelain",
+                    shell_escape(&repo_path_str)
+                );
+                if let Ok(list_output) = self.ssh_command(&list_cmd).await {
+                    // Parse porcelain output: blocks separated by blank lines
+                    // Each block has "worktree <path>" and "branch refs/heads/<name>"
+                    let target_branch = repo_ref.branch.as_deref().unwrap_or(&worktree_name);
+                    let branch_needle = format!("refs/heads/{}", target_branch);
+                    let mut conflicting_path: Option<String> = None;
+                    let mut current_path: Option<String> = None;
+
+                    for line in list_output.lines() {
+                        if let Some(path) = line.strip_prefix("worktree ") {
+                            current_path = Some(path.to_string());
+                        } else if line.starts_with("branch ") && line.contains(&branch_needle) {
+                            conflicting_path = current_path.take();
+                        } else if line.is_empty() {
+                            current_path = None;
+                        }
+                    }
+
+                    if let Some(stale_path) = conflicting_path {
+                        tracing::info!(
+                            stale_worktree = %stale_path,
+                            "Removing conflicting worktree"
+                        );
+                        let remove_cmd = format!(
+                            "git -C {} worktree remove --force {}",
+                            shell_escape(&repo_path_str),
+                            shell_escape(&stale_path)
+                        );
+                        let _ = self.ssh_command(&remove_cmd).await;
+                        let prune_cmd = format!(
+                            "git -C {} worktree prune",
+                            shell_escape(&repo_path_str)
+                        );
+                        let _ = self.ssh_command(&prune_cmd).await;
+
+                        // Retry
+                        self.ssh_command(&worktree_cmd).await.map_err(|e2| {
+                            anyhow!("Failed to create worktree after removing conflict: {}", e2)
+                        })?;
+                    } else {
+                        return Err(anyhow!("Failed to create worktree: {}", e));
+                    }
+                } else {
+                    return Err(anyhow!("Failed to create worktree: {}", e));
+                }
+            }
         }
 
         Ok(worktree_path)

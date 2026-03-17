@@ -413,10 +413,11 @@ impl ContainerManager {
         session_type: &str,
         output_tx: mpsc::Sender<OutputEvent>,
         grpc_port: u16,
+        system_prompt_append: Option<&str>,
     ) -> Result<()> {
         self.create_session_internal(
             session_id, container_name, project_path, repo, branch,
-            output_tx, false, false, session_type, grpc_port, None,
+            output_tx, false, false, session_type, grpc_port, system_prompt_append,
         ).await?;
 
         tracing::info!(
@@ -861,6 +862,15 @@ async fn message_processor(
                             let _ = output_tx
                                 .send(OutputEvent::ProcessingStarted { input_tokens: 0 })
                                 .await;
+                        }
+
+                        if let agent_event::Event::Text(ref t) = event_variant {
+                            tracing::debug!(
+                                event_count,
+                                is_partial = t.is_partial,
+                                text_len = t.text.len(),
+                                "gRPC: Text event received"
+                            );
                         }
 
                         match event_variant {

@@ -46,6 +46,7 @@ pub struct StoredTeam {
     pub status: String,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub coordination_thread_id: Option<String>,
+    pub automation: bool,
 }
 
 #[derive(Debug, Clone, FromRow)]
@@ -376,6 +377,14 @@ pub async fn create_schema(pool: &PgPool, schema: &str) -> Result<()> {
     .execute(pool)
     .await?;
 
+    // Migration: add automation column to teams table
+    sqlx::query(&format!(
+        "ALTER TABLE {}.teams ADD COLUMN IF NOT EXISTS automation BOOLEAN NOT NULL DEFAULT FALSE",
+        schema
+    ))
+    .execute(pool)
+    .await?;
+
     // Team roles table (reference data)
     sqlx::query(&format!(
         r#"
@@ -394,6 +403,18 @@ pub async fn create_schema(pool: &PgPool, schema: &str) -> Result<()> {
     .execute(pool)
     .await?;
 
+    // Migrate pm_architect → architect
+    sqlx::query(&format!(
+        "UPDATE {schema}.sessions SET role = 'Architect' WHERE role = 'PM/Architect'"
+    ))
+    .execute(pool)
+    .await?;
+    sqlx::query(&format!(
+        "DELETE FROM {schema}.team_roles WHERE role_name = 'pm_architect'"
+    ))
+    .execute(pool)
+    .await?;
+
     // Seed team_roles with default data
     sqlx::query(&format!(
         r#"
@@ -402,8 +423,8 @@ pub async fn create_schema(pool: &PgPool, schema: &str) -> Result<()> {
             ('team_lead', 'Team Lead', 'Coordinates the team, reviews PRs, and synthesizes results',
              '- Interpret user requests and determine the right course of action — spawn an Architect for spec work, Developers for implementation, or both
 - Decide which roles to spawn based on the task''s requirements; prefer fewer roles when the task is simple
-- Use `/plan` to generate implementation stories from approved specs and delegate stories to Developers
-- Use `/analyze` to verify consistency and quality across specs and stories — run after planning to ensure stories align with the spec, and re-run after changes
+- Use the spec-flow `plan` tool to generate implementation stories from approved specs and delegate stories to Developers
+- Use the spec-flow `analyze` tool to verify consistency and quality across specs and stories — run after planning to ensure stories align with the spec, and re-run after changes
 - After assigning a task via [TO:Role] or [SPAWN:Role], WAIT for that member to respond before sending another task
 - The system enforces this — sending to a member with a pending task will be rejected
 - Use [TEAM_STATUS] to check member status and current task assignments before sending follow-up tasks
@@ -417,20 +438,20 @@ pub async fn create_schema(pool: &PgPool, schema: &str) -> Result<()> {
 - Synthesize the team''s work into a final summary for the user when the task is complete
 - Wind down the team when all work is done — don''t leave idle members running',
              false, false, 0),
-            ('pm_architect', 'Architect', 'Designs architecture and manages requirements',
-             '- Use `/blueprint` to define project architecture, roadmap, and milestones
-- Use `/architecture` to maintain the project''s architecture documentation
-- Use `/specify` to create spec issues from requirements — iterate with `/clarify` to resolve ambiguities before approving
+            ('architect', 'Architect', 'Designs architecture and manages requirements',
+             '- Use the spec-flow `blueprint` tool to define project architecture, roadmap, and milestones
+- Use the spec-flow `architecture` tool to maintain the project''s architecture documentation
+- Use the spec-flow `specify` tool to create spec issues from requirements — iterate with the `clarify` tool to resolve ambiguities before approving
 - Identify technical risks (performance bottlenecks, security concerns, compatibility issues) and propose mitigations
 - Define coding conventions, patterns, and directory structure for the team to follow
-- Use `/decision` to record important Architecture Decision Records (ADRs) with justification
+- Use the spec-flow `decision` tool to record important Architecture Decision Records (ADRs) with justification
 - Review Developer PRs for architectural consistency when delegated by Team Lead — flag deviations from the agreed design
-- Run `/architecture` to update project docs after implementation PRs are merged
+- Run the spec-flow `architecture` tool to update project docs after implementation PRs are merged
 - Verify implementations match the spec before approving PRs',
              true, false, 1),
             ('developer', 'Developer', 'Implements features end-to-end',
              '- Wait for task assignment from the Team Lead before starting work
-- Use `/implement` to pull assigned Stories from GitHub, create a worktree, implement the tasks, and create a PR when complete
+- Use the spec-flow `implement` tool to pull assigned Stories from GitHub, create a worktree, implement the tasks, and create a PR when complete
 - Write clean, idiomatic code that follows the project''s existing conventions and patterns
 - Write unit tests for all new code; aim for meaningful coverage of edge cases, not just happy paths
 - Fix bugs by first reproducing the issue, identifying the root cause, then implementing and testing the fix
@@ -441,8 +462,8 @@ pub async fn create_schema(pool: &PgPool, schema: &str) -> Result<()> {
 - One task at a time — finish current work before accepting new assignments',
              true, true, 2),
             ('qa_engineer', 'QA Engineer', 'Tests and validates quality',
-             '- Use `/checklist` to generate and validate requirements quality checklists against spec issues
-- Use `/bug` to file defects as GitHub Bug issues with clear reproduction steps, expected vs actual behavior, and severity
+             '- Use the spec-flow `checklist` tool to generate and validate requirements quality checklists against spec issues
+- Use the spec-flow `bug` tool to file defects as GitHub Bug issues with clear reproduction steps, expected vs actual behavior, and severity
 - Write integration and end-to-end tests that validate the feature works as specified
 - Review Developer and Architect PRs for bugs, edge cases, error handling gaps, and security vulnerabilities
 - Validate that implementations match the original requirements — flag any deviations
@@ -533,7 +554,7 @@ impl Database {
     ) -> Result<Option<StoredSession>> {
         let session = sqlx::query_as::<_, StoredSession>(&format!(
             "SELECT session_id, channel_id, thread_id, project, project_path, container_name, container_id, session_type, parent_session_id, user_id, created_at, last_activity_at, message_count, compaction_count, claude_session_id, status, team_id, role, context_tokens, pending_task_from, current_task \
-             FROM {}.sessions WHERE channel_id = $1 AND thread_id = $2 AND status IN ('active', 'disconnected')",
+             FROM {}.sessions WHERE channel_id = $1 AND thread_id = $2 AND status IN ('active', 'disconnected', 'stuck')",
             SCHEMA
         ))
         .bind(channel_id)
@@ -1000,7 +1021,7 @@ impl Database {
     /// Get a team by ID.
     pub async fn get_team(&self, team_id: &str) -> Result<Option<StoredTeam>> {
         let team = sqlx::query_as::<_, StoredTeam>(&format!(
-            "SELECT team_id, channel_id, project, project_path, lead_session_id, dev_count, status, created_at, coordination_thread_id \
+            "SELECT team_id, channel_id, project, project_path, lead_session_id, dev_count, status, created_at, coordination_thread_id, automation \
              FROM {}.teams WHERE team_id = $1",
             SCHEMA
         ))
@@ -1014,7 +1035,7 @@ impl Database {
     pub async fn get_team_members(&self, team_id: &str) -> Result<Vec<StoredSession>> {
         let sessions = sqlx::query_as::<_, StoredSession>(&format!(
             "SELECT session_id, channel_id, thread_id, project, project_path, container_name, container_id, session_type, parent_session_id, user_id, created_at, last_activity_at, message_count, compaction_count, claude_session_id, status, team_id, role, context_tokens, pending_task_from, current_task \
-             FROM {}.sessions WHERE team_id = $1 AND status IN ('active', 'disconnected')",
+             FROM {}.sessions WHERE team_id = $1 AND status IN ('active', 'disconnected', 'stuck')",
             SCHEMA
         ))
         .bind(team_id)
@@ -1064,7 +1085,7 @@ impl Database {
     ) -> Result<Vec<StoredSession>> {
         let sessions = sqlx::query_as::<_, StoredSession>(&format!(
             "SELECT session_id, channel_id, thread_id, project, project_path, container_name, container_id, session_type, parent_session_id, user_id, created_at, last_activity_at, message_count, compaction_count, claude_session_id, status, team_id, role, context_tokens, pending_task_from, current_task \
-             FROM {}.sessions WHERE team_id = $1 AND (role = $2 OR role LIKE $3) AND status IN ('active', 'disconnected')",
+             FROM {}.sessions WHERE team_id = $1 AND (role = $2 OR role LIKE $3) AND status IN ('active', 'disconnected', 'stuck')",
             SCHEMA
         ))
         .bind(team_id)
@@ -1155,7 +1176,7 @@ impl Database {
     /// Get all active teams.
     pub async fn get_active_teams(&self) -> Result<Vec<StoredTeam>> {
         let teams = sqlx::query_as::<_, StoredTeam>(&format!(
-            "SELECT team_id, channel_id, project, project_path, lead_session_id, dev_count, status, created_at, coordination_thread_id \
+            "SELECT team_id, channel_id, project, project_path, lead_session_id, dev_count, status, created_at, coordination_thread_id, automation \
              FROM {}.teams WHERE status = 'active'",
             SCHEMA
         ))
@@ -1176,6 +1197,40 @@ impl Database {
         .fetch_all(&self.pool)
         .await?;
         Ok(roles)
+    }
+
+    /// Update the team lead session ID (used when team lead resumes with a new session ID).
+    pub async fn update_team_lead_session(
+        &self,
+        team_id: &str,
+        new_lead_session_id: &str,
+    ) -> Result<()> {
+        sqlx::query(&format!(
+            "UPDATE {}.teams SET lead_session_id = $1 WHERE team_id = $2",
+            SCHEMA
+        ))
+        .bind(new_lead_session_id)
+        .bind(team_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Set automation mode for a team.
+    pub async fn set_team_automation(
+        &self,
+        team_id: &str,
+        enabled: bool,
+    ) -> Result<()> {
+        sqlx::query(&format!(
+            "UPDATE {}.teams SET automation = $1 WHERE team_id = $2",
+            SCHEMA
+        ))
+        .bind(enabled)
+        .bind(team_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     /// Get a specific team role by name.
