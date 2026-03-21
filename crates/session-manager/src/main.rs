@@ -2349,16 +2349,14 @@ async fn stream_output(
                                 let inline_msg = caps[2].trim().to_string();
                                 // Clear pending task — member is responding
                                 let _ = state.db.clear_pending_task(&session_id).await;
-                                if inline_msg.is_empty() {
-                                    // Multi-line mode — summary added on [/MSG]
-                                    team_msg_target = Some(target_role);
-                                    team_msg_buffer.clear();
-                                } else {
-                                    // Single-line message — add summary to card
-                                    let preview = truncate_preview(&inline_msg, 80);
-                                    card.append_text(&format!("> :speech_balloon: **To {}**: {}", target_role, preview));
-                                    card.dirty = true;
-                                    route_team_message(&state, &session_id, sender_role, &target_role, &inline_msg, tid, &channel_id).await;
+                                // Always enter multi-line accumulation mode. If there's
+                                // inline content on the [TO:] line, seed the buffer with it
+                                // so that continuation lines (e.g., a numbered task list)
+                                // are captured rather than lost to the lead's output card.
+                                team_msg_target = Some(target_role);
+                                team_msg_buffer.clear();
+                                if !inline_msg.is_empty() {
+                                    team_msg_buffer.push(inline_msg);
                                 }
                                 continue;
                             }
@@ -2368,15 +2366,11 @@ async fn stream_output(
                                 let inline_msg = caps[1].trim().to_string();
                                 // Clear pending task — member is responding
                                 let _ = state.db.clear_pending_task(&session_id).await;
-                                if inline_msg.is_empty() {
-                                    // Multi-line mode — summary added on [/MSG]
-                                    team_msg_target = Some("__broadcast__".to_string());
-                                    team_msg_buffer.clear();
-                                } else {
-                                    let preview = truncate_preview(&inline_msg, 80);
-                                    card.append_text(&format!("> :loudspeaker: **Broadcast**: {}", preview));
-                                    card.dirty = true;
-                                    broadcast_team_message(&state, &session_id, sender_role, &inline_msg, tid, &channel_id).await;
+                                // Always enter multi-line accumulation mode (same as [TO:])
+                                team_msg_target = Some("__broadcast__".to_string());
+                                team_msg_buffer.clear();
+                                if !inline_msg.is_empty() {
+                                    team_msg_buffer.push(inline_msg);
                                 }
                                 continue;
                             }
@@ -2954,17 +2948,17 @@ async fn route_team_message(
 
         let header = format_team_context_header(&members, role);
         let formatted = format!("{}\n**From {}**: {}", header, sender_role, message);
+        // Set pending task and post Mattermost visibility BEFORE queueing the message,
+        // so the message appears in chat before the target starts processing.
+        let _ = state.db.set_pending_task(&target.session_id, sender_session_id, message).await;
+        let _ = state.mm.post_in_thread(
+            &target.channel_id, &target.thread_id,
+            &format!(":arrow_left: **From {}:**\n{}", sender_role, truncate_preview(message, 4000)),
+        ).await;
         if let Err(e) = state.containers.send(&target.session_id, &formatted).await {
             tracing::warn!(error = %e, role, "Failed to deliver team message");
         } else {
             delivered_roles.push(role.to_string());
-            // Set pending task on the target
-            let _ = state.db.set_pending_task(&target.session_id, sender_session_id, message).await;
-            // Post incoming message in receiver's Mattermost thread for visibility
-            let _ = state.mm.post_in_thread(
-                &target.channel_id, &target.thread_id,
-                &format!(":arrow_left: **From {}:**\n{}", sender_role, truncate_preview(message, 4000)),
-            ).await;
         }
     }
 
@@ -3188,7 +3182,7 @@ fn handle_team_spawn(
                 let _ = state.db.set_pending_task(&member_session_id, lead_session_id, initial_task).await;
             }
 
-            // Notify Lead about successful spawn (both Mattermost and session input)
+            // Notify Lead about successful spawn (both Mattermost and session context)
             if let Ok(Some(lead)) = state.db.get_session_by_id_prefix(&lead_session_id[..8.min(lead_session_id.len())]).await {
                 // Show spawn confirmation with initial task for full visibility
                 let spawn_msg = if initial_task.is_empty() {
