@@ -181,7 +181,7 @@ fn default_worktrees_path() -> String {
     "/home/claude/worktrees".into()
 }
 fn default_container_max_sessions() -> i32 {
-    5
+    20
 }
 fn default_container_idle_timeout_secs() -> u64 {
     1800

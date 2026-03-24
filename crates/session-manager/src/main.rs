@@ -45,26 +45,31 @@ fn network_request_regex() -> &'static Regex {
 }
 
 fn team_spawn_regex() -> &'static Regex {
+    // Anchored to start-of-line: markers must be the first thing on the line
+    // (with optional leading whitespace). Mid-line markers are ignored so they
+    // don't swallow surrounding text or enter accumulation mode unexpectedly.
     TEAM_SPAWN_RE.get_or_init(|| {
-        Regex::new(r"\[SPAWN:([^\]]+?)(?:\s+--worktree)?\]\s*(.*)").expect("Invalid regex")
+        Regex::new(r"^\s*\[SPAWN:([^\]]+?)(?:\s+--worktree)?\]\s*(.*)").expect("Invalid regex")
     })
 }
 
 fn team_msg_regex() -> &'static Regex {
     TEAM_MSG_RE.get_or_init(|| {
-        Regex::new(r"\[TO:([^\]]+)\]\s*(.*)").expect("Invalid regex")
+        Regex::new(r"^\s*\[TO:([^\]]+)\]\s*(.*)").expect("Invalid regex")
     })
 }
 
 fn team_broadcast_regex() -> &'static Regex {
     TEAM_BROADCAST_RE.get_or_init(|| {
-        Regex::new(r"\[BROADCAST\]\s*(.*)").expect("Invalid regex")
+        Regex::new(r"^\s*\[BROADCAST\]\s*(.*)").expect("Invalid regex")
     })
 }
 
 fn team_msg_end_regex() -> &'static Regex {
+    // [/MSG] is also anchored — must be on its own line (with optional whitespace).
+    // This prevents false matches when [/MSG] appears inside quoted text or code blocks.
     TEAM_MSG_END_RE.get_or_init(|| {
-        Regex::new(r"\[/MSG\]").expect("Invalid regex")
+        Regex::new(r"^\s*\[/MSG\]\s*$").expect("Invalid regex")
     })
 }
 
@@ -155,6 +160,39 @@ async fn main() -> Result<()> {
         tracing::warn!(error = %e, "Failed to sync container registry from database");
     }
 
+    // After VM reboot, containers may exist but be stopped at the podman level.
+    // Probe each "running" container and restart it if needed, or evict from registry if gone.
+    {
+        let containers = state.containers.registry.list_all().await;
+        for ((repo, branch), entry) in &containers {
+            match session_manager::container::ensure_container_started(&entry.container_name).await {
+                Ok(restarted) => {
+                    if restarted {
+                        tracing::info!(
+                            repo = %repo, branch = %branch,
+                            container = %entry.container_name,
+                            "Restarted stopped container on startup (VM reboot recovery)"
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        repo = %repo, branch = %branch,
+                        container = %entry.container_name,
+                        error = %e,
+                        "Container no longer exists, removing from registry"
+                    );
+                    state.containers.registry.remove_container(&state.db, repo, branch).await.ok();
+                }
+            }
+        }
+    }
+
+    // Resync session counts — correct any drift between registry counts and actual active sessions
+    if let Err(e) = state.containers.registry.resync_session_counts(&state.db).await {
+        tracing::warn!(error = %e, "Failed to resync session counts on startup");
+    }
+
     // Reconnect any sessions that survived a restart
     match state.db.get_all_sessions().await {
         Ok(sessions) if !sessions.is_empty() => {
@@ -206,6 +244,7 @@ async fn main() -> Result<()> {
                         &reconnect_repo,
                         &reconnect_branch,
                         &session.session_type,
+                        &state.db,
                         output_tx,
                         reconnect_grpc_port,
                         reconnect_prompt.as_deref(),
@@ -1364,6 +1403,7 @@ async fn handle_messages(
                                 &repo,
                                 &branch,
                                 &stopped.session_type,
+                                &state.db,
                                 output_tx,
                                 grpc_port,
                                 system_prompt.as_deref(),
@@ -2217,6 +2257,44 @@ fn format_ctx_suffix(input_tokens: u64) -> String {
     format!("{}/{}k ctx", format_token_count(input_tokens), ctx_max_k)
 }
 
+/// Fire a team spawn asynchronously (acquires spawn lock, calls handle_team_spawn).
+/// Always injects a team status update into the lead's session before spawning
+/// so the lead has current roster visibility.
+#[allow(clippy::too_many_arguments)]
+fn fire_team_spawn(
+    state: &Arc<AppState>,
+    team_id: &str,
+    channel_id: &str,
+    session_id: &str,
+    sender_role: &str,
+    role_name: &str,
+    initial_task: &str,
+    project: &str,
+) {
+    let spawn_state = state.clone();
+    let spawn_tid = team_id.to_string();
+    let spawn_cid = channel_id.to_string();
+    let spawn_sid = session_id.to_string();
+    let spawn_role = sender_role.to_string();
+    let role_name = role_name.to_string();
+    let initial_task = initial_task.to_string();
+    let spawn_project = project.to_string();
+    let lock = spawn_state.spawn_locks
+        .entry(spawn_tid.clone())
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone();
+    tokio::spawn(async move {
+        let _guard = lock.lock().await;
+        // Inject team status into the lead's session before spawning so it sees
+        // the current roster (avoids duplicate spawns and stale assumptions).
+        handle_team_status(&spawn_state, &spawn_sid, &spawn_tid).await;
+        handle_team_spawn(
+            spawn_state, &spawn_tid, &spawn_cid, &spawn_sid, &spawn_role,
+            &role_name, &initial_task, &spawn_project,
+        ).await;
+    });
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn stream_output(
     state: Arc<AppState>,
@@ -2259,6 +2337,9 @@ async fn stream_output(
     // Team messaging state machine
     let mut team_msg_target: Option<String> = None; // "Role Name" or "__broadcast__"
     let mut team_msg_buffer: Vec<String> = Vec::new();
+    // Pending spawn: accumulates multi-line task until [/MSG] or next marker, then fires spawn.
+    // (role_name, use_worktree)
+    let mut pending_spawn: Option<String> = None;
 
     tracing::info!(session_id = %session_id, "stream_output: started");
 
@@ -2288,9 +2369,50 @@ async fn stream_output(
                         // --- Team marker interception (only for team sessions) ---
                         if let Some((tid, sender_role)) = &team_info {
 
+                            // Multi-line SPAWN accumulation mode
+                            if let Some(ref spawn_role) = pending_spawn {
+                                let has_end_marker = msg_end_re.is_match(&line);
+                                let end_in_line = !has_end_marker && line.contains("[/MSG]");
+
+                                if has_end_marker || end_in_line {
+                                    if end_in_line
+                                        && let Some(pos) = line.find("[/MSG]")
+                                    {
+                                        let before = line[..pos].trim();
+                                        if !before.is_empty() {
+                                            team_msg_buffer.push(before.to_string());
+                                        }
+                                    }
+                                    let task = team_msg_buffer.join("\n");
+                                    team_msg_buffer.clear();
+                                    let spawn_role = spawn_role.clone();
+                                    pending_spawn = None;
+                                    fire_team_spawn(
+                                        &state, tid, &channel_id, &session_id, sender_role,
+                                        &spawn_role, &task, &project,
+                                    );
+                                } else {
+                                    team_msg_buffer.push(line);
+                                }
+                                continue;
+                            }
+
                             // Multi-line message accumulation mode
                             if team_msg_target.is_some() {
-                                if msg_end_re.is_match(&line) {
+                                // Check for [/MSG] — either standalone or at end of line
+                                let has_end_marker = msg_end_re.is_match(&line);
+                                let end_in_line = !has_end_marker && line.contains("[/MSG]");
+
+                                if has_end_marker || end_in_line {
+                                    // If [/MSG] is embedded in the line, capture text before it
+                                    if end_in_line
+                                        && let Some(pos) = line.find("[/MSG]")
+                                    {
+                                        let before = line[..pos].trim();
+                                        if !before.is_empty() {
+                                            team_msg_buffer.push(before.to_string());
+                                        }
+                                    }
                                     // Flush accumulated message
                                     let message = team_msg_buffer.join("\n");
                                     team_msg_buffer.clear();
@@ -2317,29 +2439,30 @@ async fn stream_output(
                             // Check for [SPAWN:Role] marker
                             if let Some(caps) = spawn_re.captures(&line) {
                                 let role_name = caps[1].trim().to_string();
-                                let initial_task = caps[2].trim().to_string();
+                                let inline_task = caps[2].trim().to_string();
                                 drain_batch_to_card(&mut card, &state, &channel_id, &thread_id, &mut batch, &mut batch_bytes).await;
-                                let task_preview = if initial_task.is_empty() { String::new() } else { format!(": {}", truncate_preview(&initial_task, 80)) };
-                                card.append_text(&format!("> :rocket: **Spawning {}**{}", role_name, task_preview));
+                                card.append_text(&format!("> :rocket: **Spawning {}**...", role_name));
                                 card.dirty = true;
-                                let spawn_state = state.clone();
-                                let spawn_tid = tid.clone();
-                                let spawn_cid = channel_id.clone();
-                                let spawn_sid = session_id.clone();
-                                let spawn_role = sender_role.clone();
-                                let spawn_project = project.clone();
-                                // Acquire per-team spawn lock to serialize spawns and prevent race conditions
-                                let lock = spawn_state.spawn_locks
-                                    .entry(spawn_tid.clone())
-                                    .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-                                    .clone();
-                                tokio::spawn(async move {
-                                    let _guard = lock.lock().await;
-                                    handle_team_spawn(
-                                        spawn_state, &spawn_tid, &spawn_cid, &spawn_sid, &spawn_role,
-                                        &role_name, &initial_task, &spawn_project,
-                                    ).await;
-                                });
+
+                                // Check for single-line spawn: [SPAWN:Role] task [/MSG]
+                                if let Some(end_pos) = inline_task.find("[/MSG]") {
+                                    let task = inline_task[..end_pos].trim().to_string();
+                                    fire_team_spawn(
+                                        &state, tid, &channel_id, &session_id, sender_role,
+                                        &role_name, &task, &project,
+                                    );
+                                } else if inline_task.is_empty() {
+                                    // No inline text and no [/MSG] — enter multi-line mode
+                                    // to accumulate the task description
+                                    pending_spawn = Some(role_name);
+                                    team_msg_buffer.clear();
+                                } else {
+                                    // Has inline text but no [/MSG] — enter multi-line mode
+                                    // to accumulate continuation lines
+                                    pending_spawn = Some(role_name);
+                                    team_msg_buffer.clear();
+                                    team_msg_buffer.push(inline_task);
+                                }
                                 continue;
                             }
 
@@ -2349,14 +2472,25 @@ async fn stream_output(
                                 let inline_msg = caps[2].trim().to_string();
                                 // Clear pending task — member is responding
                                 let _ = state.db.clear_pending_task(&session_id).await;
-                                // Always enter multi-line accumulation mode. If there's
-                                // inline content on the [TO:] line, seed the buffer with it
-                                // so that continuation lines (e.g., a numbered task list)
-                                // are captured rather than lost to the lead's output card.
-                                team_msg_target = Some(target_role);
-                                team_msg_buffer.clear();
-                                if !inline_msg.is_empty() {
-                                    team_msg_buffer.push(inline_msg);
+
+                                // Check if [/MSG] is already in the inline text (single-line message).
+                                // Without this, [TO:Role] message [/MSG] on one line would get stuck
+                                // because [/MSG] detection only runs on subsequent TextLines.
+                                if let Some(end_pos) = inline_msg.find("[/MSG]") {
+                                    let message = inline_msg[..end_pos].trim().to_string();
+                                    if !message.is_empty() {
+                                        let preview = truncate_preview(&message, 80);
+                                        card.append_text(&format!("> :speech_balloon: **To {}**: {}", target_role, preview));
+                                        card.dirty = true;
+                                        route_team_message(&state, &session_id, sender_role, &target_role, &message, tid, &channel_id).await;
+                                    }
+                                } else {
+                                    // Enter multi-line accumulation mode
+                                    team_msg_target = Some(target_role);
+                                    team_msg_buffer.clear();
+                                    if !inline_msg.is_empty() {
+                                        team_msg_buffer.push(inline_msg);
+                                    }
                                 }
                                 continue;
                             }
@@ -2366,11 +2500,23 @@ async fn stream_output(
                                 let inline_msg = caps[1].trim().to_string();
                                 // Clear pending task — member is responding
                                 let _ = state.db.clear_pending_task(&session_id).await;
-                                // Always enter multi-line accumulation mode (same as [TO:])
-                                team_msg_target = Some("__broadcast__".to_string());
-                                team_msg_buffer.clear();
-                                if !inline_msg.is_empty() {
-                                    team_msg_buffer.push(inline_msg);
+
+                                // Check if [/MSG] is already in the inline text (single-line message)
+                                if let Some(end_pos) = inline_msg.find("[/MSG]") {
+                                    let message = inline_msg[..end_pos].trim().to_string();
+                                    if !message.is_empty() {
+                                        let preview = truncate_preview(&message, 80);
+                                        card.append_text(&format!("> :loudspeaker: **Broadcast**: {}", preview));
+                                        card.dirty = true;
+                                        broadcast_team_message(&state, &session_id, sender_role, &message, tid, &channel_id).await;
+                                    }
+                                } else {
+                                    // Enter multi-line accumulation mode
+                                    team_msg_target = Some("__broadcast__".to_string());
+                                    team_msg_buffer.clear();
+                                    if !inline_msg.is_empty() {
+                                        team_msg_buffer.push(inline_msg);
+                                    }
                                 }
                                 continue;
                             }
@@ -2428,6 +2574,18 @@ async fn stream_output(
                     }
                     OutputEvent::ResponseComplete { input_tokens, output_tokens, context_tokens } => {
                         state.liveness.update_activity(&session_id, "ResponseComplete");
+
+                        // Flush any pending multi-line spawn (response ended without [/MSG])
+                        if let Some(spawn_role) = pending_spawn.take()
+                            && let Some((tid, sender_role)) = &team_info
+                        {
+                            let task = team_msg_buffer.join("\n");
+                            team_msg_buffer.clear();
+                            fire_team_spawn(
+                                &state, tid, &channel_id, &session_id, sender_role,
+                                &spawn_role, &task, &project,
+                            );
+                        }
 
                         // Flush any pending multi-line team message (response ended without [/MSG])
                         if let Some(target) = team_msg_target.take()
@@ -2746,17 +2904,27 @@ The user requested {dev_count} developer(s) for this team.
 {roles_table}
 
 ## Spawning Team Members
-  [SPAWN:Developer] Initial task or context
+IMPORTANT: Before spawning any team member, ALWAYS run [TEAM_STATUS] first to check the current roster and avoid duplicates.
+Spawn markers MUST start at the beginning of a new line. Include the task, then end with [/MSG] on its own line.
+  [SPAWN:Developer] Short task
+  [/MSG]
+Or multi-line:
+  [SPAWN:Developer]
+  Detailed task description
+  spanning multiple lines
+  [/MSG]
   [SPAWN:Developer --worktree] Force worktree isolation
 Developer roles are auto-numbered (Developer 1, Developer 2, ...). Other roles are singletons.
 
 ## Communication Markers
-  [TO:Role Name] Single-line message
+CRITICAL: All markers MUST start at the beginning of a new line. Do NOT embed markers in the middle of a sentence or paragraph — they will be ignored. Each marker must be the first thing on its line.
+  [TO:Role Name] message [/MSG]
   [TO:Role Name]
   Multi-line message
   [/MSG]
   [BROADCAST] message [/MSG]
   [TEAM_STATUS]
+[/MSG] must also be on its own line when ending a multi-line message.
 
 Messages from team members arrive prefixed with their role.
 Each message you receive will include a [TEAM: ...] header with the current roster.
@@ -2799,12 +2967,14 @@ fn build_team_member_prompt(role: &StoredTeamRole) -> String {
         r#"You are the **{display_name}** on a development team.
 
 ## Communication Markers
-  [TO:Role Name] message
+CRITICAL: All markers MUST start at the beginning of a new line. Do NOT embed markers in the middle of a sentence or paragraph — they will be ignored. Each marker must be the first thing on its line.
+  [TO:Role Name] message [/MSG]
   [TO:Role Name]
-  multi-line content
+  Multi-line message
   [/MSG]
   [BROADCAST] message [/MSG]
   [TEAM_STATUS]
+[/MSG] must also be on its own line when ending a multi-line message.
 
 Messages from other members arrive prefixed with their role.
 Each message you receive will include a [TEAM: ...] header with the current roster.
@@ -2901,24 +3071,36 @@ async fn route_team_message(
     team_id: &str,
     _channel_id: &str,
 ) {
-    // Find target sessions by role (exact + prefix match)
-    let targets = match state.db.get_sessions_by_role(team_id, target_role).await {
-        Ok(sessions) if sessions.is_empty() => {
-            tracing::warn!(team_id, target_role, "Team message target not found");
-            if let Ok(Some(sender)) = state.db.get_session_by_id_prefix(&sender_session_id[..8.min(sender_session_id.len())]).await {
-                let _ = state.mm.post_in_thread(
-                    &sender.channel_id, &sender.thread_id,
-                    &format!(":warning: No active team member with role **{}**.", target_role),
-                ).await;
+    // Find target sessions by role (exact + prefix match).
+    // Retry briefly if no target found — a just-spawned member may still be starting up.
+    let mut targets = Vec::new();
+    for attempt in 0..6 {
+        match state.db.get_sessions_by_role(team_id, target_role).await {
+            Ok(sessions) if !sessions.is_empty() => {
+                targets = sessions;
+                break;
             }
-            return;
+            Ok(_) => {
+                if attempt < 5 {
+                    tracing::debug!(team_id, target_role, attempt, "Target role not found yet, retrying");
+                    tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                } else {
+                    tracing::warn!(team_id, target_role, "Team message target not found after retries");
+                    if let Ok(Some(sender)) = state.db.get_session_by_id_prefix(&sender_session_id[..8.min(sender_session_id.len())]).await {
+                        let _ = state.mm.post_in_thread(
+                            &sender.channel_id, &sender.thread_id,
+                            &format!(":warning: No active team member with role **{}**.", target_role),
+                        ).await;
+                    }
+                    return;
+                }
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "Failed to look up team member by role");
+                return;
+            }
         }
-        Ok(sessions) => sessions,
-        Err(e) => {
-            tracing::error!(error = %e, "Failed to look up team member by role");
-            return;
-        }
-    };
+    }
 
     // Deliver to all matching sessions (fetch member list once)
     let members = state.db.get_team_members(team_id).await.unwrap_or_default();

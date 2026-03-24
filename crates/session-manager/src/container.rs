@@ -104,6 +104,12 @@ impl ContainerManager {
         let s = settings();
         let mut warning: Option<String> = None;
 
+        // Resync session counts before checking limits — corrects any drift from
+        // crashes or missed decrements so we don't wrongly reject new sessions.
+        if let Err(e) = self.registry.resync_session_counts(db).await {
+            tracing::warn!(error = %e, "Failed to resync session counts before start");
+        }
+
         // Check if a container already exists for this (repo, branch)
         let existing = self.registry.get_container(repo, branch).await;
         let (container_name, grpc_port) = if let Some(ref entry) = existing {
@@ -169,10 +175,37 @@ impl ContainerManager {
             self.cold_start(project_path, repo, branch, db).await?
         };
 
-        // Ensure the agent worker is running (starts via SSH if needed).
-        // On cold start, devcontainer up's postStartCommand handles this,
-        // but on fast path (reuse), the worker may have crashed or never started.
+        // On the fast path (reuse), the container may be stopped after a VM reboot.
+        // Ensure it's running at the podman level before trying to reach the worker.
         if existing.is_some() {
+            match ensure_container_started(&container_name).await {
+                Ok(restarted) => {
+                    if restarted {
+                        tracing::info!(
+                            repo, branch, container = %container_name,
+                            "Container was stopped (VM reboot?), restarted it"
+                        );
+                    }
+                }
+                Err(e) => {
+                    // Container is gone — remove from registry and return error.
+                    // The caller can retry, which will take the cold start path.
+                    tracing::warn!(
+                        repo, branch, container = %container_name, error = %e,
+                        "Container no longer exists, removing from registry"
+                    );
+                    self.registry.decrement_sessions(db, repo, branch).await.ok();
+                    self.registry.remove_container(db, repo, branch).await.ok();
+                    return Err(anyhow!(
+                        "Container for {}/{} no longer exists (removed from registry). Retry to create a new one.",
+                        repo, branch
+                    ));
+                }
+            }
+
+            // Ensure the agent worker is running (starts via SSH if needed).
+            // On cold start, devcontainer up's postStartCommand handles this,
+            // but on fast path (reuse), the worker may have crashed or never started.
             let grpc_addr = format!("http://{}:{}", s.vm_host, grpc_port);
             ensure_worker_running(&container_name, &grpc_addr).await?;
         }
@@ -205,8 +238,12 @@ impl ContainerManager {
     ) -> Result<(String, u16)> {
         let s = settings();
 
+        // Probe the VM for ports already bound by existing containers (including
+        // ones removed from the registry but still alive at the podman level).
+        let vm_used_ports = get_vm_used_ports().await;
+
         // Allocate a unique port for this container
-        let grpc_port = self.registry.allocate_port(s.grpc_port_start).await;
+        let grpc_port = self.registry.allocate_port(s.grpc_port_start, &vm_used_ports).await;
 
         // Read existing devcontainer.json content (if any)
         let existing_config = devcontainer::read_config_content(project_path).await;
@@ -277,6 +314,37 @@ impl ContainerManager {
         let container_name = json["containerId"].as_str()
             .ok_or_else(|| anyhow!("No containerId in devcontainer output"))?
             .to_string();
+
+        // Verify the returned container is actually for the right workspace.
+        // devcontainer up can reuse a stale container from a previous lifecycle
+        // that was created for a different repo but has the same workspace label.
+        let verify_cmd = format!(
+            "{} inspect --format '{{{{index .Config.Labels \"devcontainer.local_folder\"}}}}' {}",
+            shell_escape(&s.container_runtime),
+            shell_escape(&container_name),
+        );
+        if let Ok(label) = ssh::run_command(&verify_cmd).await {
+            let label = label.trim();
+            if !label.is_empty() && label != project_path {
+                tracing::warn!(
+                    expected = %project_path,
+                    actual = %label,
+                    container = %container_name,
+                    "devcontainer up returned a container for a different workspace, removing stale container"
+                );
+                // Remove the stale container so the next attempt creates a fresh one
+                let rm_cmd = format!(
+                    "{} rm -f {}",
+                    shell_escape(&s.container_runtime),
+                    shell_escape(&container_name),
+                );
+                let _ = ssh::run_command(&rm_cmd).await;
+                return Err(anyhow!(
+                    "Removed stale container for wrong workspace (expected {}, got {}). Retry will create a fresh container.",
+                    project_path, label
+                ));
+            }
+        }
 
         // Wait for worker health check on the allocated port.
         // If postStartCommand didn't start the worker (e.g. override config merge issue),
@@ -411,10 +479,16 @@ impl ContainerManager {
         repo: &str,
         branch: &str,
         session_type: &str,
+        db: &Database,
         output_tx: mpsc::Sender<OutputEvent>,
         grpc_port: u16,
         system_prompt_append: Option<&str>,
     ) -> Result<()> {
+        // Resync session counts before reconnecting
+        if let Err(e) = self.registry.resync_session_counts(db).await {
+            tracing::warn!(error = %e, "Failed to resync session counts before reconnect");
+        }
+
         self.create_session_internal(
             session_id, container_name, project_path, repo, branch,
             output_tx, false, false, session_type, grpc_port, system_prompt_append,
@@ -637,6 +711,76 @@ pub struct SessionInfo {
     pub thinking_mode: bool,
     pub is_first_message: bool,
     pub last_input_tokens: u64,
+}
+
+/// Query the VM for host ports mapped to container port 50051 across ALL containers
+/// (including ones not tracked in the registry). This prevents port collisions
+/// when stale containers survive a failed teardown or VM restart.
+async fn get_vm_used_ports() -> std::collections::HashSet<u16> {
+    let s = settings();
+    // List all containers (running or stopped) and extract host port mappings for 50051
+    let cmd = format!(
+        "{} ps -a --format '{{{{.Ports}}}}' | grep -oP '\\d+(?=->50051)'",
+        shell_escape(&s.container_runtime),
+    );
+    match ssh::run_command(&cmd).await {
+        Ok(output) => output
+            .lines()
+            .filter_map(|line| line.trim().parse::<u16>().ok())
+            .collect(),
+        Err(_) => {
+            // If the query fails, return empty set — allocate_port falls back to
+            // registry-only check, which is the previous behavior
+            std::collections::HashSet::new()
+        }
+    }
+}
+
+/// Ensure a container is running at the podman/docker level.
+/// After a VM reboot, containers exist but are stopped — `podman start` restarts them.
+/// Returns Ok(true) if the container was restarted, Ok(false) if already running.
+pub async fn ensure_container_started(container_name: &str) -> Result<bool> {
+    let s = settings();
+    let escaped_name = shell_escape(container_name);
+
+    // Check if container is running
+    let inspect_cmd = format!(
+        "{} inspect --format '{{{{.State.Running}}}}' {}",
+        shell_escape(&s.container_runtime),
+        escaped_name,
+    );
+    let inspect_result = ssh::run_command(&inspect_cmd).await;
+
+    let is_running = inspect_result
+        .as_ref()
+        .map(|out| out.trim() == "true")
+        .unwrap_or(false);
+
+    if is_running {
+        return Ok(false);
+    }
+
+    // Check if the container exists at all (inspect succeeds even for stopped containers)
+    if inspect_result.is_err() {
+        return Err(anyhow!(
+            "Container {} does not exist on the VM (may have been removed)",
+            container_name
+        ));
+    }
+
+    // Container exists but is stopped — start it
+    tracing::info!(container_name, "Container is stopped, starting via podman/docker");
+    let start_cmd = format!(
+        "{} start {}",
+        shell_escape(&s.container_runtime),
+        escaped_name,
+    );
+    ssh::run_command(&start_cmd).await.map_err(|e| {
+        anyhow!("Failed to start stopped container {}: {}", container_name, e)
+    })?;
+
+    tracing::info!(container_name, "Container restarted successfully");
+    Ok(true)
 }
 
 /// Check if the agent worker is healthy; if not, start it via SSH and wait.

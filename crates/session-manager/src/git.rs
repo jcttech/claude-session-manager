@@ -173,7 +173,7 @@ impl GitManager {
             .join(name)
     }
 
-    /// Ensure a repository is cloned on the VM, return path to main clone
+    /// Ensure a repository is cloned on the VM and on the correct branch, return path to main clone
     pub async fn ensure_repo(&self, repo_ref: &RepoRef) -> Result<PathBuf> {
         let repo_path = self.repo_path(repo_ref);
         let repo_path_str = repo_path.to_string_lossy();
@@ -222,6 +222,35 @@ impl GitManager {
             self.ssh_command(&clone_cmd).await.map_err(|e| {
                 anyhow!("Failed to clone repository: {}. Make sure GH_TOKEN is set for private repos.", e)
             })?;
+        }
+
+        // Checkout the requested branch if specified.
+        // Without this, the working tree stays on whatever branch it was left on
+        // (e.g., after a previous session changed branches), causing the wrong code
+        // to appear when the container is reused.
+        if let Some(ref branch) = repo_ref.branch {
+            let checkout_cmd = format!(
+                "cd {} && git fetch origin {br} 2>/dev/null; git checkout {br}",
+                shell_escape(&repo_path_str),
+                br = shell_escape(branch),
+            );
+            if let Err(e) = self.ssh_command(&checkout_cmd).await {
+                tracing::warn!(
+                    repo = %repo_ref.full_name(),
+                    branch = %branch,
+                    error = %e,
+                    "Branch checkout failed"
+                );
+                return Err(anyhow!(
+                    "Failed to checkout branch `{}`: {}",
+                    branch, e
+                ));
+            }
+            tracing::info!(
+                repo = %repo_ref.full_name(),
+                branch = %branch,
+                "Checked out requested branch"
+            );
         }
 
         Ok(repo_path)

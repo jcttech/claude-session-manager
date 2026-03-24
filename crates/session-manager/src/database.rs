@@ -924,6 +924,21 @@ impl Database {
         Ok(containers)
     }
 
+    /// Count active sessions per container_id (status IN active/disconnected/stuck).
+    /// Used to resync the session_count in the containers table.
+    pub async fn count_active_sessions_per_container(&self) -> Result<Vec<(i64, i32)>> {
+        let rows: Vec<(i64, i64)> = sqlx::query_as(&format!(
+            "SELECT container_id, COUNT(*) \
+             FROM {}.sessions \
+             WHERE status IN ('active', 'disconnected', 'stuck') AND container_id IS NOT NULL \
+             GROUP BY container_id",
+            SCHEMA
+        ))
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(|(id, count)| (id, count as i32)).collect())
+    }
+
     /// Delete a container record.
     pub async fn delete_container(&self, container_id: i64) -> Result<()> {
         sqlx::query(&format!(

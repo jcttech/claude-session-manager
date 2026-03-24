@@ -144,15 +144,17 @@ impl ContainerRegistry {
     }
 
     /// Allocate the lowest available port starting from `port_start`.
-    /// Examines all currently registered containers to find used ports.
-    pub async fn allocate_port(&self, port_start: u16) -> u16 {
+    /// Examines both the in-memory registry and actually bound ports on the VM
+    /// to avoid conflicts with containers that were removed from the registry
+    /// but still exist at the podman level (e.g., failed teardown, VM restart).
+    pub async fn allocate_port(&self, port_start: u16, vm_used_ports: &std::collections::HashSet<u16>) -> u16 {
         let entries = self.entries.read().await;
-        let used_ports: std::collections::HashSet<u16> = entries
+        let registry_ports: std::collections::HashSet<u16> = entries
             .values()
             .map(|e| e.grpc_port)
             .collect();
         let mut port = port_start;
-        while used_ports.contains(&port) {
+        while registry_ports.contains(&port) || vm_used_ports.contains(&port) {
             port += 1;
         }
         port
@@ -265,6 +267,53 @@ impl ContainerRegistry {
     /// Get the number of containers tracked.
     pub async fn count(&self) -> usize {
         self.entries.read().await.len()
+    }
+
+    /// Resync session counts from the database.
+    /// Counts actual active sessions (active/disconnected/stuck) per container
+    /// and updates both the in-memory registry and the DB containers table.
+    /// Returns the number of containers whose counts were corrected.
+    pub async fn resync_session_counts(&self, db: &Database) -> Result<usize> {
+        let actual_counts = db.count_active_sessions_per_container().await?;
+        let count_map: std::collections::HashMap<i64, i32> = actual_counts.into_iter().collect();
+
+        let mut entries = self.entries.write().await;
+        let mut corrected = 0usize;
+
+        for entry in entries.values_mut() {
+            let actual = count_map.get(&entry.container_id).copied().unwrap_or(0);
+            if entry.session_count != actual {
+                tracing::warn!(
+                    container_id = entry.container_id,
+                    container = %entry.container_name,
+                    old_count = entry.session_count,
+                    actual_count = actual,
+                    "Session count drift detected, resyncing"
+                );
+                entry.session_count = actual;
+                entry.last_activity_at = Utc::now();
+                if actual == 0 && entry.last_session_stopped_at.is_none() {
+                    entry.last_session_stopped_at = Some(Utc::now());
+                } else if actual > 0 {
+                    entry.last_session_stopped_at = None;
+                }
+                // Update DB
+                if let Err(e) = db.update_container_session_count(entry.container_id, actual).await {
+                    tracing::error!(
+                        container_id = entry.container_id,
+                        error = %e,
+                        "Failed to update session count in DB during resync"
+                    );
+                }
+                corrected += 1;
+            }
+        }
+
+        if corrected > 0 {
+            tracing::info!(corrected, "Session count resync complete");
+        }
+
+        Ok(corrected)
     }
 }
 
@@ -443,7 +492,8 @@ mod tests {
     #[tokio::test]
     async fn test_allocate_port_empty_registry() {
         let registry = ContainerRegistry::new();
-        let port = registry.allocate_port(50051).await;
+        let empty = std::collections::HashSet::new();
+        let port = registry.allocate_port(50051, &empty).await;
         assert_eq!(port, 50051);
     }
 
@@ -461,7 +511,8 @@ mod tests {
                 make_entry_with_port(2, "c2", 1, 50052),
             );
         }
-        let port = registry.allocate_port(50051).await;
+        let empty = std::collections::HashSet::new();
+        let port = registry.allocate_port(50051, &empty).await;
         assert_eq!(port, 50053);
     }
 
@@ -479,8 +530,34 @@ mod tests {
                 make_entry_with_port(2, "c2", 1, 50053),
             );
         }
-        let port = registry.allocate_port(50051).await;
+        let empty = std::collections::HashSet::new();
+        let port = registry.allocate_port(50051, &empty).await;
         // Should fill the gap at 50052
         assert_eq!(port, 50052);
+    }
+
+    #[tokio::test]
+    async fn test_allocate_port_skips_vm_used_ports() {
+        let registry = ContainerRegistry::new();
+        // Port 50051 is free in registry but in use on VM (stale container)
+        let vm_ports: std::collections::HashSet<u16> = [50051, 50053].into_iter().collect();
+        let port = registry.allocate_port(50051, &vm_ports).await;
+        assert_eq!(port, 50052);
+    }
+
+    #[tokio::test]
+    async fn test_allocate_port_skips_both_registry_and_vm() {
+        let registry = ContainerRegistry::new();
+        {
+            let mut entries = registry.entries.write().await;
+            entries.insert(
+                ("org/repo1".to_string(), "main".to_string()),
+                make_entry_with_port(1, "c1", 1, 50051),
+            );
+        }
+        // Port 50052 is used on VM but not in registry
+        let vm_ports: std::collections::HashSet<u16> = [50052].into_iter().collect();
+        let port = registry.allocate_port(50051, &vm_ports).await;
+        assert_eq!(port, 50053);
     }
 }
