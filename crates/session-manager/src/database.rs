@@ -433,6 +433,7 @@ pub async fn create_schema(pool: &PgPool, schema: &str) -> Result<()> {
 - Resolve conflicts when team members disagree or produce incompatible work
 - Review and manage PRs as described in the PR Review & Completion section below — this includes performing QA review yourself for straightforward PRs
 - Only spawn a QA Engineer when the task has significant complexity warranting dedicated testing
+- PRs arrive via the review gate: team members address Claude Reviewer comments before you see the PR — verify they did so with actual code changes, not documentation-only fixes
 - When PRs have review comments or requested changes, delegate the fixes back to the relevant Developer or Architect
 - Autonomously progress open spec and implementation PRs — review, request changes, or merge as appropriate
 - Synthesize the team''s work into a final summary for the user when the task is complete
@@ -447,7 +448,13 @@ pub async fn create_schema(pool: &PgPool, schema: &str) -> Result<()> {
 - Use the spec-flow `decision` tool to record important Architecture Decision Records (ADRs) with justification
 - Review Developer PRs for architectural consistency when delegated by Team Lead — flag deviations from the agreed design
 - Run the spec-flow `architecture` tool to update project docs after implementation PRs are merged
-- Verify implementations match the spec before approving PRs',
+- Verify implementations match the spec before approving PRs
+- **PR Review Escalation**: Developers will escalate Complex review comments to you during the PR review gate. When you receive a proposed fix from a Developer:
+  1. Evaluate whether the proposed approach maintains architectural alignment (interfaces, patterns, security, dependencies)
+  2. Check the proposal against the project''s architecture docs and ADRs
+  3. Either approve the approach, suggest a better alternative, or reject with explanation
+  4. Respond promptly via [TO:Developer N] — the Developer is blocked until you respond
+  5. If the fix requires an ADR, record it with the `decision` tool before approving',
              true, false, 1),
             ('developer', 'Developer', 'Implements features end-to-end',
              '- Wait for task assignment from the Team Lead before starting work
@@ -456,7 +463,12 @@ pub async fn create_schema(pool: &PgPool, schema: &str) -> Result<()> {
 - Write unit tests for all new code; aim for meaningful coverage of edge cases, not just happy paths
 - Fix bugs by first reproducing the issue, identifying the root cause, then implementing and testing the fix
 - Communicate blockers to the Team Lead immediately — don''t spin on problems silently
-- After creating a PR, notify Team Lead: [TO:Team Lead] PR #N ready for review
+- After creating a PR, use [PR_READY:N] to trigger the review gate — do NOT send directly to Team Lead
+- Categorise each review comment as Simple (fix yourself) or Complex (escalate to Architect):
+  Simple: code style, naming, missing error handling, missing tests, minor localised bugs, dead code
+  Complex: interface/API changes, new dependencies, module restructuring, security/auth patterns, design pattern deviations, schema changes
+- Fix Simple comments with actual code changes — documentation-only fixes are NOT acceptable
+- Escalate Complex comments to the Architect via [TO:Architect] with your proposed solution, the affected code, and the risk — wait for their feedback before implementing
 - Address PR review feedback promptly when delegated by the Team Lead
 - Do NOT start new work until your current PR is merged or you are reassigned
 - One task at a time — finish current work before accepting new assignments',

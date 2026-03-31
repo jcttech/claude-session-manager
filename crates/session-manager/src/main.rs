@@ -37,6 +37,8 @@ static TEAM_MSG_RE: OnceLock<Regex> = OnceLock::new();
 static TEAM_BROADCAST_RE: OnceLock<Regex> = OnceLock::new();
 static TEAM_MSG_END_RE: OnceLock<Regex> = OnceLock::new();
 static TEAM_STATUS_RE: OnceLock<Regex> = OnceLock::new();
+static PR_READY_RE: OnceLock<Regex> = OnceLock::new();
+static PR_REVIEWED_RE: OnceLock<Regex> = OnceLock::new();
 
 fn network_request_regex() -> &'static Regex {
     NETWORK_REQUEST_RE.get_or_init(|| {
@@ -76,6 +78,18 @@ fn team_msg_end_regex() -> &'static Regex {
 fn team_status_regex() -> &'static Regex {
     TEAM_STATUS_RE.get_or_init(|| {
         Regex::new(r"\[TEAM_STATUS\]").expect("Invalid regex")
+    })
+}
+
+fn pr_ready_regex() -> &'static Regex {
+    PR_READY_RE.get_or_init(|| {
+        Regex::new(r"^\s*\[PR_READY:(\d+)\]").expect("Invalid regex")
+    })
+}
+
+fn pr_reviewed_regex() -> &'static Regex {
+    PR_REVIEWED_RE.get_or_init(|| {
+        Regex::new(r"^\s*\[PR_REVIEWED:(\d+)\]").expect("Invalid regex")
     })
 }
 
@@ -2311,6 +2325,8 @@ async fn stream_output(
     let broadcast_re = team_broadcast_regex();
     let msg_end_re = team_msg_end_regex();
     let status_re = team_status_regex();
+    let pr_ready_re = pr_ready_regex();
+    let pr_reviewed_re = pr_reviewed_regex();
 
     // Look up team context for this session (cached once)
     let team_info: Option<(String, String)> = {
@@ -2526,6 +2542,26 @@ async fn stream_output(
                                 handle_team_status(&state, &session_id, tid).await;
                                 continue;
                             }
+
+                            // Check for [PR_READY:N] marker (team members signal PR is ready)
+                            if let Some(caps) = pr_ready_re.captures(&line) {
+                                let pr_num = caps[1].to_string();
+                                card.append_text(&format!("> :mag: **PR #{} review gate**...", pr_num));
+                                card.dirty = true;
+                                handle_pr_ready(&state, &session_id, tid, sender_role, &pr_num, &channel_id).await;
+                                continue;
+                            }
+
+                            // Check for [PR_REVIEWED:N] marker (team member confirms review comments addressed)
+                            if let Some(caps) = pr_reviewed_re.captures(&line) {
+                                let pr_num = caps[1].to_string();
+                                card.append_text(&format!("> :white_check_mark: **PR #{} review complete** — forwarding to Team Lead", pr_num));
+                                card.dirty = true;
+                                // Clear pending task — member is done with review gate
+                                let _ = state.db.clear_pending_task(&session_id).await;
+                                handle_pr_reviewed(&state, &session_id, tid, sender_role, &pr_num, &channel_id).await;
+                                continue;
+                            }
                         }
 
                         // --- Existing marker checks ---
@@ -2672,6 +2708,11 @@ async fn stream_output(
                         {
                             let _ = state.containers.send(&session_id, "/compact").await;
                             let _ = state.db.record_compaction(&session_id).await;
+
+                            // Re-inject team status after compaction so the agent
+                            // retains roster context despite losing conversation history
+                            handle_team_status(&state, &session_id, tid).await;
+
                             if role != "Team Lead"
                                 && let Ok(leads) = state.db.get_sessions_by_role(tid, "Team Lead").await
                                 && let Some(lead) = leads.first()
@@ -2694,6 +2735,12 @@ async fn stream_output(
                         card.finalize_error(exit_code, &signal);
                         card.flush(&state, &channel_id, &thread_id).await;
                         card.post_id = None;
+
+                        // Notify team about the death
+                        if let Some((ref tid, ref role)) = team_info {
+                            let _ = state.db.update_session_status(&session_id, "disconnected").await;
+                            notify_team_session_lost(&state, tid, &session_id, role, "process died").await;
+                        }
                     }
                     OutputEvent::WorkerDisconnected { reason } => {
                         tracing::warn!(session_id = %session_id, reason = %reason, "stream_output: WorkerDisconnected");
@@ -2710,6 +2757,11 @@ async fn stream_output(
                             &channel_id, &thread_id,
                             ":warning: Worker disconnected. Send a message to reconnect automatically.",
                         ).await;
+
+                        // Notify team about the disconnection
+                        if let Some((ref tid, ref role)) = team_info {
+                            notify_team_session_lost(&state, tid, &session_id, role, "worker disconnected").await;
+                        }
                     }
                     OutputEvent::WorkerReconnected => {
                         tracing::info!(session_id = %session_id, "stream_output: WorkerReconnected");
@@ -2720,6 +2772,12 @@ async fn stream_output(
                             &channel_id, &thread_id,
                             ":white_check_mark: Worker reconnected. Resuming session.",
                         ).await;
+
+                        // Re-inject team status after reconnection so the agent
+                        // has fresh roster context (especially for team leads).
+                        if let Some((ref tid, _)) = team_info {
+                            handle_team_status(&state, &session_id, tid).await;
+                        }
                     }
                     OutputEvent::SessionIdCaptured(claude_sid) => {
                         tracing::info!(session_id = %session_id, claude_sid = %claude_sid, "stream_output: SessionIdCaptured");
@@ -2752,20 +2810,46 @@ async fn stream_output(
         }
     }
 
-    // Stream ended — use centralized cleanup (atomic, prevents double-decrement)
-    cleanup_session(&state, &session_id).await;
+    // Stream ended — for team sessions, soft-delete so the session can be
+    // found by team queries and potentially re-spawned.  For non-team sessions,
+    // use the full cleanup path (atomic, prevents double-decrement).
+    if team_info.is_some() {
+        // Soft-delete: mark disconnected, release in-memory session, but preserve
+        // the DB record and worktree so the Team Lead can see the member's status
+        // and the work-in-progress is not lost.
+        let _ = state.db.update_session_status(&session_id, "disconnected").await;
 
-    tracing::info!(
-        session_id = %session_id,
-        channel_id = %channel_id,
-        "Session stream ended"
-    );
-    if let Err(e) = state
-        .mm
-        .post_in_thread(&channel_id, &thread_id, "Session ended.")
-        .await
-    {
-        tracing::warn!(error = %e, "Failed to post session end message");
+        // Release the in-memory session (channel is dead anyway) but keep DB record
+        if let Some(claimed) = state.containers.claim_session(&session_id) {
+            state.liveness.remove(&session_id);
+            let _ = state.containers.release_session(&state.db, &claimed.repo, &claimed.branch).await;
+            state.git.release_repo_by_session(&session_id);
+            // NOTE: do NOT clean up worktree — it contains the member's work
+            gauge!("active_sessions").decrement(1.0);
+        }
+
+        tracing::info!(
+            session_id = %session_id,
+            channel_id = %channel_id,
+            "Team session stream ended (soft-delete — DB record preserved)"
+        );
+        let _ = state.mm.post_in_thread(&channel_id, &thread_id, "Session ended (disconnected).").await;
+    } else {
+        // Standard session — full cleanup
+        cleanup_session(&state, &session_id).await;
+
+        tracing::info!(
+            session_id = %session_id,
+            channel_id = %channel_id,
+            "Session stream ended"
+        );
+        if let Err(e) = state
+            .mm
+            .post_in_thread(&channel_id, &thread_id, "Session ended.")
+            .await
+        {
+            tracing::warn!(error = %e, "Failed to post session end message");
+        }
     }
 }
 
@@ -2904,7 +2988,8 @@ The user requested {dev_count} developer(s) for this team.
 {roles_table}
 
 ## Spawning Team Members
-IMPORTANT: Before spawning any team member, ALWAYS run [TEAM_STATUS] first to check the current roster and avoid duplicates.
+IMPORTANT: Before spawning, ALWAYS check if existing team members of the same role are idle — use [TO:Role] to assign work to idle members instead of spawning new ones. The system will REJECT spawn requests when idle members of that role exist.
+Run [TEAM_STATUS] first to check the current roster and avoid duplicates.
 Spawn markers MUST start at the beginning of a new line. Include the task, then end with [/MSG] on its own line.
   [SPAWN:Developer] Short task
   [/MSG]
@@ -2929,6 +3014,8 @@ CRITICAL: All markers MUST start at the beginning of a new line. Do NOT embed ma
 Messages from team members arrive prefixed with their role.
 Each message you receive will include a [TEAM: ...] header with the current roster.
 
+**PR Review Gate**: Team members use [PR_READY:N] and [PR_REVIEWED:N] markers. The system ensures they address Claude Reviewer CI comments before the PR reaches you. You will receive a notification when a PR has passed the review gate.
+
 ## Your Responsibilities
 {responsibilities}
 
@@ -2950,14 +3037,18 @@ The team follows the spec-flow workflow. Coordinate members through these phases
 IMPORTANT: Do NOT spawn Developers until stories have been planned from approved specs.
 
 ## PR Review & Completion
-When team members create PRs:
-1. Review the PR using `gh pr view <number>` and `gh pr diff <number>`
-2. Check CI status with `gh pr checks <number>`
-3. If changes needed, send SPECIFIC feedback via [TO:Role] with file paths and issues
-4. Wait for fixes before re-reviewing — do not merge until CI passes
-5. For architectural PRs, delegate review to Architect via [TO:Architect] — they verify alignment with specs
-6. After merging implementation PRs, ask Architect to run the spec-flow `architecture` tool to update project docs
-7. Merge with `gh pr merge <number> --squash` when approved"#,
+Team members use the [PR_READY:N] / [PR_REVIEWED:N] review gate. The system ensures they address Claude Reviewer CI comments BEFORE the PR reaches you. When you receive a PR notification:
+
+1. **Verify CI passes**: `gh pr checks <number>` — ALL checks must be green, including Claude PR Review
+2. **Review the diff**: `gh pr view <number>` and `gh pr diff <number>`
+3. **Verify review comments are resolved**: `gh api repos/<owner>/<repo>/pulls/<number>/comments` — check that EVERY comment has been addressed with actual code changes
+4. **Reject documentation-only fixes**: If review comments were "resolved" by adding docstrings, comments, or README entries instead of fixing the underlying code/logic/security issue, send the PR back. Documentation does NOT fix code problems — it hides them for later.
+5. **Check ALL severity levels**: Low, medium, high, AND critical comments must all be evaluated. Low-severity items may be deferred with justification, but medium and above must be fixed.
+6. **Verify architectural alignment**: Complex fixes (interface changes, new dependencies, restructuring, security patterns) should have been escalated to the Architect during the review gate. Check that the Architect approved these changes before merging. If you see architectural changes without Architect sign-off, send the PR back.
+7. If changes needed, send SPECIFIC feedback via [TO:Role] with file paths, line numbers, and what needs to change
+8. Wait for fixes before re-reviewing — do not merge until all CI passes AND review comments are properly resolved
+9. After merging implementation PRs, ask Architect to run the spec-flow `architecture` tool to update project docs
+10. Merge with `gh pr merge <number> --squash` ONLY when ALL of the above are satisfied"#,
     ))
 }
 
@@ -2985,12 +3076,24 @@ Each message you receive will include a [TEAM: ...] header with the current rost
 ## Workflow
 - Wait for task assignment from the Team Lead before starting work
 - ALWAYS report back to the Team Lead when your task is complete using [TO:Team Lead] with a summary of what you did
-- After creating a PR, notify Team Lead: [TO:Team Lead] PR #N ready for review
 - After completing any assigned work (reviews, architecture updates, analysis), notify Team Lead: [TO:Team Lead] with results
 - Address review feedback promptly when delegated by Team Lead
 - Do NOT start new work until your current PR is merged or you are reassigned
 - One task at a time — finish current work before accepting new assignments
-- IMPORTANT: Never finish a response without sending [TO:Team Lead] — the Team Lead cannot see your work unless you explicitly send it"#,
+- IMPORTANT: Never finish a response without sending [TO:Team Lead] — the Team Lead cannot see your work unless you explicitly send it
+
+## PR Review Gate (IMPORTANT)
+After creating a PR, do NOT send it directly to the Team Lead. Instead use the review gate:
+1. Signal the PR is ready: `[PR_READY:N]` (where N is the PR number)
+2. The system will instruct you to wait for Claude PR Review CI and address all review comments
+3. **Categorise** each review comment as Simple or Complex:
+   - **Simple** (fix yourself): code style, naming, missing error handling, missing tests, minor localised bugs, dead code
+   - **Complex** (escalate to Architect): interface/API changes, new dependencies, module restructuring, security/auth pattern changes, design pattern deviations, schema changes
+4. Fix Simple issues with actual code changes (documentation-only fixes are NOT acceptable)
+5. For Complex issues: send your proposed solution to the Architect via [TO:Architect] — wait for their feedback, then implement
+6. Push fixes, re-check CI, repeat until clean
+7. Signal completion: `[PR_REVIEWED:N]` — the system will then notify the Team Lead
+Do NOT use [TO:Team Lead] for PR notifications — use [PR_READY:N] and [PR_REVIEWED:N] instead."#,
         display_name = role.display_name,
         responsibilities = role.responsibilities,
     )
@@ -3139,6 +3242,21 @@ async fn route_team_message(
         ).await;
         if let Err(e) = state.containers.send(&target.session_id, &formatted).await {
             tracing::warn!(error = %e, role, "Failed to deliver team message");
+            // Notify sender that delivery failed — their message was lost
+            if let Ok(Some(sender)) = state.db.get_session_by_id_prefix(&sender_session_id[..8.min(sender_session_id.len())]).await {
+                let header = format_team_context_header(&members, sender_role);
+                let fail_msg = format!(
+                    "{}\n:x: **Message delivery to {} failed** — their session may have died or disconnected.\nUse [TEAM_STATUS] to check the roster. You may need to re-spawn the role or reassign the task.",
+                    header, role,
+                );
+                let _ = state.containers.send(&sender.session_id, &fail_msg).await;
+                let _ = state.mm.post_in_thread(
+                    &sender.channel_id, &sender.thread_id,
+                    &format!(":x: Failed to deliver message to **{}** — session unreachable.", role),
+                ).await;
+            }
+            // Clear the pending task we just set — delivery didn't happen
+            let _ = state.db.clear_pending_task(&target.session_id).await;
         } else {
             delivered_roles.push(role.to_string());
         }
@@ -3287,6 +3405,40 @@ fn handle_team_spawn(
     // Determine the actual role display name (with instance numbering for multi-instance roles)
     let members = state.db.get_team_members(team_id).await.unwrap_or_default();
     let display_name = if role_def.allow_multiple {
+        // Before spawning a new instance, check if any existing members of this
+        // role are idle (active status, no pending task).  If so, reject the
+        // spawn and tell the lead to assign work to the idle member first.
+        let idle_same_role: Vec<&StoredSession> = members.iter()
+            .filter(|m| {
+                m.role.as_deref().map(|r| r.starts_with(&role_def.display_name)).unwrap_or(false)
+                    && m.status == "active"
+                    && m.pending_task_from.is_none()
+            })
+            .collect();
+        if !idle_same_role.is_empty() {
+            let idle_names: Vec<String> = idle_same_role.iter()
+                .filter_map(|m| m.role.clone())
+                .collect();
+            let idle_list = idle_names.join(", ");
+            tracing::info!(team_id, role = %role_def.display_name, idle = %idle_list,
+                "Spawn rejected: idle members of same role available");
+            if let Ok(Some(lead)) = state.db.get_session_by_id_prefix(&lead_session_id[..8.min(lead_session_id.len())]).await {
+                let reject_msg = format!(
+                    ":warning: **Spawn rejected**: {} idle — assign work with `[TO:{}] task [/MSG]` before spawning another.",
+                    idle_list, idle_names[0],
+                );
+                let _ = state.mm.post_in_thread(
+                    &lead.channel_id, &lead.thread_id, &reject_msg,
+                ).await;
+                let header = build_team_context_header(&state.db, team_id, "Team Lead").await;
+                let _ = state.containers.send(&lead.session_id, &format!(
+                    "{}\nSpawn rejected: {} is idle and available. Use [TO:{}] to assign them a task before spawning a new {}.\nThe task you wanted to assign was: {}",
+                    header, idle_list, idle_names[0], role_def.display_name, initial_task,
+                )).await;
+            }
+            return;
+        }
+
         // Count existing instances of this base role
         let existing_count = members.iter()
             .filter(|m| m.role.as_deref().map(|r| r.starts_with(&role_def.display_name)).unwrap_or(false))
@@ -3515,6 +3667,183 @@ async fn broadcast_team_notification(state: &AppState, team_id: &str, message: &
     }
 }
 
+/// Handle [PR_READY:N] — team member signals their PR is ready.
+/// Instead of forwarding directly to the team lead, inject review gate instructions
+/// so the member addresses Claude Reviewer CI comments first.
+async fn handle_pr_ready(
+    state: &AppState,
+    session_id: &str,
+    team_id: &str,
+    sender_role: &str,
+    pr_number: &str,
+    _channel_id: &str,
+) {
+    let header = build_team_context_header(&state.db, team_id, sender_role).await;
+
+    // Look up the project for the repo owner/name
+    let project = state.db.get_session_by_id_prefix(&session_id[..8.min(session_id.len())]).await
+        .ok().flatten()
+        .map(|s| s.project)
+        .unwrap_or_default();
+    let repo_slug = if project.contains('/') {
+        project.clone()
+    } else {
+        // Fallback — the member can figure it out from their working directory
+        String::new()
+    };
+
+    let gate_msg = format!(
+        r#"{header}
+**PR Review Gate — PR #{pr}**
+
+Before this PR is forwarded to the Team Lead, you MUST complete the following:
+
+### Step 1: Fetch review comments
+Wait for Claude PR Review CI, then fetch all comments:
+```
+gh pr checks {pr} --watch
+gh api repos/{repo}/pulls/{pr}/comments --jq '.[] | "[\(.path):\(.line // .original_line)] \(.body)"'
+gh pr view {pr} --json reviews --jq '.reviews[] | "\(.state): \(.body)"'
+```
+
+### Step 2: Categorise each comment
+For EVERY review comment, categorise it as **Simple** or **Complex**:
+
+**Simple** — fix directly yourself:
+- Code style, formatting, naming conventions
+- Missing or inadequate error handling (adding try/catch, nil checks, etc.)
+- Missing tests or test coverage gaps
+- Minor logic bugs with an obvious localised fix
+- Unused imports, dead code, minor refactors within a single function
+
+**Complex** — requires Architect input before fixing:
+- Changes to public interfaces, API contracts, or function signatures used by other modules
+- Adding new dependencies or replacing existing ones
+- Restructuring modules, moving responsibilities between components
+- Changes to security, authentication, or authorisation patterns
+- Deviating from established design patterns or architectural conventions
+- Performance-critical changes that alter data flow or concurrency model
+- Database schema changes or migration modifications
+
+### Step 3: Handle Simple fixes
+Address them with actual code changes. Rules:
+- **Documentation-only fixes are NOT acceptable** — adding comments or docstrings does not resolve code quality, logic, or security issues
+- If a comment is genuinely not applicable, explain why in a brief inline code comment at the relevant line
+
+### Step 4: Escalate Complex fixes to Architect
+For each Complex comment, send a message to the Architect with your proposed solution:
+```
+[TO:Architect]
+PR #{pr} review comment requires architectural input:
+
+**Review comment**: <paste the review comment>
+**Affected code**: <file:line — what the current code does>
+**Proposed fix**: <your proposed approach to address this>
+**Risk**: <what else could be affected by this change>
+
+Please advise whether this approach is acceptable or suggest an alternative.
+[/MSG]
+```
+Wait for the Architect's response, then implement their recommended approach.
+If no Architect is on the team, escalate to the Team Lead instead via [TO:Team Lead] with the same format.
+
+### Step 5: Push and re-check
+Push your fixes (this re-triggers CI). Repeat from Step 1 until all comments are resolved and CI passes.
+
+### Step 6: Signal completion
+Once ALL comments are addressed (Simple fixes applied, Complex fixes approved by Architect and implemented) and CI passes:
+```
+[PR_REVIEWED:{pr}]
+```
+
+Do NOT use [TO:Team Lead] for this PR until you have completed this gate."#,
+        header = header,
+        pr = pr_number,
+        repo = if repo_slug.is_empty() { "<owner>/<repo>".to_string() } else { repo_slug },
+    );
+
+    let _ = state.containers.send(session_id, &gate_msg).await;
+
+    // Post in member's Mattermost thread for visibility
+    if let Ok(Some(sess)) = state.db.get_session_by_id_prefix(&session_id[..8.min(session_id.len())]).await {
+        let _ = state.mm.post_in_thread(
+            &sess.channel_id, &sess.thread_id,
+            &format!(":mag: **PR #{} review gate**: Waiting for {} to address Claude Reviewer comments before forwarding to Team Lead.", pr_number, sender_role),
+        ).await;
+    }
+
+    // Log in coordination thread
+    post_to_coordination_log(
+        state, team_id,
+        &format!(":mag: **{}** triggered PR #{} review gate — addressing Claude Reviewer feedback before Team Lead review", sender_role, pr_number),
+    ).await;
+}
+
+/// Handle [PR_REVIEWED:N] — team member confirms they've addressed all review comments.
+/// Now forward the PR to the team lead for final review.
+async fn handle_pr_reviewed(
+    state: &AppState,
+    session_id: &str,
+    team_id: &str,
+    sender_role: &str,
+    pr_number: &str,
+    _channel_id: &str,
+) {
+    // Find the team lead session
+    let members = state.db.get_team_members(team_id).await.unwrap_or_default();
+    let lead = members.iter().find(|m| m.role.as_deref() == Some("Team Lead"));
+
+    if let Some(lead_session) = lead {
+        let header = build_team_context_header(&state.db, team_id, "Team Lead").await;
+        let ready_msg = format!(
+            "{}\n**PR #{} from {} — Review Gate Passed**\n\n\
+            This PR has been through the Claude Reviewer CI and {} has addressed all review comments.\n\
+            Please perform your final review:\n\
+            1. `gh pr checks {}` — verify all CI checks pass\n\
+            2. `gh pr diff {}` — review the implementation\n\
+            3. `gh api repos/<owner>/<repo>/pulls/{}/comments --jq '.[] | \"[\\(.path):\\(.line // .original_line)] \\(.body)\"'` — verify review comments are resolved with code changes\n\
+            4. If issues remain, send back to {} via [TO:{}] with specific feedback\n\
+            5. Merge with `gh pr merge {} --squash` when satisfied",
+            header, pr_number, sender_role,
+            sender_role,
+            pr_number, pr_number, pr_number,
+            sender_role, sender_role,
+            pr_number,
+        );
+        let _ = state.containers.send(&lead_session.session_id, &ready_msg).await;
+        // Set pending task on lead so they know they have a PR to review
+        let _ = state.db.set_pending_task(
+            &lead_session.session_id, session_id,
+            &format!("Review PR #{} from {}", pr_number, sender_role),
+        ).await;
+
+        // Notify in lead's Mattermost thread
+        let _ = state.mm.post_in_thread(
+            &lead_session.channel_id, &lead_session.thread_id,
+            &format!(":white_check_mark: **PR #{} from {}** — Claude Reviewer comments addressed, ready for final review.", pr_number, sender_role),
+        ).await;
+    }
+
+    // Confirm to the member
+    if let Ok(Some(sess)) = state.db.get_session_by_id_prefix(&session_id[..8.min(session_id.len())]).await {
+        let header = build_team_context_header(&state.db, team_id, sender_role).await;
+        let _ = state.containers.send(session_id, &format!(
+            "{}\nPR #{} has been forwarded to the Team Lead for final review. Wait for their feedback.",
+            header, pr_number,
+        )).await;
+        let _ = state.mm.post_in_thread(
+            &sess.channel_id, &sess.thread_id,
+            &format!(":white_check_mark: **PR #{}** forwarded to Team Lead for final review.", pr_number),
+        ).await;
+    }
+
+    // Log in coordination thread
+    post_to_coordination_log(
+        state, team_id,
+        &format!(":white_check_mark: **{}** completed PR #{} review gate — forwarded to Team Lead", sender_role, pr_number),
+    ).await;
+}
+
 /// Stop an entire team (all members + lead).
 async fn stop_team(state: &AppState, team_id: &str, lead_session: &database::StoredSession) {
     let members = state.db.get_team_members(team_id).await.unwrap_or_default();
@@ -3566,6 +3895,53 @@ async fn stop_session_by_ref(state: &AppState, session: &database::StoredSession
 async fn notify_team_member_left(state: &AppState, team_id: &str, role_name: &str, session_id: &str) {
     let msg = format!("**Team Roster Update**: {} has left the team.", role_name);
     broadcast_team_notification(state, team_id, &msg, session_id).await;
+}
+
+/// Notify the team when a session dies or disconnects.
+/// If a team member died, notify the Team Lead with the member's current task.
+/// If the Team Lead died, notify all team members.
+async fn notify_team_session_lost(state: &AppState, team_id: &str, session_id: &str, role: &str, reason: &str) {
+    // Fetch the dying session's current task for context
+    let current_task = state.db.get_session_by_id_prefix(&session_id[..8.min(session_id.len())]).await
+        .ok().flatten()
+        .and_then(|s| s.current_task);
+
+    let task_ctx = current_task.as_deref()
+        .map(|t| format!("\n**Last known task**: {}", t))
+        .unwrap_or_default();
+
+    if role == "Team Lead" {
+        // Team Lead died — notify all members
+        let msg = format!(
+            ":rotating_light: **Team Lead session {} ({}).**\nTeam members should save their progress. The Team Lead may reconnect or be re-started.",
+            reason, reason,
+        );
+        broadcast_team_notification(state, team_id, &msg, session_id).await;
+        post_to_coordination_log(state, team_id, &format!(
+            ":rotating_light: **Team Lead** session {} — team members notified", reason,
+        )).await;
+    } else {
+        // Team member died — notify the Team Lead
+        if let Ok(leads) = state.db.get_sessions_by_role(team_id, "Team Lead").await
+            && let Some(lead) = leads.first()
+        {
+            let header = build_team_context_header(&state.db, team_id, "Team Lead").await;
+            let alert_msg = format!(
+                "{}\n:rotating_light: **{} session {}.**{}\n\nOptions:\n- Wait for auto-reconnect (if the worker recovers)\n- Re-spawn the role: [SPAWN:{}] to create a replacement\n- Reassign the work to another team member via [TO:Role]\n\nUse [TEAM_STATUS] to check the current roster.",
+                header, role, reason, task_ctx,
+                // Extract base role name (e.g., "Developer" from "Developer 1")
+                role.split_whitespace().next().unwrap_or(role),
+            );
+            let _ = state.containers.send(&lead.session_id, &alert_msg).await;
+            let _ = state.mm.post_in_thread(
+                &lead.channel_id, &lead.thread_id,
+                &format!(":rotating_light: **{}** session {} — check [TEAM_STATUS]", role, reason),
+            ).await;
+        }
+        post_to_coordination_log(state, team_id, &format!(
+            ":rotating_light: **{}** session {}{}", role, reason, task_ctx,
+        )).await;
+    }
 }
 
 /// Session watchdog: periodically checks for stuck sessions and nudges idle
