@@ -3037,18 +3037,16 @@ The team follows the spec-flow workflow. Coordinate members through these phases
 IMPORTANT: Do NOT spawn Developers until stories have been planned from approved specs.
 
 ## PR Review & Completion
-Team members use the [PR_READY:N] / [PR_REVIEWED:N] review gate. The system ensures they address Claude Reviewer CI comments BEFORE the PR reaches you. When you receive a PR notification:
+Team members use the [PR_READY:N] / [PR_REVIEWED:N] review gate. The Claude Reviewer CI automatically reviews PRs and will APPROVE them once all comments are addressed. PRs only reach you after the Claude Reviewer has approved AND the team member has completed the gate. When you receive a PR notification:
 
-1. **Verify CI passes**: `gh pr checks <number>` — ALL checks must be green, including Claude PR Review
-2. **Review the diff**: `gh pr view <number>` and `gh pr diff <number>`
-3. **Verify review comments are resolved**: `gh api repos/<owner>/<repo>/pulls/<number>/comments` — check that EVERY comment has been addressed with actual code changes
-4. **Reject documentation-only fixes**: If review comments were "resolved" by adding docstrings, comments, or README entries instead of fixing the underlying code/logic/security issue, send the PR back. Documentation does NOT fix code problems — it hides them for later.
-5. **Check ALL severity levels**: Low, medium, high, AND critical comments must all be evaluated. Low-severity items may be deferred with justification, but medium and above must be fixed.
-6. **Verify architectural alignment**: Complex fixes (interface changes, new dependencies, restructuring, security patterns) should have been escalated to the Architect during the review gate. Check that the Architect approved these changes before merging. If you see architectural changes without Architect sign-off, send the PR back.
-7. If changes needed, send SPECIFIC feedback via [TO:Role] with file paths, line numbers, and what needs to change
-8. Wait for fixes before re-reviewing — do not merge until all CI passes AND review comments are properly resolved
-9. After merging implementation PRs, ask Architect to run the spec-flow `architecture` tool to update project docs
-10. Merge with `gh pr merge <number> --squash` ONLY when ALL of the above are satisfied"#,
+1. **Verify Claude Reviewer approved**: `gh pr view <number> --json reviews --jq '.reviews[] | "\(.state): \(.body)"'` — confirm the Claude Reviewer has APPROVED
+2. **Verify all CI passes**: `gh pr checks <number>` — all checks must be green
+3. **Review the diff**: `gh pr view <number>` and `gh pr diff <number>` — sanity-check the implementation
+4. **Verify architectural alignment**: Complex fixes (interface changes, new dependencies, restructuring, security patterns) should have been escalated to the Architect during the review gate. Check that the Architect approved these changes before merging. If you see architectural changes without Architect sign-off, send the PR back.
+5. If changes needed, send SPECIFIC feedback via [TO:Role] with file paths, line numbers, and what needs to change
+6. Wait for fixes before re-reviewing — do not merge until Claude Reviewer has approved and all CI passes
+7. After merging implementation PRs, ask Architect to run the spec-flow `architecture` tool to update project docs
+8. Merge with `gh pr merge <number> --squash` ONLY when ALL of the above are satisfied"#,
     ))
 }
 
@@ -3085,14 +3083,14 @@ Each message you receive will include a [TEAM: ...] header with the current rost
 ## PR Review Gate (IMPORTANT)
 After creating a PR, do NOT send it directly to the Team Lead. Instead use the review gate:
 1. Signal the PR is ready: `[PR_READY:N]` (where N is the PR number)
-2. The system will instruct you to wait for Claude PR Review CI and address all review comments
-3. **Categorise** each review comment as Simple or Complex:
+2. The system will instruct you to wait for the Claude Reviewer CI to post its review
+3. If the Claude Reviewer **APPROVES** → skip to step 7
+4. If it **REQUESTS CHANGES** — categorise each comment as Simple or Complex:
    - **Simple** (fix yourself): code style, naming, missing error handling, missing tests, minor localised bugs, dead code
    - **Complex** (escalate to Architect): interface/API changes, new dependencies, module restructuring, security/auth pattern changes, design pattern deviations, schema changes
-4. Fix Simple issues with actual code changes (documentation-only fixes are NOT acceptable)
-5. For Complex issues: send your proposed solution to the Architect via [TO:Architect] — wait for their feedback, then implement
-6. Push fixes, re-check CI, repeat until clean
-7. Signal completion: `[PR_REVIEWED:N]` — the system will then notify the Team Lead
+5. Fix Simple issues with actual code changes (documentation-only fixes are NOT acceptable)
+6. For Complex issues: send your proposed solution to the Architect via [TO:Architect] — wait for their feedback, then implement. Push fixes and repeat from step 2 until the Claude Reviewer APPROVES.
+7. Signal completion: `[PR_REVIEWED:N]` — the system notifies the Team Lead for final review and merge
 Do NOT use [TO:Team Lead] for PR notifications — use [PR_READY:N] and [PR_REVIEWED:N] instead."#,
         display_name = role.display_name,
         responsibilities = role.responsibilities,
@@ -3698,15 +3696,19 @@ async fn handle_pr_ready(
 
 Before this PR is forwarded to the Team Lead, you MUST complete the following:
 
-### Step 1: Fetch review comments
-Wait for Claude PR Review CI, then fetch all comments:
+### Step 1: Wait for Claude Reviewer and check its decision
 ```
 gh pr checks {pr} --watch
-gh api repos/{repo}/pulls/{pr}/comments --jq '.[] | "[\(.path):\(.line // .original_line)] \(.body)"'
 gh pr view {pr} --json reviews --jq '.reviews[] | "\(.state): \(.body)"'
 ```
+The Claude Reviewer will either **APPROVE** the PR or **REQUEST_CHANGES** with inline comments.
+- If APPROVED with no changes requested → skip to Step 5
+- If CHANGES_REQUESTED → continue to Step 2
 
-### Step 2: Categorise each comment
+### Step 2: Fetch and categorise review comments
+```
+gh api repos/{repo}/pulls/{pr}/comments --jq '.[] | "[\(.path):\(.line // .original_line)] \(.body)"'
+```
 For EVERY review comment, categorise it as **Simple** or **Complex**:
 
 **Simple** — fix directly yourself:
@@ -3725,12 +3727,12 @@ For EVERY review comment, categorise it as **Simple** or **Complex**:
 - Performance-critical changes that alter data flow or concurrency model
 - Database schema changes or migration modifications
 
-### Step 3: Handle Simple fixes
+### Step 3: Fix Simple comments
 Address them with actual code changes. Rules:
 - **Documentation-only fixes are NOT acceptable** — adding comments or docstrings does not resolve code quality, logic, or security issues
 - If a comment is genuinely not applicable, explain why in a brief inline code comment at the relevant line
 
-### Step 4: Escalate Complex fixes to Architect
+### Step 4: Escalate Complex comments to Architect
 For each Complex comment, send a message to the Architect with your proposed solution:
 ```
 [TO:Architect]
@@ -3747,14 +3749,16 @@ Please advise whether this approach is acceptable or suggest an alternative.
 Wait for the Architect's response, then implement their recommended approach.
 If no Architect is on the team, escalate to the Team Lead instead via [TO:Team Lead] with the same format.
 
-### Step 5: Push and re-check
-Push your fixes (this re-triggers CI). Repeat from Step 1 until all comments are resolved and CI passes.
+### Step 4b: Push and re-check
+Push your fixes (this re-triggers CI and the Claude Reviewer). Go back to Step 1.
+Repeat this loop until the Claude Reviewer **APPROVES** the PR.
 
-### Step 6: Signal completion
-Once ALL comments are addressed (Simple fixes applied, Complex fixes approved by Architect and implemented) and CI passes:
+### Step 5: Signal completion
+Once the Claude Reviewer has APPROVED the PR:
 ```
 [PR_REVIEWED:{pr}]
 ```
+This notifies the Team Lead that the PR is ready for final review and merge.
 
 Do NOT use [TO:Team Lead] for this PR until you have completed this gate."#,
         header = header,
@@ -3796,14 +3800,15 @@ async fn handle_pr_reviewed(
     if let Some(lead_session) = lead {
         let header = build_team_context_header(&state.db, team_id, "Team Lead").await;
         let ready_msg = format!(
-            "{}\n**PR #{} from {} — Review Gate Passed**\n\n\
-            This PR has been through the Claude Reviewer CI and {} has addressed all review comments.\n\
+            "{}\n**PR #{} from {} — Claude Reviewer Approved**\n\n\
+            The Claude Reviewer has APPROVED this PR and {} has completed the review gate.\n\
             Please perform your final review:\n\
-            1. `gh pr checks {}` — verify all CI checks pass\n\
-            2. `gh pr diff {}` — review the implementation\n\
-            3. `gh api repos/<owner>/<repo>/pulls/{}/comments --jq '.[] | \"[\\(.path):\\(.line // .original_line)] \\(.body)\"'` — verify review comments are resolved with code changes\n\
-            4. If issues remain, send back to {} via [TO:{}] with specific feedback\n\
-            5. Merge with `gh pr merge {} --squash` when satisfied",
+            1. `gh pr view {} --json reviews` — confirm Claude Reviewer approval\n\
+            2. `gh pr checks {}` — verify all CI checks pass\n\
+            3. `gh pr diff {}` — sanity-check the implementation\n\
+            4. Verify any architectural changes had Architect sign-off\n\
+            5. If issues remain, send back to {} via [TO:{}] with specific feedback\n\
+            6. Merge with `gh pr merge {} --squash` when satisfied",
             header, pr_number, sender_role,
             sender_role,
             pr_number, pr_number, pr_number,
