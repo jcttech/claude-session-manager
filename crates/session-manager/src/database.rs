@@ -854,7 +854,9 @@ impl Database {
 
     // --- Container operations ---
 
-    /// Create a new container record. Returns the generated ID.
+    /// Create or update a container record. Returns the ID.
+    /// Uses upsert so that a stale record (e.g. left as "stopped" after a
+    /// restart) is refreshed in-place rather than causing a duplicate key error.
     pub async fn create_container(
         &self,
         repo: &str,
@@ -865,7 +867,15 @@ impl Database {
     ) -> Result<i64> {
         let row: (i64,) = sqlx::query_as(&format!(
             "INSERT INTO {}.containers (repo, branch, container_name, devcontainer_json_hash, grpc_port) \
-             VALUES ($1, $2, $3, $4, $5) RETURNING id",
+             VALUES ($1, $2, $3, $4, $5) \
+             ON CONFLICT (repo, branch) DO UPDATE SET \
+               container_name = EXCLUDED.container_name, \
+               devcontainer_json_hash = EXCLUDED.devcontainer_json_hash, \
+               grpc_port = EXCLUDED.grpc_port, \
+               state = 'running', \
+               session_count = 0, \
+               last_activity_at = NOW() \
+             RETURNING id",
             SCHEMA
         ))
         .bind(repo)

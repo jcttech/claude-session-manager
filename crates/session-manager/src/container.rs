@@ -597,6 +597,9 @@ impl ContainerManager {
                     error = %e,
                     "Container missing on reconnect, attempting cold-start recovery"
                 );
+                // Clear from registry so cold_start doesn't take the fast-reuse path
+                let _ = self.registry.remove_container(db, repo, branch).await;
+
                 let (new_name, new_port) = self.cold_start(project_path, repo, branch, db).await?;
                 // Update the session's container_name in the DB so future restarts
                 // find the right container.
