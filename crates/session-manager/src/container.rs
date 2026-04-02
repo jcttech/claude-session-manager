@@ -276,8 +276,39 @@ impl ContainerManager {
         // Hash the devcontainer.json for future rebuild detection
         let config_hash = devcontainer::hash_config(project_path).await;
 
-        // Start container via devcontainer up, with override config if repo has its own
+        // Remove orphaned devcontainers for this workspace path.
+        // The devcontainer CLI is idempotent — if a container already exists for this
+        // workspace folder (from a previous lifecycle our registry doesn't know about),
+        // `devcontainer up` tries to reuse it. If that ghost container has mismatched
+        // ports or a broken state, `devcontainer up` hangs. Clean up first.
         let escaped_project_path = shell_escape(project_path);
+        let find_orphan_cmd = format!(
+            "{} ps -aq --filter label=devcontainer.local_folder={}",
+            shell_escape(&s.container_runtime),
+            escaped_project_path,
+        );
+        if let Ok(orphan_ids) = ssh::run_command(&find_orphan_cmd).await {
+            let ids: Vec<&str> = orphan_ids.lines().map(|l| l.trim()).filter(|l| !l.is_empty()).collect();
+            if !ids.is_empty() {
+                tracing::warn!(
+                    project_path = %project_path,
+                    orphan_count = ids.len(),
+                    "Found orphaned devcontainer(s) not in registry, removing before cold start"
+                );
+                for id in &ids {
+                    let rm_cmd = format!(
+                        "{} rm -f {}",
+                        shell_escape(&s.container_runtime),
+                        shell_escape(id),
+                    );
+                    if let Err(e) = ssh::run_command(&rm_cmd).await {
+                        tracing::warn!(container = %id, error = %e, "Failed to remove orphaned container");
+                    }
+                }
+            }
+        }
+
+        // Start container via devcontainer up, with override config if repo has its own
         let devcontainer_cmd = if let Some(ref override_path) = override_path {
             let escaped_override_path = shell_escape(override_path);
             format!(

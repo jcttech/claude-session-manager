@@ -202,6 +202,33 @@ async fn main() -> Result<()> {
         }
     }
 
+    // Evict orphaned devcontainers that exist at the podman level but are not in our registry.
+    // These ghosts cause `devcontainer up` to hang on cold start because the CLI tries to
+    // reuse them even though our registry doesn't know about them.
+    {
+        let s = session_manager::config::settings();
+        let runtime = &s.container_runtime;
+        let known_names: std::collections::HashSet<String> = state.containers.registry.list_all().await
+            .iter().map(|(_, e)| e.container_name.clone()).collect();
+        let list_cmd = format!(
+            "{runtime} ps -a --filter label=devcontainer.local_folder --format '{{{{.ID}}}} {{{{.Names}}}}'"
+        );
+        if let Ok(output) = session_manager::ssh::run_command(&list_cmd).await {
+            for line in output.lines() {
+                let parts: Vec<&str> = line.trim().splitn(2, ' ').collect();
+                if parts.len() < 2 { continue; }
+                let (id, name) = (parts[0], parts[1]);
+                if !known_names.contains(name) && !known_names.contains(id) {
+                    tracing::warn!(
+                        container_id = %id, container_name = %name,
+                        "Removing orphaned devcontainer not in registry"
+                    );
+                    let _ = session_manager::ssh::run_command(&format!("{runtime} rm -f {id}")).await;
+                }
+            }
+        }
+    }
+
     // Resync session counts — correct any drift between registry counts and actual active sessions
     if let Err(e) = state.containers.registry.resync_session_counts(&state.db).await {
         tracing::warn!(error = %e, "Failed to resync session counts on startup");
