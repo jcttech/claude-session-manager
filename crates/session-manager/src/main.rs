@@ -297,6 +297,10 @@ async fn main() -> Result<()> {
                         error = %e,
                         "Failed to reconnect session (container may be gone)"
                     );
+                    // Mark the session stopped so the DB doesn't remain stale — if we
+                    // leave it as 'active' any incoming message on this thread will hit
+                    // containers.send() and get "not found in-memory".
+                    let _ = state.db.update_session_status(&session.session_id, "stopped").await;
                     continue;
                 }
 

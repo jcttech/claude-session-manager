@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use dashmap::DashMap;
 use shell_escape::escape;
 use std::borrow::Cow;
@@ -116,7 +116,9 @@ impl ContainerManager {
             if entry.state != ContainerState::Running {
                 return Err(anyhow!(
                     "Container for {}/{} is in '{}' state, cannot start new session",
-                    repo, branch, entry.state
+                    repo,
+                    branch,
+                    entry.state
                 ));
             }
 
@@ -124,7 +126,9 @@ impl ContainerManager {
             if s.container_max_sessions > 0 && entry.session_count >= s.container_max_sessions {
                 return Err(anyhow!(
                     "Container for {}/{} has reached max sessions ({}). Stop a session first.",
-                    repo, branch, s.container_max_sessions
+                    repo,
+                    branch,
+                    s.container_max_sessions
                 ));
             }
 
@@ -141,14 +145,19 @@ impl ContainerManager {
                     repo, branch
                 ));
                 tracing::warn!(
-                    repo, branch, session_count = entry.session_count,
+                    repo,
+                    branch,
+                    session_count = entry.session_count,
                     "Same-branch concurrent session started"
                 );
             }
 
             // Check devcontainer.json hash for rebuild
             let current_hash = devcontainer::hash_config(project_path).await;
-            if let (Some(stored_hash), Some(current)) = (&entry.devcontainer_json_hash, &current_hash) && stored_hash != current {
+            if let (Some(stored_hash), Some(current)) =
+                (&entry.devcontainer_json_hash, &current_hash)
+                && stored_hash != current
+            {
                 tracing::warn!(
                     repo, branch,
                     %stored_hash, current_hash = %current,
@@ -168,7 +177,11 @@ impl ContainerManager {
                 "Reusing existing container (fast path)"
             );
             // grpc_port=0 means pre-migration container — fall back to config default
-            let port = if entry.grpc_port == 0 { s.grpc_port_start } else { entry.grpc_port };
+            let port = if entry.grpc_port == 0 {
+                s.grpc_port_start
+            } else {
+                entry.grpc_port
+            };
             (entry.container_name.clone(), port)
         } else {
             // Cold start: no existing container, run devcontainer up
@@ -194,11 +207,15 @@ impl ContainerManager {
                         repo, branch, container = %container_name, error = %e,
                         "Container no longer exists, removing from registry"
                     );
-                    self.registry.decrement_sessions(db, repo, branch).await.ok();
+                    self.registry
+                        .decrement_sessions(db, repo, branch)
+                        .await
+                        .ok();
                     self.registry.remove_container(db, repo, branch).await.ok();
                     return Err(anyhow!(
                         "Container for {}/{} no longer exists (removed from registry). Retry to create a new one.",
-                        repo, branch
+                        repo,
+                        branch
                     ));
                 }
             }
@@ -213,10 +230,19 @@ impl ContainerManager {
         // Set up message channel, connect gRPC, and spawn processor
         let reused = existing.is_some();
         self.create_session_internal(
-            session_id, &container_name, project_path, repo, branch,
-            output_tx, plan_mode, thinking_mode, session_type, grpc_port,
+            session_id,
+            &container_name,
+            project_path,
+            repo,
+            branch,
+            output_tx,
+            plan_mode,
+            thinking_mode,
+            session_type,
+            grpc_port,
             system_prompt_append,
-        ).await?;
+        )
+        .await?;
 
         Ok(StartResult {
             container_name,
@@ -243,7 +269,10 @@ impl ContainerManager {
         let vm_used_ports = get_vm_used_ports().await;
 
         // Allocate a unique port for this container
-        let grpc_port = self.registry.allocate_port(s.grpc_port_start, &vm_used_ports).await;
+        let grpc_port = self
+            .registry
+            .allocate_port(s.grpc_port_start, &vm_used_ports)
+            .await;
 
         // Read existing devcontainer.json content (if any)
         let existing_config = devcontainer::read_config_content(project_path).await;
@@ -288,7 +317,11 @@ impl ContainerManager {
             escaped_project_path,
         );
         if let Ok(orphan_ids) = ssh::run_command(&find_orphan_cmd).await {
-            let ids: Vec<&str> = orphan_ids.lines().map(|l| l.trim()).filter(|l| !l.is_empty()).collect();
+            let ids: Vec<&str> = orphan_ids
+                .lines()
+                .map(|l| l.trim())
+                .filter(|l| !l.is_empty())
+                .collect();
             if !ids.is_empty() {
                 tracing::warn!(
                     project_path = %project_path,
@@ -331,7 +364,12 @@ impl ContainerManager {
             .output();
         let output = tokio::time::timeout(timeout, output_future)
             .await
-            .map_err(|_| anyhow!("devcontainer up timed out after {}s", s.devcontainer_timeout_secs))??;
+            .map_err(|_| {
+                anyhow!(
+                    "devcontainer up timed out after {}s",
+                    s.devcontainer_timeout_secs
+                )
+            })??;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -342,7 +380,8 @@ impl ContainerManager {
         let output_str = String::from_utf8_lossy(&output.stdout);
         let json: serde_json::Value = serde_json::from_str(output_str.trim())
             .map_err(|e| anyhow!("Failed to parse devcontainer output: {}", e))?;
-        let container_name = json["containerId"].as_str()
+        let container_name = json["containerId"]
+            .as_str()
             .ok_or_else(|| anyhow!("No containerId in devcontainer output"))?
             .to_string();
 
@@ -372,7 +411,8 @@ impl ContainerManager {
                 let _ = ssh::run_command(&rm_cmd).await;
                 return Err(anyhow!(
                     "Removed stale container for wrong workspace (expected {}, got {}). Retry will create a fresh container.",
-                    project_path, label
+                    project_path,
+                    label
                 ));
             }
         }
@@ -381,9 +421,14 @@ impl ContainerManager {
         // If postStartCommand didn't start the worker (e.g. override config merge issue),
         // fall back to starting it via SSH.
         let grpc_addr = format!("http://{}:{}", s.vm_host, grpc_port);
-        if crate::grpc::wait_for_health(&grpc_addr, 10, Duration::from_secs(1)).await.is_err() {
+        if crate::grpc::wait_for_health(&grpc_addr, 10, Duration::from_secs(1))
+            .await
+            .is_err()
+        {
             tracing::warn!(
-                repo, branch, grpc_port,
+                repo,
+                branch,
+                grpc_port,
                 "postStartCommand worker not responding, starting via SSH fallback"
             );
             ensure_worker_running(&container_name, &grpc_addr).await?;
@@ -391,7 +436,14 @@ impl ContainerManager {
 
         // Register container in registry and database, with session_count = 1
         self.registry
-            .register_container(db, repo, branch, &container_name, config_hash.as_deref(), grpc_port)
+            .register_container(
+                db,
+                repo,
+                branch,
+                &container_name,
+                config_hash.as_deref(),
+                grpc_port,
+            )
             .await?;
         self.registry.increment_sessions(db, repo, branch).await?;
 
@@ -435,10 +487,8 @@ impl ContainerManager {
         };
 
         // Open bidirectional stream with timeout
-        let grpc_stream = tokio::time::timeout(
-            Duration::from_secs(30),
-            executor.open_stream(),
-        ).await
+        let grpc_stream = tokio::time::timeout(Duration::from_secs(30), executor.open_stream())
+            .await
             .map_err(|_| anyhow!("gRPC open_stream timed out after 30s (handshake deadlock?)"))?
             .map_err(|e| anyhow!("Failed to open gRPC stream: {}", e))?;
 
@@ -473,7 +523,8 @@ impl ContainerManager {
                 container_name_owned,
                 grpc_addr_owned,
                 system_prompt_owned,
-            ).await;
+            )
+            .await;
         });
 
         self.sessions.insert(
@@ -499,8 +550,11 @@ impl ContainerManager {
     }
 
     /// Reconnect to an existing session after a restart.
-    /// Creates in-memory state (channels, message_processor) without running `devcontainer up`.
-    /// The container must already be running.
+    /// Tries progressively harder recovery:
+    ///  1. If the container is stopped, start it and reconnect the gRPC worker.
+    ///  2. If the container is gone entirely, cold-start a new one (devcontainer up).
+    ///
+    /// Creates in-memory state (channels, message_processor) in all success paths.
     #[allow(clippy::too_many_arguments)]
     pub async fn reconnect(
         &self,
@@ -520,15 +574,72 @@ impl ContainerManager {
             tracing::warn!(error = %e, "Failed to resync session counts before reconnect");
         }
 
+        // Determine the actual container name and gRPC port to use.
+        // If the container is stopped, start it. If it's gone, run a full cold start.
+        let (effective_container, effective_port) = match ensure_container_started(container_name)
+            .await
+        {
+            Ok(restarted) => {
+                if restarted {
+                    tracing::info!(
+                        session_id = %session_id,
+                        container = %container_name,
+                        "Container was stopped, restarted it for reconnect"
+                    );
+                }
+                (container_name.to_string(), grpc_port)
+            }
+            Err(e) => {
+                // Container is gone — run devcontainer up to recreate it.
+                tracing::warn!(
+                    session_id = %session_id,
+                    container = %container_name,
+                    error = %e,
+                    "Container missing on reconnect, attempting cold-start recovery"
+                );
+                let (new_name, new_port) = self.cold_start(project_path, repo, branch, db).await?;
+                // Update the session's container_name in the DB so future restarts
+                // find the right container.
+                if let Err(db_err) = db
+                    .update_session_container_name(session_id, &new_name)
+                    .await
+                {
+                    tracing::warn!(
+                        session_id = %session_id,
+                        error = %db_err,
+                        "Failed to update session container_name after cold-start recovery"
+                    );
+                }
+                tracing::info!(
+                    session_id = %session_id,
+                    old_container = %container_name,
+                    new_container = %new_name,
+                    new_port,
+                    "Cold-started replacement container for reconnect"
+                );
+                (new_name, new_port)
+            }
+        };
+
         self.create_session_internal(
-            session_id, container_name, project_path, repo, branch,
-            output_tx, false, false, session_type, grpc_port, system_prompt_append,
-        ).await?;
+            session_id,
+            &effective_container,
+            project_path,
+            repo,
+            branch,
+            output_tx,
+            false,
+            false,
+            session_type,
+            effective_port,
+            system_prompt_append,
+        )
+        .await?;
 
         tracing::info!(
             session_id = %session_id,
-            container = %container_name,
-            grpc_port,
+            container = %effective_container,
+            grpc_port = effective_port,
             "Reconnected session (fresh conversation)"
         );
         Ok(())
@@ -540,7 +651,10 @@ impl ContainerManager {
                 session.message_tx.send(text.to_string()).await?;
             }
             None => {
-                return Err(anyhow!("Session {} not found in-memory (stale DB record after restart?)", session_id));
+                return Err(anyhow!(
+                    "Session {} not found in-memory (stale DB record after restart?)",
+                    session_id
+                ));
             }
         }
         Ok(())
@@ -557,12 +671,14 @@ impl ContainerManager {
     /// wins the race (removes the entry), `None` if already claimed by another.
     /// Includes repo/branch so the caller can decrement the container's session count.
     pub fn claim_session(&self, session_id: &str) -> Option<ClaimedSession> {
-        self.sessions.remove(session_id).map(|(_, session)| ClaimedSession {
-            name: session.name,
-            worktree_path: session.worktree_path,
-            repo: session.repo,
-            branch: session.branch,
-        })
+        self.sessions
+            .remove(session_id)
+            .map(|(_, session)| ClaimedSession {
+                name: session.name,
+                worktree_path: session.worktree_path,
+                repo: session.repo,
+                branch: session.branch,
+            })
     }
 
     /// Decrement the session count for a container after a session is stopped.
@@ -582,9 +698,7 @@ impl ContainerManager {
         );
 
         let timeout = Duration::from_secs(s.ssh_timeout_secs);
-        let output_future = ssh::command()?
-            .arg(ssh::login_shell(&rm_cmd))
-            .output();
+        let output_future = ssh::command()?.arg(ssh::login_shell(&rm_cmd)).output();
         tokio::time::timeout(timeout, output_future)
             .await
             .map_err(|_| anyhow!("Container removal timed out after {}s", s.ssh_timeout_secs))??;
@@ -595,7 +709,9 @@ impl ContainerManager {
     /// Resets the first-message flag and clears the Claude session ID
     /// so the next message starts a fresh conversation.
     pub async fn restart_session(&self, session_id: &str) -> Result<()> {
-        let session = self.sessions.get(session_id)
+        let session = self
+            .sessions
+            .get(session_id)
             .ok_or_else(|| anyhow!("Session {} not found", session_id))?;
         session.is_first_message.store(true, Ordering::SeqCst);
         *session.claude_session_id.lock().unwrap() = None;
@@ -619,7 +735,9 @@ impl ContainerManager {
     /// Interrupt a running Claude session via a separate gRPC unary RPC.
     /// Returns Ok(true) if interrupted, Ok(false) if no active session.
     pub async fn interrupt(&self, session_id: &str) -> Result<bool> {
-        let session = self.sessions.get(session_id)
+        let session = self
+            .sessions
+            .get(session_id)
             .ok_or_else(|| anyhow!("Session {} not found", session_id))?;
 
         let claude_sid = session.claude_session_id.lock().unwrap().clone();
@@ -677,7 +795,11 @@ impl ContainerManager {
 
     /// Find and claim all sessions that belong to a given (repo, branch) container.
     /// Returns the list of claimed sessions.
-    pub fn stop_all_sessions_for_container(&self, repo: &str, branch: &str) -> Vec<(String, ClaimedSession)> {
+    pub fn stop_all_sessions_for_container(
+        &self,
+        repo: &str,
+        branch: &str,
+    ) -> Vec<(String, ClaimedSession)> {
         // First, collect session IDs that match the repo/branch
         let matching_ids: Vec<String> = self
             .sessions
@@ -690,12 +812,15 @@ impl ContainerManager {
         let mut claimed = Vec::new();
         for session_id in matching_ids {
             if let Some((id, session)) = self.sessions.remove(&session_id) {
-                claimed.push((id, ClaimedSession {
-                    name: session.name,
-                    worktree_path: session.worktree_path,
-                    repo: session.repo,
-                    branch: session.branch,
-                }));
+                claimed.push((
+                    id,
+                    ClaimedSession {
+                        name: session.name,
+                        worktree_path: session.worktree_path,
+                        repo: session.repo,
+                        branch: session.branch,
+                    },
+                ));
             }
         }
         claimed
@@ -716,7 +841,9 @@ impl ContainerManager {
             .map(|e| e.container_name);
 
         // Remove container via SSH
-        if let Some(ref name) = container_name && let Err(e) = self.remove_container_by_name(name).await {
+        if let Some(ref name) = container_name
+            && let Err(e) = self.remove_container_by_name(name).await
+        {
             tracing::warn!(
                 container = %name, repo, branch, error = %e,
                 "Failed to remove container via SSH (may already be gone)"
@@ -727,7 +854,8 @@ impl ContainerManager {
         self.registry.remove_container(db, repo, branch).await?;
 
         tracing::info!(
-            repo, branch,
+            repo,
+            branch,
             container = container_name.as_deref().unwrap_or("unknown"),
             "Container torn down"
         );
@@ -800,14 +928,21 @@ pub async fn ensure_container_started(container_name: &str) -> Result<bool> {
     }
 
     // Container exists but is stopped — start it
-    tracing::info!(container_name, "Container is stopped, starting via podman/docker");
+    tracing::info!(
+        container_name,
+        "Container is stopped, starting via podman/docker"
+    );
     let start_cmd = format!(
         "{} start {}",
         shell_escape(&s.container_runtime),
         escaped_name,
     );
     ssh::run_command(&start_cmd).await.map_err(|e| {
-        anyhow!("Failed to start stopped container {}: {}", container_name, e)
+        anyhow!(
+            "Failed to start stopped container {}: {}",
+            container_name,
+            e
+        )
     })?;
 
     tracing::info!(container_name, "Container restarted successfully");
@@ -824,7 +959,10 @@ async fn ensure_worker_running(container_name: &str, grpc_addr: &str) -> Result<
         return Ok(());
     }
 
-    tracing::warn!(container_name, "Agent worker not responding, starting via SSH");
+    tracing::warn!(
+        container_name,
+        "Agent worker not responding, starting via SSH"
+    );
 
     let s = settings();
     let start_cmd = format!(
@@ -903,28 +1041,38 @@ async fn message_processor(
                     } else {
                         "bypassPermissions"
                     };
-                    let thinking_tokens = if thinking_mode.load(Ordering::SeqCst) { 10000 } else { 0 };
+                    let thinking_tokens = if thinking_mode.load(Ordering::SeqCst) {
+                        10000
+                    } else {
+                        0
+                    };
                     let resume_sid = claude_session_id.lock().unwrap().clone();
 
                     let _ = output_tx
                         .send(OutputEvent::ProcessingStarted { input_tokens: 0 })
                         .await;
 
-                    let send_result = stream.as_mut().unwrap().create(
-                        &message,
-                        permission_mode,
-                        std::collections::HashMap::new(),
-                        &system_prompt_append,
-                        thinking_tokens,
-                        resume_sid.as_deref(),
-                    ).await;
+                    let send_result = stream
+                        .as_mut()
+                        .unwrap()
+                        .create(
+                            &message,
+                            permission_mode,
+                            std::collections::HashMap::new(),
+                            &system_prompt_append,
+                            thinking_tokens,
+                            resume_sid.as_deref(),
+                        )
+                        .await;
 
                     if let Err(e) = send_result {
                         tracing::error!(session_id = %session_id, error = %e, "Failed to send after reconnect");
-                        let _ = output_tx.send(OutputEvent::ProcessDied {
-                            exit_code: Some(1),
-                            signal: Some(format!("Reconnect send error: {}", e)),
-                        }).await;
+                        let _ = output_tx
+                            .send(OutputEvent::ProcessDied {
+                                exit_code: Some(1),
+                                signal: Some(format!("Reconnect send error: {}", e)),
+                            })
+                            .await;
                         break;
                     }
 
@@ -934,10 +1082,12 @@ async fn message_processor(
                 }
                 Err(e) => {
                     tracing::error!(session_id = %session_id, error = %e, "Reconnect failed");
-                    let _ = output_tx.send(OutputEvent::ProcessDied {
-                        exit_code: Some(1),
-                        signal: Some(format!("Reconnect failed: {}", e)),
-                    }).await;
+                    let _ = output_tx
+                        .send(OutputEvent::ProcessDied {
+                            exit_code: Some(1),
+                            signal: Some(format!("Reconnect failed: {}", e)),
+                        })
+                        .await;
                     break;
                 }
             }

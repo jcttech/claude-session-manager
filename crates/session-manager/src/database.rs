@@ -701,6 +701,24 @@ impl Database {
         Ok(())
     }
 
+    /// Update the container name stored on a session (used when a cold-start recovery
+    /// creates a new container for an existing session).
+    pub async fn update_session_container_name(
+        &self,
+        session_id: &str,
+        container_name: &str,
+    ) -> Result<()> {
+        sqlx::query(&format!(
+            "UPDATE {}.sessions SET container_name = $1 WHERE session_id = $2",
+            SCHEMA
+        ))
+        .bind(container_name)
+        .bind(session_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     /// Update session status (active/stopped/disconnected).
     pub async fn update_session_status(
         &self,
