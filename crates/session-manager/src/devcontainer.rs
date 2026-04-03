@@ -30,7 +30,7 @@ pub fn generate_default_config(image: &str, network: &str, port: u16) -> String 
         "ANTHROPIC_API_KEY": "${{localEnv:ANTHROPIC_API_KEY}}"
     }},
     "postStartCommand": "python3 -m agent_worker --port 50051 &",
-    "runArgs": ["--network={}", "-p", "{}:50051"]
+    "runArgs": ["--network={}", "-p", "{}:50051", "--label", "csm.managed=true"]
 }}"#,
         image, network, port
     )
@@ -60,7 +60,8 @@ pub fn build_override_config(original_content: &str, port: u16) -> anyhow::Resul
     let mut config: serde_json::Value = serde_json::from_str(&stripped)
         .map_err(|e| anyhow::anyhow!("Failed to parse devcontainer.json: {}", e))?;
 
-    let obj = config.as_object_mut()
+    let obj = config
+        .as_object_mut()
         .ok_or_else(|| anyhow::anyhow!("devcontainer.json is not a JSON object"))?;
 
     // Set postStartCommand for agent worker
@@ -81,7 +82,8 @@ pub fn build_override_config(original_content: &str, port: u16) -> anyhow::Resul
     let mut i = 0;
     while i < run_args.len() {
         let s = run_args[i].as_str().unwrap_or("");
-        if s == "-p" && i + 1 < run_args.len()
+        if s == "-p"
+            && i + 1 < run_args.len()
             && run_args[i + 1].as_str().unwrap_or("").contains(":50051")
         {
             run_args.remove(i + 1);
@@ -96,6 +98,16 @@ pub fn build_override_config(original_content: &str, port: u16) -> anyhow::Resul
     run_args.push(serde_json::Value::String("-p".to_string()));
     run_args.push(serde_json::Value::String(format!("{}:50051", port)));
 
+    // Mark container as managed by claude-session-manager so orphan cleanup
+    // can distinguish CSM containers from manually-created devcontainers.
+    if !run_args
+        .iter()
+        .any(|v| v.as_str() == Some("csm.managed=true"))
+    {
+        run_args.push(serde_json::Value::String("--label".to_string()));
+        run_args.push(serde_json::Value::String("csm.managed=true".to_string()));
+    }
+
     obj.insert("runArgs".to_string(), serde_json::Value::Array(run_args));
 
     serde_json::to_string_pretty(&config)
@@ -107,10 +119,7 @@ pub fn build_override_config(original_content: &str, port: u16) -> anyhow::Resul
 pub async fn write_override_config(port: u16, config: &str) -> anyhow::Result<String> {
     let path = format!("/tmp/sm-override-{}.json", port);
     let escaped_path = escape(Cow::Borrowed(&path));
-    let write_cmd = format!(
-        "cat > {} << 'OCEOF'\n{}\nOCEOF",
-        escaped_path, config
-    );
+    let write_cmd = format!("cat > {} << 'OCEOF'\n{}\nOCEOF", escaped_path, config);
     ssh::run_command(&write_cmd).await?;
     Ok(path)
 }
@@ -221,7 +230,7 @@ impl DevcontainerConfig {
 /// Compute a SHA-256 hash of the devcontainer.json content on the VM.
 /// Returns `None` if the file doesn't exist or can't be read.
 pub async fn hash_config(project_path: &str) -> Option<String> {
-    use sha2::{Sha256, Digest};
+    use sha2::{Digest, Sha256};
     let escaped = escape(Cow::Borrowed(project_path));
 
     // Try both locations
@@ -396,9 +405,18 @@ mod tests {
         assert_eq!(parsed["image"].as_str(), Some("ghcr.io/org/repo:latest"));
         assert_eq!(parsed["containerEnv"]["FOO"].as_str(), Some("bar"));
         // Adds our properties
-        assert!(parsed["postStartCommand"].as_str().unwrap().contains("agent_worker"));
-        let run_args: Vec<&str> = parsed["runArgs"].as_array().unwrap()
-            .iter().filter_map(|v| v.as_str()).collect();
+        assert!(
+            parsed["postStartCommand"]
+                .as_str()
+                .unwrap()
+                .contains("agent_worker")
+        );
+        let run_args: Vec<&str> = parsed["runArgs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
         assert!(run_args.contains(&"-p"));
         assert!(run_args.contains(&"50053:50051"));
     }
@@ -411,8 +429,12 @@ mod tests {
         }"#;
         let result = build_override_config(original, 50055).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
-        let run_args: Vec<&str> = parsed["runArgs"].as_array().unwrap()
-            .iter().filter_map(|v| v.as_str()).collect();
+        let run_args: Vec<&str> = parsed["runArgs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
         // Existing network preserved, old port replaced, custom args preserved
         assert!(run_args.contains(&"--network=old-net"));
         assert!(run_args.contains(&"50055:50051"));
