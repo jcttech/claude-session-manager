@@ -245,7 +245,7 @@ pub async fn hash_config(project_path: &str) -> Option<String> {
 
     let mut hasher = Sha256::new();
     hasher.update(content.as_bytes());
-    Some(format!("{:x}", hasher.finalize()))
+    Some(hex::encode(hasher.finalize()))
 }
 
 /// Find the start index of a `//` line comment outside of a JSON string.

@@ -122,6 +122,11 @@ struct CallbackResponse {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Install the ring crypto provider for rustls before any TLS connections
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("Failed to install rustls crypto provider");
+
     // Load .env file if present (dev only, non-fatal in production)
     let _ = dotenvy::dotenv();
 
@@ -294,7 +299,7 @@ async fn main() -> Result<()> {
                 )
                 .await;
 
-                if let Err(e) = state
+                let reconnect_result = state
                     .containers
                     .reconnect(
                         &session.session_id,
@@ -309,21 +314,55 @@ async fn main() -> Result<()> {
                         reconnect_prompt.as_deref(),
                         session.claude_session_id.as_deref(),
                     )
-                    .await
-                {
-                    tracing::warn!(
-                        session_id = %session.session_id,
-                        error = %e,
-                        "Failed to reconnect session (container may be gone)"
-                    );
-                    // Mark the session stopped so the DB doesn't remain stale — if we
-                    // leave it as 'active' any incoming message on this thread will hit
-                    // containers.send() and get "not found in-memory".
-                    let _ = state
-                        .db
-                        .update_session_status(&session.session_id, "stopped")
-                        .await;
-                    continue;
+                    .await;
+
+                match reconnect_result {
+                    Err(e) => {
+                        tracing::warn!(
+                            session_id = %session.session_id,
+                            error = %e,
+                            "Failed to reconnect session (container may be gone)"
+                        );
+                        // Mark the session stopped so the DB doesn't remain stale — if we
+                        // leave it as 'active' any incoming message on this thread will hit
+                        // containers.send() and get "not found in-memory".
+                        let _ = state
+                            .db
+                            .update_session_status(&session.session_id, "stopped")
+                            .await;
+                        // If the session had a pending task, notify the team lead
+                        if session.pending_task_from.is_some()
+                            && let Some(ref tid) = session.team_id
+                        {
+                            let role = session.role.as_deref().unwrap_or("Unknown");
+                            let task = session.current_task.as_deref().unwrap_or("unknown task");
+                            notify_context_lost(&state, tid, &session.session_id, role, task).await;
+                        }
+                        continue;
+                    }
+                    Ok(cold_started) => {
+                        // CSM restarted — all sessions are reconnecting.
+                        // If the member had a pending task, mark context as lost
+                        // so the Team Lead knows to re-assign.
+                        if session.pending_task_from.is_some() {
+                            let role = session.role.as_deref().unwrap_or("Unknown");
+                            let task = session.current_task.as_deref().unwrap_or("unknown task");
+                            let marker = if cold_started {
+                                format!("Context lost (new container) — was: {}", task)
+                            } else {
+                                format!("Context lost (CSM restart) — was: {}", task)
+                            };
+                            let _ = state.db.set_pending_task(
+                                &session.session_id, "", &marker,
+                            ).await;
+                            // Clear pending_task_from so the member shows as idle/available
+                            let _ = state.db.clear_pending_task(&session.session_id).await;
+
+                            if let Some(ref tid) = session.team_id {
+                                notify_context_lost(&state, tid, &session.session_id, role, task).await;
+                            }
+                        }
+                    }
                 }
 
                 // Register for liveness tracking
@@ -1522,7 +1561,7 @@ async fn handle_messages(
                                 )
                                 .await
                             {
-                                Ok(()) => {
+                                Ok(_cold_started) => {
                                     // Register liveness
                                     state.liveness.register(&new_session_id);
 
@@ -4553,6 +4592,53 @@ async fn notify_team_session_lost(
         )
         .await;
     }
+}
+
+/// Notify the Team Lead that a member lost context and needs task re-assignment.
+/// Called on CSM restart or when a session reconnects via cold start.
+async fn notify_context_lost(
+    state: &AppState,
+    team_id: &str,
+    _session_id: &str,
+    role: &str,
+    previous_task: &str,
+) {
+    if let Ok(leads) = state.db.get_sessions_by_role(team_id, "Team Lead").await
+        && let Some(lead) = leads.first()
+    {
+        let header = build_team_context_header(&state.db, team_id, "Team Lead").await;
+        let alert_msg = format!(
+            "{}\n:recycle: **{} lost context** (session reconnected on new container).\n\
+            **Previous task**: {}\n\n\
+            This member is now idle and needs a new task assignment. \
+            Their previous work-in-progress may be partially committed.\n\
+            - Check their branch for any uncommitted work: use [TO:{}] to ask them to report status\n\
+            - Re-assign the task via [TO:{}] if it still needs to be done\n\
+            - Use [TEAM_STATUS] to see the full roster",
+            header, role, previous_task, role, role,
+        );
+        let _ = state.containers.send(&lead.session_id, &alert_msg).await;
+        let _ = state
+            .mm
+            .post_in_thread(
+                &lead.channel_id,
+                &lead.thread_id,
+                &format!(
+                    ":recycle: **{}** lost context — was working on: {}. Now idle, needs re-assignment.",
+                    role, truncate_preview(previous_task, 200),
+                ),
+            )
+            .await;
+    }
+    post_to_coordination_log(
+        state,
+        team_id,
+        &format!(
+            ":recycle: **{}** lost context (reconnect). Previous task: {}",
+            role, truncate_preview(previous_task, 200),
+        ),
+    )
+    .await;
 }
 
 /// Session watchdog: periodically checks for stuck sessions and nudges idle

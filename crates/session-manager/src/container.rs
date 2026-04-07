@@ -563,6 +563,7 @@ impl ContainerManager {
     ///  2. If the container is gone entirely, cold-start a new one (devcontainer up).
     ///
     /// Creates in-memory state (channels, message_processor) in all success paths.
+    /// Returns `true` if a cold start was required (context is likely lost).
     #[allow(clippy::too_many_arguments)]
     pub async fn reconnect(
         &self,
@@ -577,7 +578,7 @@ impl ContainerManager {
         grpc_port: u16,
         system_prompt_append: Option<&str>,
         claude_session_id: Option<&str>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         // Resync session counts before reconnecting
         if let Err(e) = self.registry.resync_session_counts(db).await {
             tracing::warn!(error = %e, "Failed to resync session counts before reconnect");
@@ -585,6 +586,7 @@ impl ContainerManager {
 
         // Determine the actual container name and gRPC port to use.
         // If the container is stopped, start it. If it's gone, run a full cold start.
+        let mut cold_started = false;
         let (effective_container, effective_port) = match ensure_container_started(container_name)
             .await
         {
@@ -606,6 +608,7 @@ impl ContainerManager {
                     error = %e,
                     "Container missing on reconnect, attempting cold-start recovery"
                 );
+                cold_started = true;
                 // Clear from registry so cold_start doesn't take the fast-reuse path
                 let _ = self.registry.remove_container(db, repo, branch).await;
 
@@ -654,9 +657,10 @@ impl ContainerManager {
             container = %effective_container,
             grpc_port = effective_port,
             resume = claude_session_id.is_some(),
+            cold_started,
             "Reconnected session"
         );
-        Ok(())
+        Ok(cold_started)
     }
 
     pub async fn send(&self, session_id: &str, text: &str) -> Result<()> {
