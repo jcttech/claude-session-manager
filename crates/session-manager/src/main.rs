@@ -93,6 +93,9 @@ struct AppState {
     spawn_locks: DashMap<String, Arc<tokio::sync::Mutex<()>>>,
     /// Shared coordination channel ID for team coordination logs
     coordination_channel_id: tokio::sync::RwLock<Option<String>>,
+    /// PRs that have passed the [PR_REVIEWED] gate, keyed by "team_id:pr_number".
+    /// Only PRs in this set should be merged by the Team Lead.
+    reviewed_prs: DashMap<String, ()>,
 }
 
 #[derive(Deserialize)]
@@ -156,6 +159,7 @@ async fn main() -> Result<()> {
         liveness,
         spawn_locks: DashMap::new(),
         coordination_channel_id: tokio::sync::RwLock::new(coordination_channel_id),
+        reviewed_prs: DashMap::new(),
     });
 
     // Sync container registry from database
@@ -303,6 +307,7 @@ async fn main() -> Result<()> {
                         output_tx,
                         reconnect_grpc_port,
                         reconnect_prompt.as_deref(),
+                        session.claude_session_id.as_deref(),
                     )
                     .await
                 {
@@ -1513,6 +1518,7 @@ async fn handle_messages(
                                     output_tx,
                                     grpc_port,
                                     system_prompt.as_deref(),
+                                    stopped.claude_session_id.as_deref(),
                                 )
                                 .await
                             {
@@ -3159,10 +3165,29 @@ async fn build_team_context_header(db: &Database, team_id: &str, recipient_role:
 }
 
 /// Build context header from a pre-fetched member list (avoids repeated DB queries).
+/// Includes task status so the recipient can see who is busy vs idle.
 fn format_team_context_header(members: &[StoredSession], recipient_role: &str) -> String {
-    let member_list: Vec<String> = members.iter().filter_map(|m| m.role.clone()).collect();
+    let member_list: Vec<String> = members
+        .iter()
+        .filter_map(|m| {
+            let role = m.role.as_deref()?;
+            let status = if m.pending_task_from.is_some() {
+                let task_preview = m
+                    .current_task
+                    .as_deref()
+                    .unwrap_or("task")
+                    .chars()
+                    .take(40)
+                    .collect::<String>();
+                format!("{} (busy: {})", role, task_preview)
+            } else {
+                format!("{} (idle)", role)
+            };
+            Some(status)
+        })
+        .collect();
     format!(
-        "[TEAM: You are {}. Active members: {}. \
+        "[TEAM: You are {}. Members: {}. \
          Use markers to communicate: [SPAWN:Role] task, [TO:Role] message, [BROADCAST] message, [TEAM_STATUS]]",
         recipient_role,
         member_list.join(", ")
@@ -3250,7 +3275,11 @@ The team follows the spec-flow workflow. Coordinate members through these phases
 IMPORTANT: Do NOT spawn Developers until stories have been planned from approved specs.
 
 ## PR Review & Completion
-Team members use the [PR_READY:N] / [PR_REVIEWED:N] review gate. The Claude Reviewer CI automatically reviews PRs and will APPROVE them once all comments are addressed. PRs only reach you after the Claude Reviewer has approved AND the team member has completed the gate. When you receive a PR notification:
+Team members use the [PR_READY:N] / [PR_REVIEWED:N] review gate. The Claude Reviewer CI automatically reviews PRs and will APPROVE them once all comments are addressed. PRs only reach you after the Claude Reviewer has approved AND the team member has completed the gate.
+
+**CRITICAL MERGE RULE**: NEVER merge a PR unless you received an explicit "review gate PASSED" notification from the system for that specific PR number. If a team member mentions a PR via [TO:Team Lead] without the review gate notification, do NOT merge it — tell them to use [PR_READY:N] first. Only PRs delivered to you with "review gate PASSED" in the message are cleared for merge.
+
+When you receive a review-gate-passed PR notification:
 
 1. **Verify Claude Reviewer approved**: `gh pr view <number> --json reviews --jq '.reviews[] | "\(.state): \(.body)"'` — confirm the Claude Reviewer has APPROVED
 2. **Verify all CI passes**: `gh pr checks <number>` — all checks must be green
@@ -3443,10 +3472,62 @@ async fn route_team_message(
         }
     }
 
-    // Deliver to all matching sessions (fetch member list once)
+    // Deliver to matching sessions (fetch member list once)
     let members = state.db.get_team_members(team_id).await.unwrap_or_default();
+
+    // Determine if this is a prefix match (e.g., [TO:Developer] matching Developer 1, Developer 2).
+    // Exact match (e.g., [TO:Developer 1]) targets just that one session.
+    let is_prefix_match = targets.len() > 1
+        || (targets.len() == 1
+            && targets[0]
+                .role
+                .as_deref()
+                .map(|r| r != target_role)
+                .unwrap_or(false));
+
+    // When a prefix match hits multiple members, pick ONE idle member instead of
+    // fanning out the same task to everyone. This prevents duplicate work.
+    let effective_targets: Vec<&StoredSession> = if is_prefix_match && targets.len() > 1 {
+        // Prefer idle members (no pending task from anyone)
+        let idle: Vec<&StoredSession> = targets
+            .iter()
+            .filter(|t| t.pending_task_from.is_none())
+            .collect();
+        if idle.is_empty() {
+            // All busy — reject with a clear message listing who is busy
+            let busy_list: Vec<String> = targets
+                .iter()
+                .filter_map(|t| {
+                    let role = t.role.as_deref()?;
+                    let task = t.current_task.as_deref().unwrap_or("unknown task");
+                    Some(format!("{} (busy: {})", role, task))
+                })
+                .collect();
+            if let Ok(Some(sender)) = state
+                .db
+                .get_session_by_id_prefix(&sender_session_id[..8.min(sender_session_id.len())])
+                .await
+            {
+                let header = format_team_context_header(&members, sender_role);
+                let _ = state.containers.send(&sender.session_id, &format!(
+                    "{}\nAll {} members are busy: {}. Wait for one to finish, or use [TEAM_STATUS] to check progress.",
+                    header, target_role, busy_list.join(", "),
+                )).await;
+                let _ = state.mm.post_in_thread(
+                    &sender.channel_id, &sender.thread_id,
+                    &format!(":hourglass: All **{}** members are busy. Wait for a response.", target_role),
+                ).await;
+            }
+            return;
+        }
+        // Pick the first idle member (deterministic, lowest instance number)
+        vec![idle[0]]
+    } else {
+        targets.iter().collect()
+    };
+
     let mut delivered_roles = Vec::new();
-    for target in &targets {
+    for target in &effective_targets {
         let role = target.role.as_deref().unwrap_or(target_role);
 
         // Hard gate: check if target already has a pending task from the same sender
@@ -4048,6 +4129,26 @@ async fn handle_team_status(state: &AppState, session_id: &str, team_id: &str) {
         ));
     }
 
+    // Append review-gated PRs status
+    let reviewed: Vec<String> = state
+        .reviewed_prs
+        .iter()
+        .filter_map(|entry| {
+            let key = entry.key();
+            if key.starts_with(&format!("{}:", team_id)) {
+                Some(format!("#{}", &key[team_id.len() + 1..]))
+            } else {
+                None
+            }
+        })
+        .collect();
+    if !reviewed.is_empty() {
+        table.push_str(&format!(
+            "\n**PRs cleared for merge (review gate passed):** {}\n",
+            reviewed.join(", ")
+        ));
+    }
+
     // Send back to requesting session
     if let Err(e) = state.containers.send(session_id, &table).await {
         tracing::warn!(error = %e, "Failed to send team status");
@@ -4215,6 +4316,11 @@ async fn handle_pr_reviewed(
     pr_number: &str,
     _channel_id: &str,
 ) {
+    // Record this PR as having passed the review gate
+    state
+        .reviewed_prs
+        .insert(format!("{}:{}", team_id, pr_number), ());
+
     // Find the team lead session
     let members = state.db.get_team_members(team_id).await.unwrap_or_default();
     let lead = members
@@ -4224,9 +4330,9 @@ async fn handle_pr_reviewed(
     if let Some(lead_session) = lead {
         let header = build_team_context_header(&state.db, team_id, "Team Lead").await;
         let ready_msg = format!(
-            "{}\n**PR #{} from {} — Claude Reviewer Approved**\n\n\
+            "{}\n**PR #{} from {} — Claude Reviewer Approved (review gate PASSED)**\n\n\
             The Claude Reviewer has APPROVED this PR and {} has completed the review gate.\n\
-            Please perform your final review:\n\
+            This PR is cleared for merge. Please perform your final review:\n\
             1. `gh pr view {} --json reviews` — confirm Claude Reviewer approval\n\
             2. `gh pr checks {}` — verify all CI checks pass\n\
             3. `gh pr diff {}` — sanity-check the implementation\n\

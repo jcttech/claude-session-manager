@@ -241,6 +241,7 @@ impl ContainerManager {
             session_type,
             grpc_port,
             system_prompt_append,
+            None, // New session — no resume ID
         )
         .await?;
 
@@ -460,6 +461,10 @@ impl ContainerManager {
     /// Connects to the gRPC worker and opens a bidirectional session stream
     /// before spawning the message processor, so the caller gets immediate
     /// feedback if the connection fails.
+    ///
+    /// `initial_claude_session_id` — if set, the message processor starts with
+    /// this session ID so the first message can resume the existing Claude
+    /// conversation (used on CSM restart to avoid context loss).
     #[allow(clippy::too_many_arguments)]
     async fn create_session_internal(
         &self,
@@ -474,6 +479,7 @@ impl ContainerManager {
         session_type: &str,
         grpc_port: u16,
         system_prompt_append: Option<&str>,
+        initial_claude_session_id: Option<&str>,
     ) -> Result<()> {
         let s = settings();
         let grpc_addr = format!("http://{}:{}", s.vm_host, grpc_port);
@@ -496,7 +502,7 @@ impl ContainerManager {
 
         let (message_tx, message_rx) = mpsc::channel::<String>(32);
         let is_first_message = Arc::new(AtomicBool::new(true));
-        let claude_session_id = Arc::new(Mutex::new(None));
+        let claude_session_id = Arc::new(Mutex::new(initial_claude_session_id.map(|s| s.to_string())));
         let plan_mode_flag = Arc::new(AtomicBool::new(plan_mode));
         let thinking_mode_flag = Arc::new(AtomicBool::new(thinking_mode));
         let pending_title_flag = Arc::new(AtomicBool::new(false));
@@ -570,6 +576,7 @@ impl ContainerManager {
         output_tx: mpsc::Sender<OutputEvent>,
         grpc_port: u16,
         system_prompt_append: Option<&str>,
+        claude_session_id: Option<&str>,
     ) -> Result<()> {
         // Resync session counts before reconnecting
         if let Err(e) = self.registry.resync_session_counts(db).await {
@@ -638,6 +645,7 @@ impl ContainerManager {
             session_type,
             effective_port,
             system_prompt_append,
+            claude_session_id,
         )
         .await?;
 
@@ -645,7 +653,8 @@ impl ContainerManager {
             session_id = %session_id,
             container = %effective_container,
             grpc_port = effective_port,
-            "Reconnected session (fresh conversation)"
+            resume = claude_session_id.is_some(),
+            "Reconnected session"
         );
         Ok(())
     }
@@ -1147,7 +1156,7 @@ async fn message_processor(
                         std::collections::HashMap::new(),
                         &system_prompt_append,
                         thinking_tokens,
-                        None,
+                        stored_sid.as_deref(),
                     ).await
                 } else {
                     active_stream.follow_up(&message).await
