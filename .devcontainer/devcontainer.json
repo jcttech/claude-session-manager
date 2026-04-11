@@ -47,7 +47,9 @@
     },
     "remoteEnv": {
         "ANTHROPIC_API_KEY": "${localEnv:ANTHROPIC_API_KEY}",
-        "GH_TOKEN": "${localEnv:GH_TOKEN}"
+        "GH_TOKEN": "${localEnv:GH_TOKEN}",
+        "MEMBANK_URL": "${localEnv:MEMBANK_URL}",
+        "MEMBANK_TOKEN": "${localEnv:MEMBANK_TOKEN}"
     },
     "workspaceMount": "source=${localWorkspaceFolder},target=/workspaces/${localWorkspaceFolderBasename},type=bind,consistency=delegated",
     "workspaceFolder": "/workspaces/${localWorkspaceFolderBasename}",
