@@ -1,5 +1,5 @@
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    tonic_build::compile_protos("../../proto/agent.proto")?;
+    tonic_prost_build::compile_protos("../../proto/agent.proto")?;
 
     // CI sets APP_VERSION from git tag; fall back to Cargo.toml version
     if let Ok(v) = std::env::var("APP_VERSION") {

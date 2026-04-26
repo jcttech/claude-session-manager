@@ -1,5 +1,5 @@
 [build-system]
-requires = ["hatchling", "hatch-vcs", "grpcio-tools>=1.60.0"]
+requires = ["hatchling", "hatch-vcs", "grpcio-tools>=1.80.0"]
 build-backend = "hatchling.build"
 
 [project]
@@ -8,17 +8,17 @@ dynamic = ["version"]
 description = "gRPC Agent SDK worker for claude-session-manager"
 requires-python = ">=3.13"
 dependencies = [
-    "claude-agent-sdk>=0.1.48",
-    "grpcio>=1.78.0",
-    "protobuf>=6.31.1,<7.0.0",
+    "claude-agent-sdk>=0.1.68",
+    "grpcio>=1.80.0",
+    "protobuf>=6.33.6,<7.0.0",
 ]
 
 [project.optional-dependencies]
 dev = [
-    "pytest>=9.0.2",
+    "pytest>=9.0.3",
     "pytest-asyncio>=1.3.0",
-    "grpcio-tools>=1.78.0",
-    "ruff>=0.15.4",
+    "grpcio-tools>=1.80.0",
+    "ruff>=0.15.12",
 ]
 
 [tool.hatch.version]

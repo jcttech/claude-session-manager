@@ -37,7 +37,7 @@ class SessionManager:
         """
         options = ClaudeAgentOptions(
             system_prompt=system_prompt_append or None,
-            setting_sources=["project"],
+            setting_sources=["user", "project"],
             permission_mode=permission_mode or "bypassPermissions",
             env=env or {},
             max_turns=max_turns,
