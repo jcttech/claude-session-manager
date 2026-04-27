@@ -58,6 +58,16 @@ struct Session {
     pending_title: Arc<AtomicBool>,
     /// Last known input_tokens from ResponseComplete (for context window display)
     last_input_tokens: Arc<AtomicU64>,
+    /// UNIX timestamp (secs) of the most recent auto `/clear`. 0 means never.
+    /// Used to suppress re-firing while the post-clear response is still in flight,
+    /// since context_tokens reported during that window may still be above threshold.
+    last_auto_clear_at: Arc<AtomicU64>,
+    /// Whether the auto-clear trigger is armed. Fires once when context exceeds
+    /// the high threshold; re-arms only after context falls back below the low
+    /// threshold. Prevents the runaway loop that occurred with `/compact`, where
+    /// the summarization API call itself reports a near-full input_tokens reading
+    /// and re-triggered the action immediately.
+    auto_clear_armed: Arc<AtomicBool>,
     /// gRPC address for interrupt RPC (separate from the stream)
     grpc_addr: String,
 }
@@ -507,6 +517,8 @@ impl ContainerManager {
         let thinking_mode_flag = Arc::new(AtomicBool::new(thinking_mode));
         let pending_title_flag = Arc::new(AtomicBool::new(false));
         let last_input_tokens_flag = Arc::new(AtomicU64::new(0));
+        let last_auto_clear_at_flag = Arc::new(AtomicU64::new(0));
+        let auto_clear_armed_flag = Arc::new(AtomicBool::new(true));
 
         let session_id_owned = session_id.to_string();
         let is_first_clone = Arc::clone(&is_first_message);
@@ -550,6 +562,8 @@ impl ContainerManager {
                 thinking_mode: thinking_mode_flag,
                 pending_title: pending_title_flag,
                 last_input_tokens: last_input_tokens_flag,
+                last_auto_clear_at: last_auto_clear_at_flag,
+                auto_clear_armed: auto_clear_armed_flag,
                 grpc_addr: grpc_addr.clone(),
             },
         );
@@ -774,6 +788,48 @@ impl ContainerManager {
     pub fn set_last_input_tokens(&self, session_id: &str, tokens: u64) {
         if let Some(s) = self.sessions.get(session_id) {
             s.last_input_tokens.store(tokens, Ordering::SeqCst);
+        }
+    }
+
+    /// Try to fire an auto `/clear` for this session.
+    ///
+    /// Combines two guards to prevent the runaway loop seen previously with
+    /// `/compact`:
+    ///
+    /// 1. **Armed flag**: must be re-armed via [`rearm_auto_clear`] when context
+    ///    falls below the low threshold. The flag is consumed on a successful
+    ///    fire, so the trigger emits at most once per high-water mark regardless
+    ///    of how many `ResponseComplete` events report >90% in succession.
+    /// 2. **Time cooldown**: even if somehow re-armed, refuses to fire again
+    ///    within `cooldown_secs` of the previous fire — defence-in-depth against
+    ///    spurious low-then-high oscillation across a single turn.
+    ///
+    /// Returns true and resets the cooldown on success.
+    pub fn try_begin_auto_clear(&self, session_id: &str, cooldown_secs: u64) -> bool {
+        let Some(s) = self.sessions.get(session_id) else {
+            return false;
+        };
+        if !s.auto_clear_armed.load(Ordering::SeqCst) {
+            return false;
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let last = s.last_auto_clear_at.load(Ordering::SeqCst);
+        if last != 0 && now.saturating_sub(last) < cooldown_secs {
+            return false;
+        }
+        s.last_auto_clear_at.store(now, Ordering::SeqCst);
+        s.auto_clear_armed.store(false, Ordering::SeqCst);
+        true
+    }
+
+    /// Re-arm the auto-clear trigger. Call when context has fallen back below
+    /// the low-water threshold so the next high-water crossing can fire again.
+    pub fn rearm_auto_clear(&self, session_id: &str) {
+        if let Some(s) = self.sessions.get(session_id) {
+            s.auto_clear_armed.store(true, Ordering::SeqCst);
         }
     }
 

@@ -2910,11 +2910,22 @@ async fn stream_output(
                         // Warn when context window is getting full (>80%)
                         let ctx_max = config::settings().context_window_max;
                         let ctx_warn_threshold = ctx_max * 80 / 100;
-                        let ctx_compact_threshold = ctx_max * 90 / 100;
+                        let ctx_clear_threshold = ctx_max * 90 / 100;
+                        let ctx_rearm_threshold = ctx_max * 70 / 100;
+
+                        // Re-arm the auto-clear trigger once we observe context
+                        // back below the low-water mark. Combined with the
+                        // armed-flag check below, this ensures the trigger
+                        // fires at most once per high-water crossing even if
+                        // many ResponseComplete events report >90% in a row.
+                        if ctx_display < ctx_rearm_threshold {
+                            state.containers.rearm_auto_clear(&session_id);
+                        }
+
                         if ctx_display > ctx_warn_threshold {
                             let usage_pct = (ctx_display as f64 / ctx_max as f64 * 100.0) as u64;
                             let msg = format!(
-                                ":warning: **Context window {}% full** ({} / {}k tokens) — consider using `compact` or `clear`",
+                                ":warning: **Context window {}% full** ({} / {}k tokens) — consider using `clear` (membank will reload context)",
                                 usage_pct, ctx_display, ctx_max / 1000,
                             );
                             let _ = state.mm.post_in_thread(&channel_id, &thread_id, &msg).await;
@@ -2924,7 +2935,7 @@ async fn stream_output(
                                 && role != "Team Lead"
                             {
                                 let alert_msg = format!(
-                                    "**Context Alert**: {} is at {}% context capacity ({}/{}k).\nConsider sending them a `compact` or `clear` instruction, or reassigning remaining work.",
+                                    "**Context Alert**: {} is at {}% context capacity ({}/{}k).\nConsider sending them a `clear` instruction (membank will reload context), or reassigning remaining work.",
                                     role, usage_pct, format_token_count(ctx_display), ctx_max / 1000,
                                 );
                                 if let Ok(leads) = state.db.get_sessions_by_role(tid, "Team Lead").await
@@ -2936,14 +2947,25 @@ async fn stream_output(
                             }
                         }
 
-                        // Auto-compact at 90% context for team sessions
-                        if ctx_display > ctx_compact_threshold
+                        // Auto-clear at 90% context for team sessions. We rely on
+                        // claude-membank to repopulate context after the clear. A
+                        // cooldown prevents re-firing while the post-clear response
+                        // is still in flight (its ResponseComplete may still report
+                        // ctx_tokens above threshold, which previously caused an
+                        // infinite auto-compact loop).
+                        const AUTO_CLEAR_COOLDOWN_SECS: u64 = 180;
+                        if ctx_display > ctx_clear_threshold
                             && let Some((ref tid, ref role)) = team_info
+                            && state.containers.try_begin_auto_clear(&session_id, AUTO_CLEAR_COOLDOWN_SECS)
                         {
-                            let _ = state.containers.send(&session_id, "/compact").await;
-                            let _ = state.db.record_compaction(&session_id).await;
+                            tracing::info!(
+                                session_id = %session_id,
+                                ctx_display, ctx_max,
+                                "auto-clear: context above threshold, sending /clear"
+                            );
+                            let _ = state.containers.send(&session_id, "/clear").await;
 
-                            // Re-inject team status after compaction so the agent
+                            // Re-inject team status after clear so the agent
                             // retains roster context despite losing conversation history
                             handle_team_status(&state, &session_id, tid).await;
 
@@ -2952,13 +2974,13 @@ async fn stream_output(
                                 && let Some(lead) = leads.first()
                             {
                                 let header = build_team_context_header(&state.db, tid, "Team Lead").await;
-                                let compact_msg = format!(
-                                    "{}\n**Auto-compact**: {} context auto-compacted at {}% ({}k/{}k).",
+                                let clear_msg = format!(
+                                    "{}\n**Auto-clear**: {} context auto-cleared at {}% ({}k/{}k). Membank will reload context on next message.",
                                     header, role,
                                     (ctx_display as f64 / ctx_max as f64 * 100.0) as u64,
                                     ctx_display / 1000, ctx_max / 1000,
                                 );
-                                let _ = state.containers.send(&lead.session_id, &compact_msg).await;
+                                let _ = state.containers.send(&lead.session_id, &clear_msg).await;
                             }
                         }
                     }
