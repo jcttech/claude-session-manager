@@ -110,6 +110,20 @@ pub struct AuditLogEntry {
 
 const SCHEMA: &str = "session_manager";
 
+/// Truncate a task summary to 500 chars on a UTF-8 boundary, with an ellipsis.
+fn truncate_task_summary(task: &str) -> String {
+    if task.len() <= 500 {
+        return task.to_string();
+    }
+    let end = task
+        .char_indices()
+        .map(|(i, _)| i)
+        .take_while(|&i| i <= 500)
+        .last()
+        .unwrap_or(0);
+    format!("{}…", &task[..end])
+}
+
 /// Create schema and all tables/indexes for the given schema name.
 /// Used by both production initialization and integration tests.
 pub async fn create_schema(pool: &PgPool, schema: &str) -> Result<()> {
@@ -502,6 +516,36 @@ pub async fn create_schema(pool: &PgPool, schema: &str) -> Result<()> {
     .execute(pool)
     .await?;
 
+    // Atomic-claim table: prevents two concurrent spawns from both winning the
+    // same (team_id, role) slot. handle_team_spawn inserts here BEFORE doing any
+    // expensive container work; ON CONFLICT means the loser bails immediately.
+    sqlx::query(&format!(
+        r#"
+        CREATE TABLE IF NOT EXISTS {}.team_role_claims (
+            team_id TEXT NOT NULL,
+            role TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            claimed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            PRIMARY KEY (team_id, role)
+        )
+        "#,
+        schema
+    ))
+    .execute(pool)
+    .await?;
+
+    // Defense-in-depth: even if claim/release ever desync from sessions, the DB
+    // physically refuses two live sessions sharing (team_id, role).
+    sqlx::query(&format!(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_team_role_active \
+         ON {}.sessions(team_id, role) \
+         WHERE team_id IS NOT NULL AND role IS NOT NULL \
+           AND status IN ('active','disconnected','stuck')",
+        schema
+    ))
+    .execute(pool)
+    .await?;
+
     Ok(())
 }
 
@@ -634,6 +678,13 @@ impl Database {
         let mut tx = self.pool.begin().await?;
 
         sqlx::query(&format!("DELETE FROM {}.pending_requests WHERE session_id = $1", SCHEMA))
+            .bind(session_id)
+            .execute(&mut *tx)
+            .await?;
+
+        // Also drop any team role claim tied to this session so the slot can
+        // be re-spawned even if cleanup_session didn't release it explicitly.
+        sqlx::query(&format!("DELETE FROM {}.team_role_claims WHERE session_id = $1", SCHEMA))
             .bind(session_id)
             .execute(&mut *tx)
             .await?;
@@ -1131,6 +1182,92 @@ impl Database {
         Ok(())
     }
 
+    /// Atomically claim a (team_id, role) slot before spawning a team member.
+    ///
+    /// For singleton roles, attempts an `INSERT ... ON CONFLICT DO NOTHING` —
+    /// returns `Ok(None)` if another caller already holds the slot.
+    ///
+    /// For multi-instance roles (e.g. Developer), takes a Postgres
+    /// transaction-scoped advisory lock keyed by (team_id, base_role), picks
+    /// the next instance number as `MAX(trailing_digits) + 1` (monotonic — never
+    /// reuses a number even after a member exits), and inserts the claim.
+    /// Numbering is monotonic so a re-spawn after a member exits won't collide
+    /// with the partial unique index on sessions(team_id, role).
+    ///
+    /// Returns the assigned display name (e.g. "Architect", "Developer 3") on
+    /// success, or `None` if the slot was already taken.
+    pub async fn claim_team_role(
+        &self,
+        team_id: &str,
+        base_role: &str,
+        allow_multiple: bool,
+        session_id: &str,
+    ) -> Result<Option<String>> {
+        let mut tx = self.pool.begin().await?;
+
+        // Serialize concurrent claims for the same role family within a team
+        // (across processes too — the lock lives in Postgres, not in-memory).
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(format!("{}::{}", team_id, base_role))
+            .execute(&mut *tx)
+            .await?;
+
+        let display_name = if allow_multiple {
+            let like_pattern = format!(
+                "{} %",
+                base_role.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")
+            );
+            let next_n: i32 = sqlx::query_scalar(&format!(
+                "SELECT COALESCE(MAX((SUBSTRING(role FROM '\\d+$'))::INTEGER), 0) + 1 \
+                 FROM {}.team_role_claims \
+                 WHERE team_id = $1 AND (role = $2 OR role LIKE $3)",
+                SCHEMA
+            ))
+            .bind(team_id)
+            .bind(base_role)
+            .bind(like_pattern)
+            .fetch_one(&mut *tx)
+            .await?;
+            format!("{} {}", base_role, next_n)
+        } else {
+            base_role.to_string()
+        };
+
+        let inserted = sqlx::query(&format!(
+            "INSERT INTO {}.team_role_claims (team_id, role, session_id) \
+             VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
+            SCHEMA
+        ))
+        .bind(team_id)
+        .bind(&display_name)
+        .bind(session_id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+
+        tx.commit().await?;
+
+        if inserted == 0 {
+            Ok(None)
+        } else {
+            Ok(Some(display_name))
+        }
+    }
+
+    /// Release a (team_id, role) claim — called from cleanup paths so the slot
+    /// becomes available for a future spawn.
+    pub async fn release_team_role(&self, team_id: &str, role: &str) -> Result<()> {
+        sqlx::query(&format!(
+            "DELETE FROM {}.team_role_claims WHERE team_id = $1 AND role = $2",
+            SCHEMA
+        ))
+        .bind(team_id)
+        .bind(role)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     /// Find team members by role name. Matches exact role or role prefix
     /// (e.g., "Developer" matches "Developer 1", "Developer 2").
     pub async fn get_sessions_by_role(
@@ -1175,17 +1312,7 @@ impl Database {
         sender_session_id: &str,
         task_summary: &str,
     ) -> Result<()> {
-        // Truncate task summary to 500 chars
-        let truncated = if task_summary.len() > 500 {
-            let end = task_summary.char_indices()
-                .map(|(i, _)| i)
-                .take_while(|&i| i <= 500)
-                .last()
-                .unwrap_or(0);
-            format!("{}…", &task_summary[..end])
-        } else {
-            task_summary.to_string()
-        };
+        let truncated = truncate_task_summary(task_summary);
         sqlx::query(&format!(
             "UPDATE {}.sessions SET pending_task_from = $1, current_task = $2 WHERE session_id = $3",
             SCHEMA
@@ -1196,6 +1323,34 @@ impl Database {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    /// Atomically claim a member's pending-task slot. Only succeeds if the
+    /// target has no pending task. Returns true if this caller won the claim,
+    /// false if another sender beat us to it.
+    ///
+    /// This is the race-safe variant used by route_team_message when
+    /// dispatching a [TO:Role] to one of multiple idle candidates — two
+    /// concurrent assignments can't both attach to the same idle member.
+    pub async fn try_set_pending_task(
+        &self,
+        target_session_id: &str,
+        sender_session_id: &str,
+        task_summary: &str,
+    ) -> Result<bool> {
+        let truncated = truncate_task_summary(task_summary);
+        let result = sqlx::query(&format!(
+            "UPDATE {}.sessions \
+             SET pending_task_from = $1, current_task = $2 \
+             WHERE session_id = $3 AND pending_task_from IS NULL",
+            SCHEMA
+        ))
+        .bind(sender_session_id)
+        .bind(&truncated)
+        .bind(target_session_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
     }
 
     /// Clear pending task state (called when member responds).

@@ -96,6 +96,57 @@ struct AppState {
     /// PRs that have passed the [PR_REVIEWED] gate, keyed by "team_id:pr_number".
     /// Only PRs in this set should be merged by the Team Lead.
     reviewed_prs: DashMap<String, ()>,
+    /// Short-window dedupe of identical intent markers (`[SPAWN:Role]` /
+    /// `[TO:Role]`). LLMs occasionally emit the same marker twice; this
+    /// suppresses the duplicate so it doesn't fan out to two members.
+    /// Key → first-seen instant; entries past INTENT_DEDUPE_TTL are GC'd.
+    intent_dedupe: DashMap<String, std::time::Instant>,
+}
+
+/// How long an identical intent marker is suppressed after first being seen.
+const INTENT_DEDUPE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Returns true if this intent was seen within INTENT_DEDUPE_TTL (caller
+/// should drop it). Otherwise records the current time and returns false.
+fn intent_seen_recently(map: &DashMap<String, std::time::Instant>, key: String) -> bool {
+    let now = std::time::Instant::now();
+    match map.entry(key) {
+        dashmap::mapref::entry::Entry::Occupied(mut e) => {
+            if now.duration_since(*e.get()) < INTENT_DEDUPE_TTL {
+                true
+            } else {
+                e.insert(now);
+                false
+            }
+        }
+        dashmap::mapref::entry::Entry::Vacant(e) => {
+            e.insert(now);
+            false
+        }
+    }
+}
+
+/// Build a stable dedupe key for an intent. `kind` distinguishes spawn vs
+/// route; the message hash keeps the key bounded regardless of task length.
+fn intent_key(
+    team_id: &str,
+    sender_session_id: &str,
+    kind: &str,
+    target: &str,
+    message: &str,
+) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    message.trim().hash(&mut h);
+    format!(
+        "{}|{}|{}|{}|{:x}",
+        team_id,
+        sender_session_id,
+        kind,
+        target,
+        h.finish()
+    )
 }
 
 #[derive(Deserialize)]
@@ -165,6 +216,7 @@ async fn main() -> Result<()> {
         spawn_locks: DashMap::new(),
         coordination_channel_id: tokio::sync::RwLock::new(coordination_channel_id),
         reviewed_prs: DashMap::new(),
+        intent_dedupe: DashMap::new(),
     });
 
     // Sync container registry from database
@@ -434,6 +486,19 @@ async fn main() -> Result<()> {
         session_watchdog(watchdog_state).await;
     });
 
+    // GC stale intent-dedupe entries every 2x TTL so the map stays bounded.
+    let dedupe_state = state.clone();
+    let _dedupe_gc_handle = tokio::spawn(async move {
+        let mut tick = tokio::time::interval(INTENT_DEDUPE_TTL * 2);
+        loop {
+            tick.tick().await;
+            let now = std::time::Instant::now();
+            dedupe_state
+                .intent_dedupe
+                .retain(|_, ts| now.duration_since(*ts) < INTENT_DEDUPE_TTL);
+        }
+    });
+
     // Configure rate limiting
     let s = config::settings();
     let rate_limiter = RateLimitLayer::new(s.rate_limit_rps, s.rate_limit_burst);
@@ -666,10 +731,15 @@ async fn start_session(
     team_id: Option<&str>,
     role: Option<&str>,
     system_prompt: Option<&str>,
+    pre_session_id: Option<&str>,
 ) -> Result<String> {
     use std::path::PathBuf;
 
-    let session_id = Uuid::new_v4().to_string();
+    // Caller may pre-allocate the session_id (used by handle_team_spawn so the
+    // (team_id, role) claim and the eventual sessions row share an identity).
+    let session_id = pre_session_id
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
     let mut worktree_path: Option<PathBuf> = None;
 
     // Resolve project path (clone/worktree)
@@ -872,11 +942,16 @@ async fn cleanup_session(state: &AppState, session_id: &str) {
     // Remove from liveness tracking
     state.liveness.remove(session_id);
 
-    // Unfollow thread for the user who started the session (fire-and-forget)
-    if let Ok(Some(session)) = state
+    // Look up the session row once — we need its user_id (for unfollow) and
+    // (team_id, role) (to release the role claim so the slot can be re-spawned).
+    let stored_session = state
         .db
         .get_session_by_id_prefix(&session_id[..8.min(session_id.len())])
         .await
+        .ok()
+        .flatten();
+
+    if let Some(ref session) = stored_session
         && let Some(ref uid) = session.user_id
     {
         let mm = state.mm.clone();
@@ -931,6 +1006,16 @@ async fn cleanup_session(state: &AppState, session_id: &str) {
     // Delete session from database
     if let Err(e) = state.db.delete_session(session_id).await {
         tracing::warn!(session_id = %session_id, error = %e, "Failed to delete session from database");
+    }
+
+    // Release the team role claim (if this was a team member) so the slot
+    // becomes available for a future spawn.
+    if let Some(session) = stored_session
+        && let (Some(tid), Some(role)) = (session.team_id, session.role)
+        && let Err(e) = state.db.release_team_role(&tid, &role).await
+    {
+        tracing::warn!(team_id = %tid, role = %role, error = %e,
+            "Failed to release team role claim");
     }
 
     gauge!("active_sessions").decrement(1.0);
@@ -999,6 +1084,16 @@ async fn stop_session(state: &Arc<AppState>, session: &database::StoredSession) 
         .await
     {
         tracing::warn!(session_id = %session.session_id, error = %e, "Failed to update session status to stopped");
+    }
+
+    // Release the team role claim (if any) so the slot is available for respawn.
+    // 'stopped' is excluded from the partial unique index, but the claim row
+    // would still block a new spawn of the same role until released.
+    if let (Some(tid), Some(role)) = (session.team_id.as_deref(), session.role.as_deref())
+        && let Err(e) = state.db.release_team_role(tid, role).await
+    {
+        tracing::warn!(team_id = %tid, role = %role, error = %e,
+            "Failed to release team role claim on stop");
     }
 
     gauge!("active_sessions").decrement(1.0);
@@ -1764,6 +1859,7 @@ async fn handle_messages(
                                     None,
                                     None,
                                     None,
+                                    None,
                                 )
                                 .await
                                 {
@@ -1872,6 +1968,7 @@ async fn handle_messages(
                                 Some(&team_id),
                                 Some("Team Lead"),
                                 Some(&lead_prompt),
+                                None,
                             )
                             .await
                             {
@@ -2507,6 +2604,18 @@ fn fire_team_spawn(
     initial_task: &str,
     project: &str,
 ) {
+    // Suppress LLM-stutter / replayed [SPAWN:Role] markers: an identical
+    // (team, sender, role, task) within INTENT_DEDUPE_TTL is dropped.
+    let dedupe_key = intent_key(team_id, session_id, "SPAWN", role_name, initial_task);
+    if intent_seen_recently(&state.intent_dedupe, dedupe_key) {
+        tracing::info!(
+            team_id, role = %role_name,
+            "Suppressed duplicate [SPAWN:{}] within {}s window",
+            role_name, INTENT_DEDUPE_TTL.as_secs()
+        );
+        return;
+    }
+
     let spawn_state = state.clone();
     let spawn_tid = team_id.to_string();
     let spawn_cid = channel_id.to_string();
@@ -3313,6 +3422,38 @@ CRITICAL: All markers MUST start at the beginning of a new line. Do NOT embed ma
 Messages from team members arrive prefixed with their role.
 Each message you receive will include a [TEAM: ...] header with the current roster.
 
+## Structured Acknowledgements
+After every [SPAWN:Role] and [TO:Role] you emit, the system replies with an [ACK:...] line. **Treat these as authoritative ground truth** — the English message is for the user; the ACK is for you. Examples:
+
+  [ACK:SPAWN role="Architect" status=ok]
+  [ACK:SPAWN role="Architect" status=rejected reason=already_exists]
+  [ACK:SPAWN role="Developer" status=rejected reason=idle_available idle="Developer 1"]
+  [ACK:SPAWN role="Developer 3" status=ok]
+  [ACK:SPAWN role="QA Engineer" status=failed reason=spawn_failed]
+  [ACK:TO target="Developer 2" status=ok]
+  [ACK:TO target="Architect" status=rejected reason=already_pending]
+  [ACK:TO target="Developer" status=rejected reason=all_busy]
+  [ACK:TO target="Developer" status=rejected reason=slot_lost_race]
+  [ACK:TO target="Developer 5" status=failed reason=delivery_unreachable]
+  [ACK:TO target="Architect" status=failed reason=target_not_found]
+
+Status values:
+  ok        — the action completed; proceed with downstream work.
+  rejected  — refused by policy. Do NOT retry the same action — change strategy.
+  failed    — transient error. You MAY retry once after checking [TEAM_STATUS].
+
+Decision matrix (read the `reason` to pick the right next move):
+  - rejected reason=already_exists  → role is on team; use [TO:<role>] instead of spawning.
+  - rejected reason=idle_available  → use [TO:<idle>] (the `idle="..."` field tells you who).
+  - rejected reason=already_pending → wait for that member's response; do NOT re-send.
+  - rejected reason=all_busy        → wait, or [TEAM_STATUS] to find a different idle role.
+  - rejected reason=slot_lost_race  → another assignment landed first; [TEAM_STATUS] then retry once one is idle.
+  - failed   reason=target_not_found → roster is missing that role; [SPAWN:<role>] or pick a different target.
+  - failed   reason=delivery_unreachable → member's session died; [TEAM_STATUS], then re-spawn or reassign.
+  - failed   reason=spawn_failed    → check [TEAM_STATUS]; one retry permitted, then escalate to user.
+
+If you do not see an [ACK:...] line within a few seconds of emitting a marker, assume the marker was malformed (not at line start, missing [/MSG], etc.) and re-emit it correctly.
+
 **PR Review Gate**: Team members use [PR_READY:N] and [PR_REVIEWED:N] markers. The system ensures they address Claude Reviewer CI comments before the PR reaches you. You will receive a notification when a PR has passed the review gate.
 
 ## Your Responsibilities
@@ -3480,6 +3621,19 @@ async fn route_team_message(
     team_id: &str,
     _channel_id: &str,
 ) {
+    // Suppress duplicate [TO:Role] markers: identical (sender, target, message)
+    // within INTENT_DEDUPE_TTL is dropped. Catches LLM-stutter and replayed
+    // markers that would otherwise fan the same task to multiple members.
+    let dedupe_key = intent_key(team_id, sender_session_id, "TO", target_role, message);
+    if intent_seen_recently(&state.intent_dedupe, dedupe_key) {
+        tracing::info!(
+            team_id, target_role,
+            "Suppressed duplicate [TO:{}] within {}s window",
+            target_role, INTENT_DEDUPE_TTL.as_secs()
+        );
+        return;
+    }
+
     // Find target sessions by role (exact + prefix match).
     // Retry briefly if no target found — a just-spawned member may still be starting up.
     let mut targets = Vec::new();
@@ -3522,6 +3676,20 @@ async fn route_team_message(
                                 ),
                             )
                             .await;
+                        let ack = format!(
+                            "[ACK:TO target=\"{}\" status=failed reason=target_not_found]",
+                            target_role,
+                        );
+                        let _ = state
+                            .containers
+                            .send(
+                                &sender.session_id,
+                                &format!(
+                                    "{}\nNo active team member with role {}. Use [TEAM_STATUS] to inspect the roster, or [SPAWN:{}] to add one.",
+                                    ack, target_role, target_role,
+                                ),
+                            )
+                            .await;
                     }
                     return;
                 }
@@ -3546,16 +3714,17 @@ async fn route_team_message(
                 .map(|r| r != target_role)
                 .unwrap_or(false));
 
-    // When a prefix match hits multiple members, pick ONE idle member instead of
-    // fanning out the same task to everyone. This prevents duplicate work.
-    let effective_targets: Vec<&StoredSession> = if is_prefix_match && targets.len() > 1 {
-        // Prefer idle members (no pending task from anyone)
+    // Build the candidate list. For a multi-instance prefix match, only
+    // currently-idle members are candidates — we'll claim one atomically below
+    // so two concurrent [TO:Role] calls can't both attach to the same idle
+    // member. For exact / single-target matches, the only candidate is the
+    // target itself.
+    let candidates: Vec<&StoredSession> = if is_prefix_match && targets.len() > 1 {
         let idle: Vec<&StoredSession> = targets
             .iter()
             .filter(|t| t.pending_task_from.is_none())
             .collect();
         if idle.is_empty() {
-            // All busy — reject with a clear message listing who is busy
             let busy_list: Vec<String> = targets
                 .iter()
                 .filter_map(|t| {
@@ -3570,9 +3739,13 @@ async fn route_team_message(
                 .await
             {
                 let header = format_team_context_header(&members, sender_role);
+                let ack = format!(
+                    "[ACK:TO target=\"{}\" status=rejected reason=all_busy]",
+                    target_role,
+                );
                 let _ = state.containers.send(&sender.session_id, &format!(
-                    "{}\nAll {} members are busy: {}. Wait for one to finish, or use [TEAM_STATUS] to check progress.",
-                    header, target_role, busy_list.join(", "),
+                    "{}\n{}\nAll {} members are busy: {}. Wait for one to finish, or use [TEAM_STATUS] to check progress.",
+                    ack, header, target_role, busy_list.join(", "),
                 )).await;
                 let _ = state.mm.post_in_thread(
                     &sender.channel_id, &sender.thread_id,
@@ -3581,91 +3754,149 @@ async fn route_team_message(
             }
             return;
         }
-        // Pick the first idle member (deterministic, lowest instance number)
-        vec![idle[0]]
+        idle
     } else {
         targets.iter().collect()
     };
 
-    let mut delivered_roles = Vec::new();
-    for target in &effective_targets {
-        let role = target.role.as_deref().unwrap_or(target_role);
-
-        // Hard gate: check if target already has a pending task from the same sender
-        if let Some(ref pending_from) = target.pending_task_from
+    // Iterate-until-claim: try to atomically claim each candidate's
+    // pending_task slot. The first successful UPDATE wins; later candidates
+    // are tried only if earlier ones were just snatched by another sender.
+    let mut claimed: Option<&StoredSession> = None;
+    let mut self_pending: Option<&StoredSession> = None;
+    for candidate in &candidates {
+        // Same-sender pending: surface as a soft "wait for response" rejection
+        // after the loop if no other candidate claims successfully.
+        if let Some(ref pending_from) = candidate.pending_task_from
             && pending_from == sender_session_id
         {
-            // Reject — same sender already has a pending task
-            if let Ok(Some(sender)) = state
-                .db
-                .get_session_by_id_prefix(&sender_session_id[..8.min(sender_session_id.len())])
-                .await
-            {
-                let _ = state.mm.post_in_thread(
-                    &sender.channel_id, &sender.thread_id,
-                    &format!(":hourglass: **{}** already has a pending task. Wait for their response.", role),
-                ).await;
-                // Inject rejection into sender's Claude session
-                let header = format_team_context_header(&members, sender_role);
-                let _ = state.containers.send(&sender.session_id, &format!(
-                    "{}\nTask delivery rejected: {} already has a pending task from you. Wait for their response before sending another task.",
-                    header, role,
-                )).await;
-            }
+            self_pending.get_or_insert(*candidate);
             continue;
         }
-
-        let header = format_team_context_header(&members, role);
-        let formatted = format!("{}\n**From {}**: {}", header, sender_role, message);
-        // Set pending task and post Mattermost visibility BEFORE queueing the message,
-        // so the message appears in chat before the target starts processing.
-        let _ = state
+        match state
             .db
-            .set_pending_task(&target.session_id, sender_session_id, message)
-            .await;
-        let _ = state
-            .mm
-            .post_in_thread(
-                &target.channel_id,
-                &target.thread_id,
-                &format!(
-                    ":arrow_left: **From {}:**\n{}",
-                    sender_role,
-                    truncate_preview(message, 4000)
-                ),
-            )
-            .await;
-        if let Err(e) = state.containers.send(&target.session_id, &formatted).await {
-            tracing::warn!(error = %e, role, "Failed to deliver team message");
-            // Notify sender that delivery failed — their message was lost
-            if let Ok(Some(sender)) = state
+            .try_set_pending_task(&candidate.session_id, sender_session_id, message)
+            .await
+        {
+            Ok(true) => {
+                claimed = Some(*candidate);
+                break;
+            }
+            Ok(false) => {
+                tracing::debug!(
+                    target = ?candidate.role,
+                    "pending_task slot lost the race — trying next candidate",
+                );
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, target = ?candidate.role,
+                    "try_set_pending_task failed");
+            }
+        }
+    }
+
+    let target = match claimed {
+        Some(t) => t,
+        None => {
+            // Nothing claimable. Surface the most informative rejection.
+            if let Some(t) = self_pending {
+                let role = t.role.as_deref().unwrap_or(target_role);
+                if let Ok(Some(sender)) = state
+                    .db
+                    .get_session_by_id_prefix(&sender_session_id[..8.min(sender_session_id.len())])
+                    .await
+                {
+                    let _ = state.mm.post_in_thread(
+                        &sender.channel_id, &sender.thread_id,
+                        &format!(":hourglass: **{}** already has a pending task. Wait for their response.", role),
+                    ).await;
+                    let header = format_team_context_header(&members, sender_role);
+                    let ack = format!(
+                        "[ACK:TO target=\"{}\" status=rejected reason=already_pending]",
+                        role,
+                    );
+                    let _ = state.containers.send(&sender.session_id, &format!(
+                        "{}\n{}\nTask delivery rejected: {} already has a pending task from you. Wait for their response before sending another task.",
+                        ack, header, role,
+                    )).await;
+                }
+            } else if let Ok(Some(sender)) = state
                 .db
                 .get_session_by_id_prefix(&sender_session_id[..8.min(sender_session_id.len())])
                 .await
             {
+                // Candidates were idle when read but all got snatched mid-loop.
                 let header = format_team_context_header(&members, sender_role);
-                let fail_msg = format!(
-                    "{}\n:x: **Message delivery to {} failed** — their session may have died or disconnected.\nUse [TEAM_STATUS] to check the roster. You may need to re-spawn the role or reassign the task.",
-                    header, role,
+                let ack = format!(
+                    "[ACK:TO target=\"{}\" status=rejected reason=slot_lost_race]",
+                    target_role,
                 );
-                let _ = state.containers.send(&sender.session_id, &fail_msg).await;
-                let _ = state
-                    .mm
-                    .post_in_thread(
-                        &sender.channel_id,
-                        &sender.thread_id,
-                        &format!(
-                            ":x: Failed to deliver message to **{}** — session unreachable.",
-                            role
-                        ),
-                    )
-                    .await;
+                let _ = state.containers.send(&sender.session_id, &format!(
+                    "{}\n{}\nAll {} members are now busy (another assignment landed first). Use [TEAM_STATUS] and retry once one is idle.",
+                    ack, header, target_role,
+                )).await;
+                let _ = state.mm.post_in_thread(
+                    &sender.channel_id, &sender.thread_id,
+                    &format!(":hourglass: All **{}** members are busy. Wait for a response.", target_role),
+                ).await;
             }
-            // Clear the pending task we just set — delivery didn't happen
-            let _ = state.db.clear_pending_task(&target.session_id).await;
-        } else {
-            delivered_roles.push(role.to_string());
+            return;
         }
+    };
+
+    let role = target.role.as_deref().unwrap_or(target_role);
+    let header = format_team_context_header(&members, role);
+    let formatted = format!("{}\n**From {}**: {}", header, sender_role, message);
+
+    // pending_task is already set by try_set_pending_task above. Post the
+    // Mattermost visibility line, then push to the target's container.
+    let _ = state
+        .mm
+        .post_in_thread(
+            &target.channel_id,
+            &target.thread_id,
+            &format!(
+                ":arrow_left: **From {}:**\n{}",
+                sender_role,
+                truncate_preview(message, 4000)
+            ),
+        )
+        .await;
+
+    let mut delivered_roles: Vec<String> = Vec::new();
+    if let Err(e) = state.containers.send(&target.session_id, &formatted).await {
+        tracing::warn!(error = %e, role, "Failed to deliver team message");
+        // Roll back the claim so the slot is free again.
+        let _ = state.db.clear_pending_task(&target.session_id).await;
+        if let Ok(Some(sender)) = state
+            .db
+            .get_session_by_id_prefix(&sender_session_id[..8.min(sender_session_id.len())])
+            .await
+        {
+            let header = format_team_context_header(&members, sender_role);
+            let ack = format!(
+                "[ACK:TO target=\"{}\" status=failed reason=delivery_unreachable]",
+                role,
+            );
+            let fail_msg = format!(
+                "{}\n{}\n:x: **Message delivery to {} failed** — their session may have died or disconnected.\nUse [TEAM_STATUS] to check the roster. You may need to re-spawn the role or reassign the task.",
+                ack, header, role,
+            );
+            let _ = state.containers.send(&sender.session_id, &fail_msg).await;
+            let _ = state
+                .mm
+                .post_in_thread(
+                    &sender.channel_id,
+                    &sender.thread_id,
+                    &format!(
+                        ":x: Failed to deliver message to **{}** — session unreachable.",
+                        role
+                    ),
+                )
+                .await;
+        }
+    } else {
+        delivered_roles.push(role.to_string());
     }
 
     // Post delivery note in sender's thread + coordination log
@@ -3696,9 +3927,10 @@ async fn route_team_message(
 
         // Inject delivery receipt into sender's Claude session
         let header = format_team_context_header(&members, sender_role);
+        let ack = format!("[ACK:TO target=\"{}\" status=ok]", label);
         let _ = state.containers.send(&sender.session_id, &format!(
-            "{}\nDelivery receipt: message delivered to {}. Wait for their response before sending another task.",
-            header, label,
+            "{}\n{}\nDelivery receipt: message delivered to {}. Wait for their response before sending another task.",
+            ack, header, label,
         )).await;
 
         // Post to coordination log
@@ -3863,12 +4095,12 @@ fn handle_team_spawn(
             }
         };
 
-        // Determine the actual role display name (with instance numbering for multi-instance roles)
-        let members = state.db.get_team_members(team_id).await.unwrap_or_default();
-        let display_name = if role_def.allow_multiple {
-            // Before spawning a new instance, check if any existing members of this
-            // role are idle (active status, no pending task).  If so, reject the
-            // spawn and tell the lead to assign work to the idle member first.
+        // Soft pre-check: if the role allows multiple and an idle member of the
+        // same role exists, reject so the Lead reuses the idle one rather than
+        // spawning yet another. This is best-effort UX — the atomic claim below
+        // is what guarantees no duplicate (team_id, role) ever exists.
+        if role_def.allow_multiple {
+            let members = state.db.get_team_members(team_id).await.unwrap_or_default();
             let idle_same_role: Vec<&StoredSession> = members
                 .iter()
                 .filter(|m| {
@@ -3902,33 +4134,43 @@ fn handle_team_spawn(
                         .post_in_thread(&lead.channel_id, &lead.thread_id, &reject_msg)
                         .await;
                     let header = build_team_context_header(&state.db, team_id, "Team Lead").await;
+                    let ack = format!(
+                        "[ACK:SPAWN role=\"{}\" status=rejected reason=idle_available idle=\"{}\"]",
+                        role_def.display_name, idle_names[0],
+                    );
                     let _ = state.containers.send(&lead.session_id, &format!(
-                    "{}\nSpawn rejected: {} is idle and available. Use [TO:{}] to assign them a task before spawning a new {}.\nThe task you wanted to assign was: {}",
-                    header, idle_list, idle_names[0], role_def.display_name, initial_task,
+                    "{}\n{}\nSpawn rejected: {} is idle and available. Use [TO:{}] to assign them a task before spawning a new {}.\nThe task you wanted to assign was: {}",
+                    ack, header, idle_list, idle_names[0], role_def.display_name, initial_task,
                 )).await;
                 }
                 return;
             }
+        }
 
-            // Count existing instances of this base role
-            let existing_count = members
-                .iter()
-                .filter(|m| {
-                    m.role
-                        .as_deref()
-                        .map(|r| r.starts_with(&role_def.display_name))
-                        .unwrap_or(false)
-                })
-                .count();
-            let instance_num = existing_count + 1;
-            format!("{} {}", role_def.display_name, instance_num)
-        } else {
-            // Singleton: check for duplicates
-            let already_exists = members
-                .iter()
-                .any(|m| m.role.as_deref() == Some(&role_def.display_name));
-            if already_exists {
-                // Post error in Lead's thread
+        // Atomically claim the (team_id, role) slot before any expensive work.
+        // For singletons, returns None if the role is taken. For multi-instance,
+        // serializes via advisory lock and assigns the next monotonic instance
+        // number (e.g. "Developer 3"). The pre-allocated session_id is reused
+        // when start_session creates the row, so the claim and the session row
+        // share an identity.
+        let pre_session_id = Uuid::new_v4().to_string();
+        let display_name = match state
+            .db
+            .claim_team_role(
+                team_id,
+                &role_def.display_name,
+                role_def.allow_multiple,
+                &pre_session_id,
+            )
+            .await
+        {
+            Ok(Some(name)) => name,
+            Ok(None) => {
+                tracing::info!(
+                    team_id,
+                    role = %role_def.display_name,
+                    "Spawn rejected: role slot already claimed (singleton)"
+                );
                 if let Ok(Some(lead)) = state
                     .db
                     .get_session_by_id_prefix(&lead_session_id[..8.min(lead_session_id.len())])
@@ -3946,20 +4188,28 @@ fn handle_team_spawn(
                         )
                         .await;
                     let header = build_team_context_header(&state.db, team_id, "Team Lead").await;
+                    let ack = format!(
+                        "[ACK:SPAWN role=\"{}\" status=rejected reason=already_exists]",
+                        role_def.display_name,
+                    );
                     let _ = state
                         .containers
                         .send(
                             &lead.session_id,
                             &format!(
-                                "{}\nSpawn rejected: {} is already on the team (singleton role).",
-                                header, role_def.display_name,
+                                "{}\n{}\nSpawn rejected: {} is already on the team (singleton role).",
+                                ack, header, role_def.display_name,
                             ),
                         )
                         .await;
                 }
                 return;
             }
-            role_def.display_name.clone()
+            Err(e) => {
+                tracing::error!(team_id, role = %role_def.display_name, error = %e,
+                    "Failed to claim team role slot");
+                return;
+            }
         };
 
         // Team-spawned sessions always use worktrees for isolation.
@@ -3990,7 +4240,8 @@ fn handle_team_spawn(
         // Determine session type
         let session_type = "team_member";
 
-        // Start the member session
+        // Start the member session, reusing the pre-allocated session_id from
+        // the claim so claim_team_role.session_id matches sessions.session_id.
         let session_result: Result<String> = Box::pin(start_session(
             &state,
             channel_id,
@@ -4002,6 +4253,7 @@ fn handle_team_spawn(
             Some(team_id),
             Some(&display_name),
             Some(&member_prompt),
+            Some(&pre_session_id),
         ))
         .await;
         match session_result {
@@ -4044,9 +4296,10 @@ fn handle_team_spawn(
                         .await;
                     // Feed confirmation back into the lead's Claude session so it can continue
                     let header = build_team_context_header(&state.db, team_id, "Team Lead").await;
+                    let ack = format!("[ACK:SPAWN role=\"{}\" status=ok]", display_name);
                     if let Err(e) = state.containers.send(&lead.session_id, &format!(
-                    "{}\nSpawn confirmed: {} is now active and has been assigned the task. Wait for their response before sending another task.",
-                    header, display_name,
+                    "{}\n{}\nSpawn confirmed: {} is now active and has been assigned the task. Wait for their response before sending another task.",
+                    ack, header, display_name,
                 )).await {
                     tracing::warn!(error = %e, "Failed to send spawn confirmation to Team Lead session");
                 }
@@ -4073,6 +4326,11 @@ fn handle_team_spawn(
             }
             Err(e) => {
                 tracing::error!(error = %e, role = %display_name, "Failed to spawn team member");
+                // Release the claim so a retry isn't blocked by a leaked slot.
+                if let Err(re) = state.db.release_team_role(team_id, &display_name).await {
+                    tracing::warn!(team_id, role = %display_name, error = %re,
+                        "Failed to release team role claim after spawn failure");
+                }
                 if let Ok(Some(lead)) = state
                     .db
                     .get_session_by_id_prefix(&lead_session_id[..8.min(lead_session_id.len())])
@@ -4087,11 +4345,18 @@ fn handle_team_spawn(
                         )
                         .await;
                     let header = build_team_context_header(&state.db, team_id, "Team Lead").await;
+                    let ack = format!(
+                        "[ACK:SPAWN role=\"{}\" status=failed reason=spawn_failed]",
+                        display_name,
+                    );
                     let _ = state
                         .containers
                         .send(
                             &lead.session_id,
-                            &format!("{}\nSpawn failed for {}: {}", header, display_name, e,),
+                            &format!(
+                                "{}\n{}\nSpawn failed for {}: {}",
+                                ack, header, display_name, e,
+                            ),
                         )
                         .await;
                 }
