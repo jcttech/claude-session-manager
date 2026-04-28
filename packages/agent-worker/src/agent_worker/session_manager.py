@@ -64,15 +64,20 @@ class SessionManager:
         """Get an existing client by session_id."""
         return self._sessions.get(session_id)
 
-    async def remove(self, session_id: str) -> None:
-        """Remove and disconnect a session."""
+    async def remove(self, session_id: str) -> bool:
+        """Remove and disconnect a session.
+
+        Returns True if the session existed and was removed, False otherwise.
+        """
         client = self._sessions.pop(session_id, None)
-        if client is not None:
-            try:
-                await client.disconnect()
-            except Exception:
-                logger.warning("Error disconnecting session %s", session_id, exc_info=True)
-            logger.info("Removed session %s", session_id)
+        if client is None:
+            return False
+        try:
+            await client.disconnect()
+        except Exception:
+            logger.warning("Error disconnecting session %s", session_id, exc_info=True)
+        logger.info("Removed session %s", session_id)
+        return True
 
     async def interrupt(self, session_id: str) -> bool:
         """Interrupt a running session. Returns True if found and interrupted."""

@@ -3,9 +3,9 @@
 import grpc
 import warnings
 
-import agent_pb2 as agent__pb2
+from . import agent_pb2 as agent__pb2
 
-GRPC_GENERATED_VERSION = '1.78.0'
+GRPC_GENERATED_VERSION = '1.80.0'
 GRPC_VERSION = grpc.__version__
 _version_not_supported = False
 
@@ -44,6 +44,11 @@ class AgentWorkerStub(object):
                 request_serializer=agent__pb2.InterruptRequest.SerializeToString,
                 response_deserializer=agent__pb2.InterruptResponse.FromString,
                 _registered_method=True)
+        self.ClearSession = channel.unary_unary(
+                '/claude_agent.AgentWorker/ClearSession',
+                request_serializer=agent__pb2.ClearRequest.SerializeToString,
+                response_deserializer=agent__pb2.ClearResponse.FromString,
+                _registered_method=True)
         self.Health = channel.unary_unary(
                 '/claude_agent.AgentWorker/Health',
                 request_serializer=agent__pb2.HealthRequest.SerializeToString,
@@ -67,6 +72,12 @@ class AgentWorkerServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def ClearSession(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
     def Health(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
@@ -85,6 +96,11 @@ def add_AgentWorkerServicer_to_server(servicer, server):
                     servicer.Interrupt,
                     request_deserializer=agent__pb2.InterruptRequest.FromString,
                     response_serializer=agent__pb2.InterruptResponse.SerializeToString,
+            ),
+            'ClearSession': grpc.unary_unary_rpc_method_handler(
+                    servicer.ClearSession,
+                    request_deserializer=agent__pb2.ClearRequest.FromString,
+                    response_serializer=agent__pb2.ClearResponse.SerializeToString,
             ),
             'Health': grpc.unary_unary_rpc_method_handler(
                     servicer.Health,
@@ -146,6 +162,33 @@ class AgentWorker(object):
             '/claude_agent.AgentWorker/Interrupt',
             agent__pb2.InterruptRequest.SerializeToString,
             agent__pb2.InterruptResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ClearSession(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/claude_agent.AgentWorker/ClearSession',
+            agent__pb2.ClearRequest.SerializeToString,
+            agent__pb2.ClearResponse.FromString,
             options,
             channel_credentials,
             insecure,

@@ -113,6 +113,7 @@ pub struct StoredTeamTask {
     pub delivered_at: Option<chrono::DateTime<chrono::Utc>>,
     pub cancelled_at: Option<chrono::DateTime<chrono::Utc>>,
     pub failure_reason: Option<String>,
+    pub deliver_after: chrono::DateTime<chrono::Utc>,
 }
 
 #[derive(Debug, FromRow)]
@@ -583,9 +584,19 @@ pub async fn create_schema(pool: &PgPool, schema: &str) -> Result<()> {
             created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
             delivered_at      TIMESTAMPTZ,
             cancelled_at      TIMESTAMPTZ,
-            failure_reason    TEXT
+            failure_reason    TEXT,
+            deliver_after     TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )
         "#,
+        schema
+    ))
+    .execute(pool)
+    .await?;
+
+    // Upgrade path for pre-existing tables created without deliver_after.
+    sqlx::query(&format!(
+        "ALTER TABLE {}.team_task_queue \
+         ADD COLUMN IF NOT EXISTS deliver_after TIMESTAMPTZ NOT NULL DEFAULT NOW()",
         schema
     ))
     .execute(pool)
@@ -1536,11 +1547,12 @@ impl Database {
         sender_session_id: &str,
         sender_role: &str,
         message: &str,
+        deliver_after: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<i64> {
         let row: (i64,) = sqlx::query_as(&format!(
             "INSERT INTO {}.team_task_queue \
-                 (team_id, target_role, is_prefix_match, sender_session_id, sender_role, message) \
-             VALUES ($1, $2, $3, $4, $5, $6) \
+                 (team_id, target_role, is_prefix_match, sender_session_id, sender_role, message, deliver_after) \
+             VALUES ($1, $2, $3, $4, $5, $6, COALESCE($7, NOW())) \
              RETURNING task_id",
             SCHEMA
         ))
@@ -1550,20 +1562,22 @@ impl Database {
         .bind(sender_session_id)
         .bind(sender_role)
         .bind(message)
+        .bind(deliver_after)
         .fetch_one(&self.pool)
         .await?;
         Ok(row.0)
     }
 
-    /// Oldest-first list of all queued tasks for a team. Drain orchestration
-    /// in main.rs walks this list and tries to claim a target for each row.
+    /// Oldest-first list of queued tasks for a team that are ready to deliver
+    /// now (deliver_after has passed). Drain orchestration walks this list
+    /// and tries to claim a target for each row.
     pub async fn list_queued_tasks_for_team(&self, team_id: &str) -> Result<Vec<StoredTeamTask>> {
         let rows = sqlx::query_as::<_, StoredTeamTask>(&format!(
             "SELECT task_id, team_id, target_role, target_session_id, is_prefix_match, \
                     sender_session_id, sender_role, message, status, \
-                    created_at, delivered_at, cancelled_at, failure_reason \
+                    created_at, delivered_at, cancelled_at, failure_reason, deliver_after \
              FROM {}.team_task_queue \
-             WHERE team_id = $1 AND status = 'queued' \
+             WHERE team_id = $1 AND status = 'queued' AND deliver_after <= NOW() \
              ORDER BY created_at ASC",
             SCHEMA
         ))
@@ -1571,6 +1585,21 @@ impl Database {
         .fetch_all(&self.pool)
         .await?;
         Ok(rows)
+    }
+
+    /// Distinct team_ids with at least one queued task whose deliver_after has
+    /// just become eligible. The periodic scheduled-drain ticker uses this to
+    /// know which teams need a drain pass.
+    pub async fn teams_with_ready_scheduled_tasks(&self) -> Result<Vec<String>> {
+        let rows: Vec<(String,)> = sqlx::query_as(&format!(
+            "SELECT DISTINCT team_id \
+             FROM {}.team_task_queue \
+             WHERE status = 'queued' AND deliver_after <= NOW()",
+            SCHEMA
+        ))
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(|(t,)| t).collect())
     }
 
     /// Mark a queued task as delivered. Caller has already pushed the message

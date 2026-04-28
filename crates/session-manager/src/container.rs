@@ -764,6 +764,42 @@ impl ContainerManager {
         }
     }
 
+    /// Genuinely clear a session's conversation context.
+    ///
+    /// The Claude Agent SDK does not interpret `/clear` as a slash command —
+    /// sending the literal string just appends "/clear" as a user message. To
+    /// actually wipe history we must:
+    ///   1. Reset local flags so the next message creates a fresh session
+    ///      with no `resume_session_id` (via [`restart_session`]).
+    ///   2. Tell the worker to disconnect the live SDK client.
+    ///
+    /// After step 2 the bidi gRPC stream ends; the message_processor enters
+    /// disconnected state; the next user message reconnects via CreateSession
+    /// with no resume → genuinely fresh context. Order matters: step 1 first,
+    /// otherwise the reconnect path would still resume the cleared session.
+    pub async fn clear(&self, session_id: &str) -> Result<bool> {
+        let session = self
+            .sessions
+            .get(session_id)
+            .ok_or_else(|| anyhow!("Session {} not found", session_id))?;
+        let claude_sid = session.claude_session_id.lock().unwrap().clone();
+        let grpc_addr = session.grpc_addr.clone();
+        drop(session);
+
+        // Step 1: reset local-side flags so reconnect skips resume.
+        self.restart_session(session_id).await?;
+
+        // Step 2: tell the worker to drop the SDK client. If we never captured
+        // a claude_session_id (very early in the session), nothing to clear
+        // worker-side; the local reset is enough.
+        let Some(claude_sid) = claude_sid else {
+            return Ok(false);
+        };
+
+        let mut executor = GrpcExecutor::connect(&grpc_addr).await?;
+        executor.clear_session(&claude_sid).await
+    }
+
     /// Interrupt a running Claude session via a separate gRPC unary RPC.
     /// Returns Ok(true) if interrupted, Ok(false) if no active session.
     pub async fn interrupt(&self, session_id: &str) -> Result<bool> {

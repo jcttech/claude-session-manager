@@ -561,6 +561,29 @@ async fn main() -> Result<()> {
         }
     });
 
+    // Scheduled-drain ticker: every 30s, find teams with at least one queued
+    // task whose deliver_after has passed and trigger drain_team_queue. Cheap
+    // (one indexed scan over team_task_queue) and 30s latency is fine for the
+    // "deliver in N hours" use case.
+    let scheduled_state = state.clone();
+    let _scheduled_drain_handle = tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            match scheduled_state.db.teams_with_ready_scheduled_tasks().await {
+                Ok(team_ids) => {
+                    for team_id in team_ids {
+                        drain_team_queue(&scheduled_state, &team_id).await;
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "Scheduled-drain query failed");
+                }
+            }
+        }
+    });
+
     // Configure rate limiting
     let s = config::settings();
     let rate_limiter = RateLimitLayer::new(s.rate_limit_rps, s.rate_limit_burst);
@@ -1190,6 +1213,61 @@ fn format_root_label(session_type: &str, project: &str, role: Option<&str>) -> S
     }
 }
 
+/// Parse a `/schedule <role> <time> <message>` command body (without the
+/// leading `/schedule `). Returns (role, deliver_after_utc, message) or a
+/// human-readable error string suitable for posting back to the thread.
+fn parse_schedule_command(
+    input: &str,
+) -> Result<(String, chrono::DateTime<chrono::Utc>, String), String> {
+    let trimmed = input.trim_start();
+    if trimmed.is_empty() {
+        return Err("missing <role>".into());
+    }
+    let (role, rest) = trimmed
+        .split_once(char::is_whitespace)
+        .ok_or("missing <time> and <message> after role")?;
+    let rest = rest.trim_start();
+    let (time_token, rest) = rest
+        .split_once(char::is_whitespace)
+        .ok_or("missing <message> after time")?;
+    let deliver_after = parse_schedule_time(time_token)?;
+    let message = rest.trim();
+    if message.is_empty() {
+        return Err("missing <message>".into());
+    }
+    Ok((role.to_string(), deliver_after, message.to_string()))
+}
+
+/// Parse a /schedule time token: `+Ns`, `+Nm`, `+Nh`, `+Nd`, or RFC3339.
+fn parse_schedule_time(tok: &str) -> Result<chrono::DateTime<chrono::Utc>, String> {
+    if let Some(rel) = tok.strip_prefix('+') {
+        let split = rel
+            .find(|c: char| !c.is_ascii_digit())
+            .ok_or_else(|| format!("bad relative time '{}'; expected e.g. +5h", tok))?;
+        let (num_str, unit) = rel.split_at(split);
+        let n: i64 = num_str
+            .parse()
+            .map_err(|_| format!("bad relative number in '{}'", tok))?;
+        let dur = match unit {
+            "s" => chrono::Duration::seconds(n),
+            "m" => chrono::Duration::minutes(n),
+            "h" => chrono::Duration::hours(n),
+            "d" => chrono::Duration::days(n),
+            other => {
+                return Err(format!(
+                    "unknown time unit '{}' in '{}'; use s/m/h/d",
+                    other, tok
+                ))
+            }
+        };
+        Ok(chrono::Utc::now() + dur)
+    } else {
+        chrono::DateTime::parse_from_rfc3339(tok)
+            .map(|dt| dt.with_timezone(&chrono::Utc))
+            .map_err(|e| format!("bad RFC3339 timestamp '{}': {}", tok, e))
+    }
+}
+
 async fn handle_messages(
     state: Arc<AppState>,
     mut rx: mpsc::Receiver<Post>,
@@ -1218,6 +1296,84 @@ async fn handle_messages(
             let root_id = &post.root_id;
 
             if let Ok(Some(session)) = state.db.get_session_by_thread(channel_id, root_id).await {
+                // User-only `/schedule <role> <time> <message>` — intercepted
+                // before the LLM ever sees it. Inserts directly into the
+                // team_task_queue with deliver_after; the periodic scheduled
+                // drain ticker delivers when it's due. Lead threads only.
+                if text.starts_with("/schedule ") || text == "/schedule" {
+                    if session.session_type != "team_lead" {
+                        let _ = state
+                            .mm
+                            .post_in_thread(
+                                channel_id,
+                                root_id,
+                                "/schedule is only available in Team Lead threads.",
+                            )
+                            .await;
+                        continue;
+                    }
+                    let Some(team_id) = session.team_id.clone() else {
+                        let _ = state
+                            .mm
+                            .post_in_thread(
+                                channel_id,
+                                root_id,
+                                "Team Lead session has no team_id; cannot schedule.",
+                            )
+                            .await;
+                        continue;
+                    };
+                    let body = text.trim_start_matches("/schedule").trim_start();
+                    match parse_schedule_command(body) {
+                        Ok((role, deliver_after, message)) => {
+                            match state
+                                .db
+                                .enqueue_team_task(
+                                    &team_id,
+                                    &role,
+                                    false,
+                                    &session.session_id,
+                                    "Team Lead",
+                                    &message,
+                                    Some(deliver_after),
+                                )
+                                .await
+                            {
+                                Ok(task_id) => {
+                                    let _ = state.mm.post_in_thread(
+                                        channel_id,
+                                        root_id,
+                                        &format!(
+                                            ":alarm_clock: **Scheduled** task #{} for **{}** at {} (UTC).",
+                                            task_id,
+                                            role,
+                                            deliver_after.to_rfc3339(),
+                                        ),
+                                    ).await;
+                                }
+                                Err(e) => {
+                                    let _ = state.mm.post_in_thread(
+                                        channel_id,
+                                        root_id,
+                                        &format!("Failed to schedule: {}", e),
+                                    ).await;
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            let _ = state.mm.post_in_thread(
+                                channel_id,
+                                root_id,
+                                &format!(
+                                    "/schedule error: {}\nUsage: `/schedule <role> <+5h|+30m|+2d|RFC3339> <message>`",
+                                    e,
+                                ),
+                            ).await;
+                        }
+                    }
+                    continue;
+                }
+
                 // Check for in-thread commands
                 if text.starts_with(bot_trigger) {
                     let cmd = text.trim_start_matches(bot_trigger).trim();
@@ -1376,7 +1532,7 @@ async fn handle_messages(
                         continue;
                     }
                     if cmd == "clear" {
-                        let _ = state.containers.send(&session.session_id, "/clear").await;
+                        let _ = state.containers.clear(&session.session_id).await;
                         let _ = state
                             .mm
                             .post_in_thread(channel_id, root_id, "Context cleared.")
@@ -3193,9 +3349,9 @@ async fn stream_output(
                             tracing::info!(
                                 session_id = %session_id,
                                 ctx_display, ctx_max,
-                                "auto-clear: context above threshold, sending /clear"
+                                "auto-clear: context above threshold, clearing session"
                             );
-                            let _ = state.containers.send(&session_id, "/clear").await;
+                            let _ = state.containers.clear(&session_id).await;
 
                             // Re-inject team status after clear so the agent
                             // retains roster context despite losing conversation history
@@ -3548,12 +3704,13 @@ CRITICAL: All markers MUST start at the beginning of a new line. Do NOT embed ma
                           ResponseComplete that follows. Prefix match (e.g.
                           [INTERRUPT:Developer]) interrupts every matching
                           member; use the exact role for one.
-  [CLEAR:Role Name]       Send `/clear` to a member to reset their conversation
-                          history. Membank reloads baseline context on their next
-                          message. Use sparingly — context loss costs continuity.
-                          Shares a 180s cooldown with auto-clear, so back-to-back
-                          requests within that window are rejected with
-                          reason=cooldown.
+  [CLEAR:Role Name]       Genuinely reset a member's conversation history (drops
+                          the live SDK client; reconnect on next message starts
+                          fresh, no resume). Membank reloads baseline context on
+                          their next message. Use sparingly — context loss costs
+                          continuity. Shares a 180s cooldown with auto-clear, so
+                          back-to-back requests within that window are rejected
+                          with reason=cooldown.
   [CANCEL_QUEUED:Role]      Drop ALL still-queued tasks from you to that role.
   [CANCEL_QUEUED:Role:N]    Drop just queue_id=N. Already-delivered tasks
                             cannot be cancelled — use [INTERRUPT:Role] for those.
@@ -3573,6 +3730,16 @@ If you want to halt a member entirely:
 
 Messages from team members arrive prefixed with their role.
 Each message you receive will include a [TEAM: ...] header with the current roster.
+
+## Scheduled Tasks (out-of-band)
+The user can type `/schedule <role> <+5h|+30m|+2d|RFC3339> <message>` directly
+into your thread to enqueue a delayed task — useful for things like "ping the
+Developer in 5 hours to continue work after the rate-limit window." The system
+intercepts these before you ever see them, inserts into the queue with a
+deliver_after timestamp, and they fire when due. You will receive the standard
+[ACK:TO ... status=delivered queue_id=N] when the drain hands one off, even
+though you never emitted the corresponding [TO:]. Treat such ACKs as
+informational — no action required unless a member then escalates.
 
 ## Structured Acknowledgements
 After every [SPAWN:Role] and [TO:Role] you emit, the system replies with an [ACK:...] line. **Treat these as authoritative ground truth** — the English message is for the user; the ACK is for you. Examples:
@@ -3914,6 +4081,7 @@ async fn route_team_message(
             sender_session_id,
             sender_role,
             message,
+            None,
         )
         .await
     {
@@ -4447,8 +4615,8 @@ async fn handle_team_clear(
             );
             continue;
         }
-        match state.containers.send(&t.session_id, "/clear").await {
-            Ok(()) => {
+        match state.containers.clear(&t.session_id).await {
+            Ok(_) => {
                 ok_roles.push(role.to_string());
                 // Re-inject roster so the member retains team context.
                 handle_team_status(state, &t.session_id, team_id).await;
@@ -4464,7 +4632,7 @@ async fn handle_team_clear(
             Err(e) => {
                 failed_roles.push(role.to_string());
                 tracing::warn!(error = %e, session_id = %t.session_id, role,
-                    "Failed to deliver /clear to member");
+                    "Failed to clear member session");
             }
         }
     }

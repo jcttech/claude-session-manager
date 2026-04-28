@@ -278,6 +278,20 @@ class AgentWorkerServicer(agent_pb2_grpc.AgentWorkerServicer):
         success = await self.sessions.interrupt(request.session_id)
         return agent_pb2.InterruptResponse(success=success)
 
+    async def ClearSession(self, request, context):
+        """Disconnect the SDK client for a session.
+
+        The bidi Session task's sdk_reader will see StopAsyncIteration on the
+        old message stream and shut down, ending the bidi stream. session-manager
+        observes the disconnect and reconnects on the next user message — with
+        is_first_message=true and no resume_session_id (caller's responsibility),
+        the new stream starts a fresh conversation. This is how /clear actually
+        works in SDK mode (slash commands aren't honored by the SDK).
+        """
+        logger.info("ClearSession: session=%s", request.session_id)
+        existed = await self.sessions.remove(request.session_id)
+        return agent_pb2.ClearResponse(success=existed)
+
     async def Health(self, request, context):
         """Health check endpoint."""
         return agent_pb2.HealthResponse(

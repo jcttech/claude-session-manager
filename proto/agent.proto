@@ -5,6 +5,7 @@ service AgentWorker {
   // One bidirectional stream per session — replaces Execute + SendMessage
   rpc Session (stream SessionInput) returns (stream AgentEvent);
   rpc Interrupt (InterruptRequest) returns (InterruptResponse);
+  rpc ClearSession (ClearRequest) returns (ClearResponse);
   rpc Health (HealthRequest) returns (HealthResponse);
 }
 
@@ -34,6 +35,14 @@ message InterruptRequest {
 }
 
 message InterruptResponse {
+  bool success = 1;
+}
+
+message ClearRequest {
+  string session_id = 1;
+}
+
+message ClearResponse {
   bool success = 1;
 }
 

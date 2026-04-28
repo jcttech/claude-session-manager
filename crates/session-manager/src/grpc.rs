@@ -12,7 +12,7 @@ pub mod proto {
 }
 
 use proto::agent_worker_client::AgentWorkerClient;
-use proto::{agent_event, HealthRequest, InterruptRequest};
+use proto::{agent_event, ClearRequest, HealthRequest, InterruptRequest};
 
 /// gRPC client that communicates with the Python Agent SDK worker.
 pub struct GrpcExecutor {
@@ -70,6 +70,24 @@ impl GrpcExecutor {
             .interrupt(request)
             .await
             .map_err(|e| anyhow!("Interrupt RPC failed: {}", e))?;
+
+        Ok(response.into_inner().success)
+    }
+
+    /// Disconnect the SDK client for a session. The worker drops the client;
+    /// the bidi Session stream ends; session-manager reconnects on the next
+    /// user message with no resume → fresh context. This is the actual
+    /// /clear primitive (the SDK does not honor "/clear" as a slash command).
+    pub async fn clear_session(&mut self, session_id: &str) -> Result<bool> {
+        let request = ClearRequest {
+            session_id: session_id.to_string(),
+        };
+
+        let response = self
+            .client
+            .clear_session(request)
+            .await
+            .map_err(|e| anyhow!("ClearSession RPC failed: {}", e))?;
 
         Ok(response.into_inner().success)
     }
