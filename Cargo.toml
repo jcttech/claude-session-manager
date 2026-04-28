@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/*"]
 
 [workspace.package]
-version = "2.5.3"
+version = "2.5.4"
 
 [workspace.dependencies]
 tokio = { version = "1.52.1", features = ["full"] }

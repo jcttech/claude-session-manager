@@ -97,6 +97,16 @@ pub struct StoredPendingRequest {
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
+/// Outcome of `enqueue_team_clear`. Cooldown / AlreadyQueued are not errors —
+/// they're normal flow-control outcomes the caller surfaces back to the Lead
+/// via [ACK:CLEAR ... status=rejected reason=cooldown] / [...status=queued].
+#[derive(Debug, Clone)]
+pub enum EnqueueClearResult {
+    Enqueued(i64),
+    Cooldown { remaining_secs: i64 },
+    AlreadyQueued(i64),
+}
+
 #[derive(Debug, Clone, FromRow)]
 #[allow(dead_code)]
 pub struct StoredTeamTask {
@@ -114,6 +124,14 @@ pub struct StoredTeamTask {
     pub cancelled_at: Option<chrono::DateTime<chrono::Utc>>,
     pub failure_reason: Option<String>,
     pub deliver_after: chrono::DateTime<chrono::Utc>,
+    /// 'message' (default), 'spawn', or 'clear'. Distinguishes the three
+    /// drain handlers: deliver-to-idle-target, claim-and-spawn-new-member,
+    /// and reset-target-context. Added in v2.5.4 to consolidate three formerly
+    /// inline control paths into one durable queue.
+    pub task_type: String,
+    /// For task_type='spawn', JSON payload with extra args (project string,
+    /// initial task, etc.). For other task types, NULL.
+    pub spawn_payload: Option<serde_json::Value>,
 }
 
 #[derive(Debug, FromRow)]
@@ -602,6 +620,25 @@ pub async fn create_schema(pool: &PgPool, schema: &str) -> Result<()> {
     .execute(pool)
     .await?;
 
+    // task_type discriminates message / spawn / clear rows. Default 'message'
+    // preserves existing rows. Added in v2.5.4.
+    sqlx::query(&format!(
+        "ALTER TABLE {}.team_task_queue \
+         ADD COLUMN IF NOT EXISTS task_type TEXT NOT NULL DEFAULT 'message'",
+        schema
+    ))
+    .execute(pool)
+    .await?;
+
+    // spawn_payload carries spawn-specific args (project string, etc.) for
+    // task_type='spawn' rows. NULL for message/clear.
+    sqlx::query(&format!(
+        "ALTER TABLE {}.team_task_queue ADD COLUMN IF NOT EXISTS spawn_payload JSONB",
+        schema
+    ))
+    .execute(pool)
+    .await?;
+
     // Drain hot path: oldest queued row per team+role, partial index keeps it tight.
     sqlx::query(&format!(
         "CREATE INDEX IF NOT EXISTS idx_team_task_queue_drain \
@@ -616,6 +653,29 @@ pub async fn create_schema(pool: &PgPool, schema: &str) -> Result<()> {
     sqlx::query(&format!(
         "CREATE INDEX IF NOT EXISTS idx_team_task_queue_sender \
          ON {}.team_task_queue (team_id, sender_session_id, status)",
+        schema
+    ))
+    .execute(pool)
+    .await?;
+
+    // Spawn dedupe lookup: enqueue_team_spawn checks for an existing spawn row
+    // with the same team+role+md5(message) within a 5-minute window to
+    // suppress LLM re-emissions of the same intent.
+    sqlx::query(&format!(
+        "CREATE INDEX IF NOT EXISTS idx_team_task_queue_spawn_dedupe \
+         ON {}.team_task_queue (team_id, target_role, created_at) \
+         WHERE task_type = 'spawn'",
+        schema
+    ))
+    .execute(pool)
+    .await?;
+
+    // Clear cooldown lookup: enqueue_team_clear computes MAX(delivered_at)
+    // per target_session_id to enforce the AUTO_CLEAR_COOLDOWN_SECS window.
+    sqlx::query(&format!(
+        "CREATE INDEX IF NOT EXISTS idx_team_task_queue_clear_history \
+         ON {}.team_task_queue (target_session_id, delivered_at DESC) \
+         WHERE task_type = 'clear'",
         schema
     ))
     .execute(pool)
@@ -1568,6 +1628,132 @@ impl Database {
         Ok(row.0)
     }
 
+    /// Enqueue a [SPAWN:Role] task. Performs an atomic SQL-level dedupe: if
+    /// an existing spawn row for the same (team, role, md5(message)) is
+    /// queued or recently delivered, returns the existing task_id without
+    /// inserting. This catches LLM re-emissions that slip past in-memory
+    /// dedupe windows (the original bug: re-emit after dedupe TTL expires
+    /// while Developer 1 is still busy with the same task → spawned
+    /// Developer 2 by accident).
+    ///
+    /// Returns Ok(Ok(task_id)) on insert, Ok(Err(existing_id)) on dedupe hit.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn enqueue_team_spawn(
+        &self,
+        team_id: &str,
+        target_role: &str,
+        sender_session_id: &str,
+        sender_role: &str,
+        initial_task: &str,
+        spawn_payload: &serde_json::Value,
+        dedupe_window_secs: i64,
+    ) -> Result<std::result::Result<i64, i64>> {
+        // Dedupe window. Same role + same task content = same intent, suppressed.
+        let existing: Option<(i64,)> = sqlx::query_as(&format!(
+            "SELECT task_id FROM {}.team_task_queue \
+             WHERE team_id = $1 AND target_role = $2 AND task_type = 'spawn' \
+               AND md5(message) = md5($3) \
+               AND status IN ('queued', 'delivered') \
+               AND created_at > NOW() - make_interval(secs => $4) \
+             ORDER BY task_id DESC LIMIT 1",
+            SCHEMA
+        ))
+        .bind(team_id)
+        .bind(target_role)
+        .bind(initial_task)
+        .bind(dedupe_window_secs as f64)
+        .fetch_optional(&self.pool)
+        .await?;
+        if let Some((existing_id,)) = existing {
+            return Ok(Err(existing_id));
+        }
+
+        let row: (i64,) = sqlx::query_as(&format!(
+            "INSERT INTO {}.team_task_queue \
+                 (team_id, target_role, is_prefix_match, sender_session_id, sender_role, \
+                  message, task_type, spawn_payload) \
+             VALUES ($1, $2, false, $3, $4, $5, 'spawn', $6) \
+             RETURNING task_id",
+            SCHEMA
+        ))
+        .bind(team_id)
+        .bind(target_role)
+        .bind(sender_session_id)
+        .bind(sender_role)
+        .bind(initial_task)
+        .bind(spawn_payload)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(Ok(row.0))
+    }
+
+    /// Result of an enqueue_team_clear call: Enqueued(task_id), Cooldown(secs
+    /// remaining), or AlreadyQueued(existing_task_id).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn enqueue_team_clear(
+        &self,
+        team_id: &str,
+        target_role: &str,
+        target_session_id: &str,
+        sender_session_id: &str,
+        sender_role: &str,
+        reason: &str,
+        cooldown_secs: i64,
+    ) -> Result<EnqueueClearResult> {
+        // Cooldown: if a clear was delivered to this session within
+        // cooldown_secs, reject. Auto + manual + self-clear all share this
+        // gate, so two ResponseCompletes back-to-back can't ping-pong /clear.
+        let last: Option<(Option<chrono::DateTime<chrono::Utc>>,)> = sqlx::query_as(&format!(
+            "SELECT MAX(delivered_at) FROM {}.team_task_queue \
+             WHERE target_session_id = $1 AND task_type = 'clear' AND status = 'delivered'",
+            SCHEMA
+        ))
+        .bind(target_session_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        if let Some((Some(last_delivered),)) = last {
+            let elapsed = (chrono::Utc::now() - last_delivered).num_seconds();
+            if elapsed < cooldown_secs {
+                return Ok(EnqueueClearResult::Cooldown {
+                    remaining_secs: cooldown_secs - elapsed,
+                });
+            }
+        }
+
+        // Coalesce: if a clear is already queued for this session, return its
+        // task_id rather than enqueueing a duplicate. The Lead may emit
+        // [CLEAR:Self] twice in one turn — second one is a no-op.
+        let pending: Option<(i64,)> = sqlx::query_as(&format!(
+            "SELECT task_id FROM {}.team_task_queue \
+             WHERE target_session_id = $1 AND task_type = 'clear' AND status = 'queued'",
+            SCHEMA
+        ))
+        .bind(target_session_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        if let Some((existing_id,)) = pending {
+            return Ok(EnqueueClearResult::AlreadyQueued(existing_id));
+        }
+
+        let row: (i64,) = sqlx::query_as(&format!(
+            "INSERT INTO {}.team_task_queue \
+                 (team_id, target_role, target_session_id, is_prefix_match, \
+                  sender_session_id, sender_role, message, task_type) \
+             VALUES ($1, $2, $3, false, $4, $5, $6, 'clear') \
+             RETURNING task_id",
+            SCHEMA
+        ))
+        .bind(team_id)
+        .bind(target_role)
+        .bind(target_session_id)
+        .bind(sender_session_id)
+        .bind(sender_role)
+        .bind(reason)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(EnqueueClearResult::Enqueued(row.0))
+    }
+
     /// Oldest-first list of queued tasks for a team that are ready to deliver
     /// now (deliver_after has passed). Drain orchestration walks this list
     /// and tries to claim a target for each row.
@@ -1575,7 +1761,8 @@ impl Database {
         let rows = sqlx::query_as::<_, StoredTeamTask>(&format!(
             "SELECT task_id, team_id, target_role, target_session_id, is_prefix_match, \
                     sender_session_id, sender_role, message, status, \
-                    created_at, delivered_at, cancelled_at, failure_reason, deliver_after \
+                    created_at, delivered_at, cancelled_at, failure_reason, deliver_after, \
+                    task_type, spawn_payload \
              FROM {}.team_task_queue \
              WHERE team_id = $1 AND status = 'queued' AND deliver_after <= NOW() \
              ORDER BY created_at ASC",

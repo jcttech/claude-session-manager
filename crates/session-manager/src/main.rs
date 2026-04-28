@@ -19,7 +19,9 @@ use mattermost_client::{Mattermost, Post, sanitize_channel_name};
 use session_manager::config;
 use session_manager::container::ContainerManager;
 use session_manager::crypto::{sign_request, verify_signature};
-use session_manager::database::{self, Database, StoredSession, StoredTeamRole, StoredTeamTask};
+use session_manager::database::{
+    self, Database, EnqueueClearResult, StoredSession, StoredTeamRole, StoredTeamTask,
+};
 use session_manager::git::{GitManager, RepoRef};
 use session_manager::liveness::{LivenessState, format_duration_short};
 use session_manager::opnsense::OPNsense;
@@ -42,6 +44,11 @@ static PR_REVIEWED_RE: OnceLock<Regex> = OnceLock::new();
 static TEAM_INTERRUPT_RE: OnceLock<Regex> = OnceLock::new();
 static TEAM_CLEAR_RE: OnceLock<Regex> = OnceLock::new();
 static TEAM_CANCEL_QUEUED_RE: OnceLock<Regex> = OnceLock::new();
+/// Detects `gh pr merge` success output for the system-fallback breakpoint
+/// detector (Part D2). Matches both `gh`'s `Merged pull request #N` and the
+/// inline GitHub UI line some CI surfaces emit. Anywhere in the line, not
+/// anchored — `gh` may indent its success message under other output.
+static PR_MERGED_RE: OnceLock<Regex> = OnceLock::new();
 
 fn network_request_regex() -> &'static Regex {
     NETWORK_REQUEST_RE.get_or_init(|| {
@@ -112,6 +119,15 @@ fn team_cancel_queued_regex() -> &'static Regex {
     })
 }
 
+fn pr_merged_regex() -> &'static Regex {
+    // Matches the success line `gh pr merge` prints, e.g.:
+    //   Merged pull request #47 (Story G title)
+    // Captures the PR number for the breakpoint reason field.
+    PR_MERGED_RE.get_or_init(|| {
+        Regex::new(r"Merged pull request #(\d+)").expect("Invalid regex")
+    })
+}
+
 struct AppState {
     mm: Mattermost,
     containers: ContainerManager,
@@ -119,8 +135,6 @@ struct AppState {
     opnsense: OPNsense,
     db: Database,
     liveness: LivenessState,
-    /// Per-team mutex to serialize spawn operations (prevents race conditions)
-    spawn_locks: DashMap<String, Arc<tokio::sync::Mutex<()>>>,
     /// Shared coordination channel ID for team coordination logs
     coordination_channel_id: tokio::sync::RwLock<Option<String>>,
     /// PRs that have passed the [PR_REVIEWED] gate, keyed by "team_id:pr_number".
@@ -142,6 +156,9 @@ struct AppState {
     /// to two different idle targets.
     drain_locks: DashMap<String, Arc<tokio::sync::Mutex<()>>>,
 }
+
+// `spawn_locks` was removed in v2.5.4 — its serialization role is subsumed by
+// `drain_locks` since SPAWN now flows through `team_task_queue` like TO/CLEAR.
 
 /// How long an identical intent marker is suppressed after first being seen.
 const INTENT_DEDUPE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
@@ -273,7 +290,6 @@ async fn main() -> Result<()> {
         opnsense,
         db,
         liveness,
-        spawn_locks: DashMap::new(),
         coordination_channel_id: tokio::sync::RwLock::new(coordination_channel_id),
         reviewed_prs: DashMap::new(),
         intent_dedupe: DashMap::new(),
@@ -2808,9 +2824,17 @@ fn format_ctx_suffix(input_tokens: u64) -> String {
     format!("{}/{}k ctx", format_token_count(input_tokens), ctx_max_k)
 }
 
-/// Fire a team spawn asynchronously (acquires spawn lock, calls handle_team_spawn).
-/// Always injects a team status update into the lead's session before spawning
-/// so the lead has current roster visibility.
+/// How long an identical [SPAWN:Role] marker is suppressed at the SQL layer
+/// after first being enqueued. Wider than the in-memory window because LLM
+/// turns can run for minutes — the original re-emission bug fired well past
+/// the 60s in-memory dedupe.
+const SPAWN_DEDUPE_WINDOW_SECS: i64 = 300;
+
+/// Enqueue a [SPAWN:Role] task and fire a drain pass. Replaces the previous
+/// fire-and-forget tokio::spawn path. The SQL-level dedupe inside
+/// `enqueue_team_spawn` catches LLM re-emissions that slipped past the
+/// in-memory `intent_dedupe` (ticket: re-emitted spawn marker fired late
+/// after first one already succeeded; spawned Developer 2 by accident).
 #[allow(clippy::too_many_arguments)]
 fn fire_team_spawn(
     state: &Arc<AppState>,
@@ -2822,18 +2846,6 @@ fn fire_team_spawn(
     initial_task: &str,
     project: &str,
 ) {
-    // Suppress LLM-stutter / replayed [SPAWN:Role] markers: an identical
-    // (team, sender, role, task) within INTENT_DEDUPE_TTL is dropped.
-    let dedupe_key = intent_key(team_id, session_id, "SPAWN", role_name, initial_task);
-    if intent_seen_recently(&state.intent_dedupe, dedupe_key) {
-        tracing::info!(
-            team_id, role = %role_name,
-            "Suppressed duplicate [SPAWN:{}] within {}s window",
-            role_name, INTENT_DEDUPE_TTL.as_secs()
-        );
-        return;
-    }
-
     let spawn_state = state.clone();
     let spawn_tid = team_id.to_string();
     let spawn_cid = channel_id.to_string();
@@ -2842,27 +2854,74 @@ fn fire_team_spawn(
     let role_name = role_name.to_string();
     let initial_task = initial_task.to_string();
     let spawn_project = project.to_string();
-    let lock = spawn_state
-        .spawn_locks
-        .entry(spawn_tid.clone())
-        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-        .clone();
     tokio::spawn(async move {
-        let _guard = lock.lock().await;
-        // Inject team status into the lead's session before spawning so it sees
-        // the current roster (avoids duplicate spawns and stale assumptions).
-        handle_team_status(&spawn_state, &spawn_sid, &spawn_tid).await;
-        handle_team_spawn(
-            spawn_state,
-            &spawn_tid,
-            &spawn_cid,
-            &spawn_sid,
-            &spawn_role,
-            &role_name,
-            &initial_task,
-            &spawn_project,
-        )
-        .await;
+        let payload = serde_json::json!({
+            "channel_id": spawn_cid,
+            "project": spawn_project,
+        });
+        let result = spawn_state
+            .db
+            .enqueue_team_spawn(
+                &spawn_tid,
+                &role_name,
+                &spawn_sid,
+                &spawn_role,
+                &initial_task,
+                &payload,
+                SPAWN_DEDUPE_WINDOW_SECS,
+            )
+            .await;
+        match result {
+            Ok(Ok(task_id)) => {
+                // Send LLM-side queued ACK so the Lead correlates the queue_id.
+                if let Ok(Some(lead)) = spawn_state
+                    .db
+                    .get_session_by_id_prefix(&spawn_sid[..8.min(spawn_sid.len())])
+                    .await
+                {
+                    let ack = format!(
+                        "[ACK:SPAWN role=\"{}\" status=queued queue_id={}]",
+                        role_name, task_id,
+                    );
+                    let _ = spawn_state
+                        .containers
+                        .send(
+                            &lead.session_id,
+                            &format!(
+                                "{}\nSpawn enqueued. The drain will deliver an [ACK:SPAWN ... status=ok queue_id={}] once the new member is live; until then you may [CANCEL_QUEUED:{}:{}] to abort.",
+                                ack, task_id, role_name, task_id,
+                            ),
+                        )
+                        .await;
+                }
+                drain_team_queue(&spawn_state, &spawn_tid).await;
+            }
+            Ok(Err(existing_id)) => {
+                tracing::info!(
+                    team_id = %spawn_tid, role = %role_name, existing_id,
+                    "Suppressed duplicate [SPAWN:{}] within {}s SQL window",
+                    role_name, SPAWN_DEDUPE_WINDOW_SECS
+                );
+                if let Ok(Some(lead)) = spawn_state
+                    .db
+                    .get_session_by_id_prefix(&spawn_sid[..8.min(spawn_sid.len())])
+                    .await
+                {
+                    let ack = format!(
+                        "[ACK:SPAWN role=\"{}\" status=rejected reason=duplicate_intent existing_queue_id={}]",
+                        role_name, existing_id,
+                    );
+                    let _ = spawn_state.containers.send(&lead.session_id, &format!(
+                        "{}\nA prior [SPAWN:{}] with the same task content is already in flight (queue_id={}). Wait for its ACK rather than re-emitting.",
+                        ack, role_name, existing_id,
+                    )).await;
+                }
+            }
+            Err(e) => {
+                tracing::error!(error = %e, team_id = %spawn_tid, role = %role_name,
+                    "Failed to enqueue spawn task");
+            }
+        }
     });
 }
 
@@ -2887,6 +2946,7 @@ async fn stream_output(
     let interrupt_re = team_interrupt_regex();
     let clear_re = team_clear_regex();
     let cancel_queued_re = team_cancel_queued_regex();
+    let pr_merged_re = pr_merged_regex();
 
     // Look up team context for this session (cached once)
     let team_info: Option<(String, String)> = {
@@ -3180,6 +3240,52 @@ async fn stream_output(
                                 handle_pr_reviewed(&state, &session_id, tid, sender_role, &pr_num, &channel_id).await;
                                 continue;
                             }
+
+                            // Part D2 system fallback: detect `gh pr merge` success
+                            // in the Lead's stream and enqueue [CLEAR:Self]. The SQL
+                            // cooldown collapses with any [CLEAR:Self] the Lead also
+                            // emits, so double-firing is harmless. Only fires for
+                            // the Lead — members don't merge PRs.
+                            if sender_role == "Team Lead"
+                                && let Some(caps) = pr_merged_re.captures(&line)
+                            {
+                                let pr_num = caps[1].to_string();
+                                let reason = format!("breakpoint:pr_{}_merged", pr_num);
+                                let role_label = sender_role.to_string();
+                                let session_for_clear = session_id.clone();
+                                let tid_for_clear = tid.clone();
+                                let state_for_clear = state.clone();
+                                tokio::spawn(async move {
+                                    match state_for_clear
+                                        .db
+                                        .enqueue_team_clear(
+                                            &tid_for_clear,
+                                            &role_label,
+                                            &session_for_clear,
+                                            &session_for_clear,
+                                            &role_label,
+                                            &reason,
+                                            AUTO_CLEAR_COOLDOWN_SECS as i64,
+                                        )
+                                        .await
+                                    {
+                                        Ok(EnqueueClearResult::Enqueued(task_id)) => {
+                                            tracing::info!(
+                                                session_id = %session_for_clear, pr_num, task_id,
+                                                "Breakpoint detector: enqueued [CLEAR:Self] after PR merge"
+                                            );
+                                            drain_team_queue(&state_for_clear, &tid_for_clear).await;
+                                        }
+                                        Ok(_) => { /* cooldown or already-queued: nothing to do */ }
+                                        Err(e) => {
+                                            tracing::warn!(error = %e, pr_num,
+                                                "Breakpoint detector: enqueue_team_clear failed");
+                                        }
+                                    }
+                                });
+                                // NOTE: don't `continue` — the line is still legitimate
+                                // tool output the user wants to see in the card.
+                            }
                         }
 
                         // --- Existing marker checks ---
@@ -3301,14 +3407,12 @@ async fn stream_output(
                         let ctx_clear_threshold = ctx_max * 90 / 100;
                         let ctx_rearm_threshold = ctx_max * 70 / 100;
 
-                        // Re-arm the auto-clear trigger once we observe context
-                        // back below the low-water mark. Combined with the
-                        // armed-flag check below, this ensures the trigger
-                        // fires at most once per high-water crossing even if
-                        // many ResponseComplete events report >90% in a row.
-                        if ctx_display < ctx_rearm_threshold {
-                            state.containers.rearm_auto_clear(&session_id);
-                        }
+                        // (The previous in-memory armed-flag was removed in v2.5.4
+                        // when auto-clear moved to the queue. The SQL cooldown
+                        // inside `enqueue_team_clear` now provides the same
+                        // anti-loop guarantee.) ctx_rearm_threshold retained
+                        // for telemetry only.
+                        let _ = ctx_rearm_threshold;
 
                         if ctx_display > ctx_warn_threshold {
                             let usage_pct = (ctx_display as f64 / ctx_max as f64 * 100.0) as u64;
@@ -3318,57 +3422,103 @@ async fn stream_output(
                             );
                             let _ = state.mm.post_in_thread(&channel_id, &thread_id, &msg).await;
 
-                            // Team-aware: notify Team Lead about high context usage
-                            if let Some((ref tid, ref role)) = team_info
-                                && role != "Team Lead"
-                            {
-                                let alert_msg = format!(
-                                    "**Context Alert**: {} is at {}% context capacity ({}/{}k).\nConsider sending them a `clear` instruction (membank will reload context), or reassigning remaining work.",
-                                    role, usage_pct, format_token_count(ctx_display), ctx_max / 1000,
-                                );
-                                if let Ok(leads) = state.db.get_sessions_by_role(tid, "Team Lead").await
-                                    && let Some(lead) = leads.first()
-                                {
+                            // Team-aware: route the warn alert into a Claude
+                            // session that can act on it. For members, that's
+                            // the Lead (who decides whether to [CLEAR:Role] or
+                            // reassign work). For the Lead itself, it's the
+                            // Lead's own session — otherwise the Lead's LLM
+                            // never sees a signal that its context is filling
+                            // up and just rides into the 90% auto-clear blind.
+                            if let Some((ref tid, ref role)) = team_info {
+                                if role == "Team Lead" {
                                     let header = build_team_context_header(&state.db, tid, "Team Lead").await;
-                                    let _ = state.containers.send(&lead.session_id, &format!("{}\n{}", header, alert_msg)).await;
+                                    let alert_msg = format!(
+                                        "{}\n[CONTEXT_ALERT] Your own context is at {}% ({}/{}k). Wrap up the current train of thought, then emit `[CLEAR:Self]` as the last marker in your response. Auto-clear will fire at 90% if you don't — preserving queued tasks and roster, but losing in-flight working memory.",
+                                        header, usage_pct, format_token_count(ctx_display), ctx_max / 1000,
+                                    );
+                                    let _ = state.containers.send(&session_id, &alert_msg).await;
+                                } else {
+                                    let alert_msg = format!(
+                                        "**Context Alert**: {} is at {}% context capacity ({}/{}k).\nConsider sending them a `clear` instruction (membank will reload context), or reassigning remaining work.",
+                                        role, usage_pct, format_token_count(ctx_display), ctx_max / 1000,
+                                    );
+                                    if let Ok(leads) = state.db.get_sessions_by_role(tid, "Team Lead").await
+                                        && let Some(lead) = leads.first()
+                                    {
+                                        let header = build_team_context_header(&state.db, tid, "Team Lead").await;
+                                        let _ = state.containers.send(&lead.session_id, &format!("{}\n{}", header, alert_msg)).await;
+                                    }
                                 }
                             }
                         }
 
-                        // Auto-clear at 90% context for team sessions. We rely on
-                        // claude-membank to repopulate context after the clear. The
-                        // cooldown (module-level AUTO_CLEAR_COOLDOWN_SECS) prevents
-                        // re-firing while the post-clear response is still in flight
-                        // (its ResponseComplete may still report ctx_tokens above
-                        // threshold, which previously caused an infinite auto-compact
-                        // loop). Manual [CLEAR:Role] shares this cooldown.
+                        // Auto-clear at 90% — enqueue a clear task. The SQL
+                        // cooldown inside `enqueue_team_clear` (180s window per
+                        // target_session_id) replaces the in-memory armed-flag
+                        // gate that used to live here; manual + auto + self
+                        // share the same gate so they can't ping-pong.
+                        // Membank repopulates context after the clear lands.
                         if ctx_display > ctx_clear_threshold
                             && let Some((ref tid, ref role)) = team_info
-                            && state.containers.try_begin_auto_clear(&session_id, AUTO_CLEAR_COOLDOWN_SECS)
                         {
-                            tracing::info!(
-                                session_id = %session_id,
-                                ctx_display, ctx_max,
-                                "auto-clear: context above threshold, clearing session"
-                            );
-                            let _ = state.containers.clear(&session_id).await;
-
-                            // Re-inject team status after clear so the agent
-                            // retains roster context despite losing conversation history
-                            handle_team_status(&state, &session_id, tid).await;
-
-                            if role != "Team Lead"
-                                && let Ok(leads) = state.db.get_sessions_by_role(tid, "Team Lead").await
-                                && let Some(lead) = leads.first()
+                            let usage_pct =
+                                (ctx_display as f64 / ctx_max as f64 * 100.0) as u64;
+                            let role_label = role.clone();
+                            let reason = format!("auto_{}pct", usage_pct);
+                            match state
+                                .db
+                                .enqueue_team_clear(
+                                    tid,
+                                    &role_label,
+                                    &session_id,
+                                    &session_id,
+                                    &role_label,
+                                    &reason,
+                                    AUTO_CLEAR_COOLDOWN_SECS as i64,
+                                )
+                                .await
                             {
-                                let header = build_team_context_header(&state.db, tid, "Team Lead").await;
-                                let clear_msg = format!(
-                                    "{}\n**Auto-clear**: {} context auto-cleared at {}% ({}k/{}k). Membank will reload context on next message.",
-                                    header, role,
-                                    (ctx_display as f64 / ctx_max as f64 * 100.0) as u64,
-                                    ctx_display / 1000, ctx_max / 1000,
-                                );
-                                let _ = state.containers.send(&lead.session_id, &clear_msg).await;
+                                Ok(EnqueueClearResult::Enqueued(task_id))
+                                | Ok(EnqueueClearResult::AlreadyQueued(task_id)) => {
+                                    tracing::info!(
+                                        session_id = %session_id,
+                                        ctx_display, ctx_max, task_id,
+                                        "auto-clear: enqueued (queue_id={})", task_id
+                                    );
+                                    if role == "Team Lead" {
+                                        let coord_msg = format!(
+                                            ":broom: **Team Lead context auto-cleared at {}%** ({}k/{}k, queue_id={}). Expect a brief pause before the next assignment — the Lead is being re-briefed from durable state.",
+                                            usage_pct, ctx_display / 1000, ctx_max / 1000, task_id,
+                                        );
+                                        post_to_coordination_log(&state, tid, &coord_msg).await;
+                                        let broadcast_msg = format!(
+                                            "**Team Lead context auto-cleared** at {}%. The Lead is briefly re-orienting from queued tasks and roster — your in-flight work continues normally; reports landing in the Lead's thread during this window may be re-acknowledged.",
+                                            usage_pct,
+                                        );
+                                        broadcast_team_notification(&state, tid, &broadcast_msg, &session_id).await;
+                                    } else if let Ok(leads) = state.db.get_sessions_by_role(tid, "Team Lead").await
+                                        && let Some(lead) = leads.first()
+                                    {
+                                        let header = build_team_context_header(&state.db, tid, "Team Lead").await;
+                                        let clear_msg = format!(
+                                            "{}\n**Auto-clear** (queue_id={}): {} context auto-cleared at {}% ({}k/{}k). Membank will reload context on next message.",
+                                            header, task_id, role, usage_pct,
+                                            ctx_display / 1000, ctx_max / 1000,
+                                        );
+                                        let _ = state.containers.send(&lead.session_id, &clear_msg).await;
+                                    }
+                                    drain_team_queue(&state, tid).await;
+                                }
+                                Ok(EnqueueClearResult::Cooldown { remaining_secs }) => {
+                                    tracing::debug!(
+                                        session_id = %session_id, remaining_secs,
+                                        "auto-clear suppressed by cooldown"
+                                    );
+                                }
+                                Err(e) => {
+                                    tracing::warn!(error = %e, session_id = %session_id,
+                                        "Failed to enqueue auto-clear task");
+                                }
                             }
                         }
                     }
@@ -3706,11 +3856,26 @@ CRITICAL: All markers MUST start at the beginning of a new line. Do NOT embed ma
                           member; use the exact role for one.
   [CLEAR:Role Name]       Genuinely reset a member's conversation history (drops
                           the live SDK client; reconnect on next message starts
-                          fresh, no resume). Membank reloads baseline context on
-                          their next message. Use sparingly — context loss costs
-                          continuity. Shares a 180s cooldown with auto-clear, so
-                          back-to-back requests within that window are rejected
-                          with reason=cooldown.
+                          fresh, no resume). Now flows through the task queue:
+                          you'll get [ACK:CLEAR ... status=queued queue_id=N]
+                          immediately, then [ACK:CLEAR ... status=ok queue_id=N]
+                          when the drain delivers (mid-turn members are deferred
+                          to ResponseComplete, so the clear is always safe).
+                          Membank reloads baseline context on their next message.
+                          Use sparingly — context loss costs continuity. Shares
+                          a 180s SQL cooldown with auto-clear, so back-to-back
+                          requests within that window are rejected with
+                          reason=cooldown.
+  [CLEAR:Self]            Pre-emptively clear YOUR OWN context at a workflow
+                          boundary (between specs, after a plan tool call,
+                          after merging a story PR). Safe to emit mid-turn:
+                          the clear is queued and fires after this turn's
+                          ResponseComplete, so the response containing the
+                          marker completes first. After the clear you receive
+                          a [POST_CLEAR_BRIEFING] reconstructing in-flight
+                          state from durable DB sources (roster + queued
+                          tasks + member current_tasks). See "Context Hygiene
+                          at Workflow Boundaries" below.
   [CANCEL_QUEUED:Role]      Drop ALL still-queued tasks from you to that role.
   [CANCEL_QUEUED:Role:N]    Drop just queue_id=N. Already-delivered tasks
                             cannot be cancelled — use [INTERRUPT:Role] for those.
@@ -3744,11 +3909,12 @@ informational — no action required unless a member then escalates.
 ## Structured Acknowledgements
 After every [SPAWN:Role] and [TO:Role] you emit, the system replies with an [ACK:...] line. **Treat these as authoritative ground truth** — the English message is for the user; the ACK is for you. Examples:
 
-  [ACK:SPAWN role="Architect" status=ok]
-  [ACK:SPAWN role="Architect" status=rejected reason=already_exists]
-  [ACK:SPAWN role="Developer" status=rejected reason=idle_available idle="Developer 1"]
-  [ACK:SPAWN role="Developer 3" status=ok]
-  [ACK:SPAWN role="QA Engineer" status=failed reason=spawn_failed]
+  [ACK:SPAWN role="Architect" status=queued queue_id=17]                                ← enqueue receipt
+  [ACK:SPAWN role="Architect" status=ok queue_id=17]                                    ← drain delivered, member live
+  [ACK:SPAWN role="Architect" status=rejected reason=already_exists queue_id=18]
+  [ACK:SPAWN role="Developer" status=rejected reason=idle_available idle="Developer 1" queue_id=19]
+  [ACK:SPAWN role="Developer" status=rejected reason=duplicate_intent existing_queue_id=15]  ← SQL dedupe (same role + same task content within 5min)
+  [ACK:SPAWN role="QA Engineer" status=failed reason=spawn_failed queue_id=20]
   [ACK:TO target="Developer" status=queued queue_id=42]            ← enqueue receipt
   [ACK:TO target="Developer 2" status=delivered queue_id=42]       ← later, when drain hands off
   [ACK:TO target="Developer 5" status=failed reason=delivery_unreachable queue_id=43]
@@ -3759,8 +3925,11 @@ After every [SPAWN:Role] and [TO:Role] you emit, the system replies with an [ACK
   [ACK:INTERRUPT target="Developer" status=ok count=2 failed=1]
   [ACK:INTERRUPT target="Architect" status=failed reason=target_not_found]
   [ACK:INTERRUPT target="Architect" status=rejected reason=not_lead]
-  [ACK:CLEAR target="Developer 2" status=ok count=1]
-  [ACK:CLEAR target="Developer" status=rejected reason=cooldown cooldown=2]
+  [ACK:CLEAR target="Developer" status=queued count=2 queue_ids=[51,52]]                 ← enqueue receipt (one row per matching member)
+  [ACK:CLEAR target="Developer 2" status=ok queue_id=51]                                 ← drain delivered, session was reset
+  [ACK:CLEAR target="Self" status=queued count=1 queue_ids=[53]]                         ← Lead pre-emptive self-clear at workflow boundary
+  [ACK:CLEAR target="Self" status=ok queue_id=53]                                        ← drain delivered AFTER this turn's ResponseComplete
+  [ACK:CLEAR target="Developer" status=rejected reason=cooldown count=0]                 ← clear delivered to that target within last 180s
   [ACK:CLEAR target="Architect" status=failed reason=target_not_found]
   [ACK:CANCEL_QUEUED target="Developer" status=ok count=3]
   [ACK:CANCEL_QUEUED target="Developer" status=ok count=0 queue_id=42]  ← already delivered, nothing to cancel
@@ -3777,14 +3946,21 @@ Decision matrix (read the `reason` to pick the right next move):
   - status=delivered                → the queued task has reached the member. From here, only [INTERRUPT:<role>] can stop it.
   - rejected reason=already_exists  → role is on team; use [TO:<role>] instead of spawning.
   - rejected reason=idle_available  → use [TO:<idle>] (the `idle="..."` field tells you who).
+  - rejected reason=duplicate_intent → an identical [SPAWN:Role] with the same task content was enqueued in the last 5 minutes (existing_queue_id given). Wait for its ACK rather than re-emitting; this is the SQL dedupe catching a re-emission.
   - rejected reason=burst_throttle  → you fired the same target/broadcast within ~10s. Stop — the prior intent is in flight.
-  - rejected reason=cooldown        → that role's `/clear` (auto or manual) ran within the last ~3min. Wait it out, or use [TEAM_STATUS] and try again later.
+  - rejected reason=cooldown        → that target's `/clear` (auto or manual or self) ran within the last ~3min. Wait it out, or use [TEAM_STATUS] and try again later.
   - rejected reason=not_lead        → control marker is Lead-only. Members can't [INTERRUPT:], [CLEAR:], or [CANCEL_QUEUED:].
   - failed   reason=target_not_found → roster is missing that role; [SPAWN:<role>] or pick a different target.
   - failed   reason=delivery_unreachable → member's session died between enqueue and drain; [TEAM_STATUS], then re-spawn or reassign.
   - failed   reason=spawn_failed    → check [TEAM_STATUS]; one retry permitted, then escalate to user.
 
-If you do not see an [ACK:...] line within a few seconds of emitting a marker, assume the marker was malformed (not at line start, missing [/MSG], etc.) and re-emit it correctly.
+ACKs may arrive in the NEXT turn rather than the current one (the system pushes
+them as a follow-up message on the bidi stream, which buffers until your turn
+completes). If you do not see an [ACK:...] line at the start of your NEXT turn
+after emitting a marker, then assume the marker was malformed (not at line
+start, missing [/MSG], etc.) and re-emit it correctly. Do not re-emit
+mid-turn just because you don't see an ACK yet — that's the source of the
+spurious-double-spawn class of bugs.
 
 **PR Review Gate**: Team members use [PR_READY:N] and [PR_REVIEWED:N] markers. The system ensures they address Claude Reviewer CI comments before the PR reaches you. You will receive a notification when a PR has passed the review gate.
 
@@ -3799,6 +3975,41 @@ If you do not see an [ACK:...] line within a few seconds of emitting a marker, a
 - After delivery (`delivered` ACK), only [INTERRUPT:Role] can stop the work
 - Do NOT assign the same task to multiple developers unless you explicitly want parallel approaches
 - Use [TEAM_STATUS] to inspect roster + queue depth
+
+## Context Hygiene at Workflow Boundaries
+The system gives you durable amnesia points — use them. Long-running coordination
+sessions that never clear accumulate per-PR review chatter, debugging traces, and
+exploratory diffs that bear no value once the work has merged. Auto-clear at 90%
+will eventually fire, but it's an emergency wipe; prefer voluntary clears at
+phase boundaries where the workflow is naturally re-enterable from durable
+GitHub state.
+
+**Self-clear** — emit `[CLEAR:Self]` as the LAST marker in your response after:
+- Acknowledging an approved spec from the Architect, before invoking `plan`
+- Finishing a `plan` tool call, before spawning developers for the new stories
+- Merging a story PR, before reviewing or assigning the next one
+
+`[CLEAR:Self]` is mid-turn-safe by construction (the queued clear fires on this
+turn's ResponseComplete, after the response has streamed). After the clear you
+receive [TEAM_STATUS] + [POST_CLEAR_BRIEFING] reconstructing roster + queued
+tasks + member current_tasks. You wake up oriented for the next phase without
+the prior phase's working memory.
+
+**Member-clear** — emit `[CLEAR:Role]` BEFORE the next `[TO:Role]` after:
+- Merging a Developer's PR (story done; clear them before assigning the next story)
+- The Architect finishes a spec / `architecture` / clarification round (before next assignment)
+- Any member completes a multi-turn deliverable and you're handing them a different deliverable
+
+The canonical pattern (drain serializes; clear fires first, then the new task
+hits a clean session):
+```
+[CLEAR:Developer 2]
+[TO:Developer 2] start work on Story I [/MSG]
+```
+
+Do NOT clear mid-story or mid-deliverable; only at completion boundaries. The
+member's per-task working memory (file paths, debugging context) is load-bearing
+within a story but irrelevant once the PR merges.
 
 ## Development Workflow (spec-flow)
 The team follows the spec-flow workflow. Coordinate members through these phases IN ORDER:
@@ -3947,7 +4158,7 @@ fn truncate_preview(s: &str, max_bytes: usize) -> String {
 /// Route a message from one team member to another (or all matching a role).
 /// `[TO:Developer]` fans out to "Developer", "Developer 1", "Developer 2", etc.
 async fn route_team_message(
-    state: &AppState,
+    state: &Arc<AppState>,
     sender_session_id: &str,
     sender_role: &str,
     target_role: &str,
@@ -4106,13 +4317,14 @@ async fn route_team_message(
         }
     };
 
-    // Acknowledge the enqueue immediately. The Lead now has a queue_id they
-    // can use with [CANCEL_QUEUED:Role:N] until the drain delivers.
-    if let Ok(Some(sender)) = state
+    // LLM-side ACK fires immediately so the Lead's session sees the queue_id
+    // and can [CANCEL_QUEUED:Role:N] before delivery. The Mattermost mirror is
+    // deferred until after drain — see below.
+    let sender_lookup = state
         .db
         .get_session_by_id_prefix(&sender_session_id[..8.min(sender_session_id.len())])
-        .await
-    {
+        .await;
+    if let Ok(Some(ref sender)) = sender_lookup {
         let ack = format!(
             "[ACK:TO target=\"{}\" status=queued queue_id={}]",
             target_role, task_id,
@@ -4121,26 +4333,34 @@ async fn route_team_message(
             "{}\nQueued for {}. Use [CANCEL_QUEUED:{}] or [CANCEL_QUEUED:{}:{}] to amend before delivery; you'll receive [ACK:TO ... status=delivered queue_id={}] when it lands.",
             ack, target_role, target_role, target_role, task_id, task_id,
         )).await;
+    }
+
+    // Drain inline. Per-team mutex inside drain_team_queue serializes overlapping
+    // calls so two ResponseCompletes can't double-deliver. We capture the set of
+    // task_ids actually delivered so we can suppress the "Queued for…" mirror
+    // when delivery happened in this same call (otherwise the Lead's thread gets
+    // both ":outbox_tray: Queued" and ":arrow_right: Delivered" with identical
+    // bodies seconds apart).
+    let delivered_now = drain_team_queue(state, team_id).await;
+
+    // Only publish the human-facing "Queued" mirror if delivery actually waited.
+    // The mirror is intentionally body-less — the body lands in the "Delivered
+    // to…" post when the drain hands it off, so no need to repeat it here.
+    if !delivered_now.contains(&task_id)
+        && let Ok(Some(sender)) = sender_lookup
+    {
         let _ = state
             .mm
             .post_in_thread(
                 &sender.channel_id,
                 &sender.thread_id,
                 &format!(
-                    ":outbox_tray: **Queued for {}** (queue_id={}):\n{}",
-                    target_role,
-                    task_id,
-                    truncate_preview(message, 4000)
+                    ":outbox_tray: **Queued for {}** (queue_id={}) — awaiting capacity. `[CANCEL_QUEUED:{}:{}]` to amend.",
+                    target_role, task_id, target_role, task_id,
                 ),
             )
             .await;
     }
-
-    // Drain inline. The Lead has already received the [ACK:TO ... status=queued]
-    // above; drain only blocks the marker loop briefly (a few DB ops + a send
-    // per ready candidate). Per-team mutex inside drain_team_queue serializes
-    // overlapping calls so two ResponseCompletes can't double-deliver.
-    drain_team_queue(state, team_id).await;
 }
 
 /// Drain queued tasks for a team. Walks the queue oldest-first, atomically
@@ -4151,7 +4371,15 @@ async fn route_team_message(
 ///
 /// Single pass — caller is responsible for re-triggering on the events that
 /// can change drain outcomes (ResponseComplete, Spawn, Interrupt).
-async fn drain_team_queue(state: &AppState, team_id: &str) {
+///
+/// Returns the task_ids delivered in this pass. Callers who just enqueued a
+/// task (e.g. `route_team_message`) check the returned set to decide whether
+/// to publish the "Queued for…" Mattermost mirror — instant deliveries skip
+/// it, since the drain's "Delivered to…" post already carries the body.
+///
+/// Takes `&Arc<AppState>` so the spawn-task branch can clone the handle into
+/// `handle_team_spawn` (which needs an owned `Arc`).
+async fn drain_team_queue(state: &Arc<AppState>, team_id: &str) -> Vec<i64> {
     // Per-team serialization. Use lock().await — drain passes are short and
     // we'd rather queue up than miss a freshly-enqueued task.
     let lock = state
@@ -4161,147 +4389,453 @@ async fn drain_team_queue(state: &AppState, team_id: &str) {
         .clone();
     let _guard = lock.lock().await;
 
+    let mut delivered_ids: Vec<i64> = Vec::new();
+
     let queued = match state.db.list_queued_tasks_for_team(team_id).await {
         Ok(q) => q,
         Err(e) => {
             tracing::error!(error = %e, team_id, "Failed to list queued tasks for drain");
-            return;
+            return delivered_ids;
         }
     };
     if queued.is_empty() {
-        return;
+        return delivered_ids;
     }
 
     // Cache the member list once for header construction during this pass.
     let members = state.db.get_team_members(team_id).await.unwrap_or_default();
 
     for task in queued {
-        let role_targets = match state
+        let delivered = match task.task_type.as_str() {
+            "spawn" => drain_one_spawn(state, team_id, &task).await,
+            "clear" => drain_one_clear(state.as_ref(), team_id, &task).await,
+            _ => drain_one_message(state.as_ref(), team_id, &task, &members).await,
+        };
+        if delivered {
+            delivered_ids.push(task.task_id);
+        }
+    }
+
+    delivered_ids
+}
+
+/// Drain a single message-type task. Returns true if delivered, false if
+/// rolled back / left queued / failed.
+async fn drain_one_message(
+    state: &AppState,
+    team_id: &str,
+    task: &StoredTeamTask,
+    members: &[StoredSession],
+) -> bool {
+    let role_targets = match state
+        .db
+        .get_sessions_by_role(team_id, &task.target_role)
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(error = %e, task_id = task.task_id, "Drain: role lookup failed");
+            return false;
+        }
+    };
+
+    // Role no longer exists on the team — fail the task so it doesn't
+    // pile up forever. (Could happen if the only member of a role was
+    // stopped after the task was queued.)
+    if role_targets.is_empty() {
+        let _ = state
             .db
-            .get_sessions_by_role(team_id, &task.target_role)
+            .mark_task_failed(task.task_id, "target_not_found")
+            .await;
+        send_drain_ack(state, task, &task.target_role, "failed", "target_not_found").await;
+        return false;
+    }
+
+    // Idle candidates only. For exact match (is_prefix_match=false), the
+    // role_targets list is just the one named member; if busy, leave queued.
+    let candidates: Vec<&StoredSession> = role_targets
+        .iter()
+        .filter(|t| t.pending_task_from.is_none())
+        .collect();
+    if candidates.is_empty() {
+        // No idle target right now — leave queued, next ResponseComplete
+        // on this team triggers another drain pass.
+        return false;
+    }
+
+    // Try to claim each idle candidate; first success wins. The atomic
+    // `try_set_pending_task` (UPDATE ... WHERE pending_task_from IS NULL)
+    // guarantees no two drains can both attach to the same target.
+    let mut delivered_target: Option<&StoredSession> = None;
+    for candidate in &candidates {
+        match state
+            .db
+            .try_set_pending_task(&candidate.session_id, &task.sender_session_id, &task.message)
             .await
         {
-            Ok(r) => r,
+            Ok(true) => {
+                delivered_target = Some(*candidate);
+                break;
+            }
+            Ok(false) => continue,
             Err(e) => {
-                tracing::warn!(error = %e, task_id = task.task_id, "Drain: role lookup failed");
+                tracing::warn!(error = %e, "Drain: try_set_pending_task failed");
                 continue;
             }
-        };
+        }
+    }
 
-        // Role no longer exists on the team — fail the task so it doesn't
-        // pile up forever. (Could happen if the only member of a role was
-        // stopped after the task was queued.)
-        if role_targets.is_empty() {
+    let target = match delivered_target {
+        Some(t) => t,
+        None => return false,
+    };
+    let role = target.role.as_deref().unwrap_or(&task.target_role);
+
+    // Mattermost visibility for the recipient
+    let _ = state
+        .mm
+        .post_in_thread(
+            &target.channel_id,
+            &target.thread_id,
+            &format!(
+                ":arrow_left: **From {}** (queue_id={}):\n{}",
+                task.sender_role,
+                task.task_id,
+                truncate_preview(&task.message, 4000)
+            ),
+        )
+        .await;
+
+    let header = format_team_context_header(members, role);
+    let formatted = format!("{}\n**From {}**: {}", header, task.sender_role, task.message);
+
+    match state.containers.send(&target.session_id, &formatted).await {
+        Ok(()) => {
+            let _ = state
+                .db
+                .mark_task_delivered(task.task_id, &target.session_id)
+                .await;
+            send_drain_ack(state, task, role, "delivered", "").await;
+            post_to_coordination_log(
+                state,
+                team_id,
+                &format!(
+                    ":arrow_right: **{} → {}** (queue_id={}): {}",
+                    task.sender_role,
+                    role,
+                    task.task_id,
+                    truncate_preview(&task.message, 4000),
+                ),
+            )
+            .await;
+            true
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, role, task_id = task.task_id,
+                "Drain: containers.send failed; rolling back claim");
+            // Release the slot we just claimed and mark the task failed.
+            let _ = state.db.clear_pending_task(&target.session_id).await;
+            let _ = state
+                .db
+                .mark_task_failed(task.task_id, "delivery_unreachable")
+                .await;
+            send_drain_ack(state, task, role, "failed", "delivery_unreachable").await;
+            false
+        }
+    }
+}
+
+/// Drain a single spawn-type task. Calls handle_team_spawn (which does the
+/// claim + start_session + initial-task send + Lead ACK) and marks the queue
+/// row based on the outcome.
+async fn drain_one_spawn(state: &Arc<AppState>, team_id: &str, task: &StoredTeamTask) -> bool {
+    let payload = task.spawn_payload.as_ref();
+    let channel_id = payload
+        .and_then(|p| p.get("channel_id"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let project = payload
+        .and_then(|p| p.get("project"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    if channel_id.is_empty() || project.is_empty() {
+        tracing::error!(task_id = task.task_id, "Spawn task missing channel_id/project payload");
+        let _ = state.db.mark_task_failed(task.task_id, "bad_payload").await;
+        return false;
+    }
+
+    let outcome = handle_team_spawn(
+        state.clone(),
+        team_id,
+        &channel_id,
+        &task.sender_session_id,
+        &task.sender_role,
+        &task.target_role,
+        &task.message,
+        &project,
+        Some(task.task_id),
+    )
+    .await;
+
+    match outcome {
+        SpawnOutcome::Delivered => {
+            // We don't have a single target_session_id to record (the new
+            // member's session_id is internal to handle_team_spawn). Record
+            // the sender's session_id as a placeholder; mark_task_delivered
+            // requires a non-null target. The semantic value here is "the
+            // task is no longer pending."
+            let _ = state
+                .db
+                .mark_task_delivered(task.task_id, &task.sender_session_id)
+                .await;
+            true
+        }
+        SpawnOutcome::Rejected => {
+            let _ = state.db.mark_task_failed(task.task_id, "rejected").await;
+            false
+        }
+        SpawnOutcome::Failed => {
+            let _ = state.db.mark_task_failed(task.task_id, "spawn_failed").await;
+            false
+        }
+    }
+}
+
+/// Drain a single clear-type task. Disconnects the SDK client for
+/// `target_session_id` and re-injects [TEAM_STATUS]. The cooldown was already
+/// enforced at enqueue time (`enqueue_team_clear`), so no further gating.
+async fn drain_one_clear(state: &AppState, team_id: &str, task: &StoredTeamTask) -> bool {
+    let target_sid = match task.target_session_id.as_deref() {
+        Some(s) => s,
+        None => {
+            tracing::error!(task_id = task.task_id, "Clear task missing target_session_id");
+            let _ = state.db.mark_task_failed(task.task_id, "bad_payload").await;
+            return false;
+        }
+    };
+    let target = match state.db.get_session_by_id_prefix(&target_sid[..8.min(target_sid.len())]).await {
+        Ok(Some(s)) => s,
+        _ => {
             let _ = state
                 .db
                 .mark_task_failed(task.task_id, "target_not_found")
                 .await;
-            send_drain_ack(
-                state,
-                &task,
-                &task.target_role,
-                "failed",
-                "target_not_found",
-            )
-            .await;
-            continue;
+            return false;
         }
+    };
+    // Skip if the target is mid-turn (claude is still processing). Leave
+    // queued; the next ResponseComplete will trigger a fresh drain.
+    if target.pending_task_from.is_some() {
+        return false;
+    }
 
-        // Idle candidates only. For exact match (is_prefix_match=false), the
-        // role_targets list is just the one named member; if busy, leave queued.
-        let candidates: Vec<&StoredSession> = role_targets
-            .iter()
-            .filter(|t| t.pending_task_from.is_none())
-            .collect();
-        if candidates.is_empty() {
-            // No idle target right now — leave queued, next ResponseComplete
-            // on this team triggers another drain pass.
-            continue;
-        }
+    let target_role_label = target.role.as_deref().unwrap_or(&task.target_role);
+    let reason = task.message.as_str();
+    let is_self = task.sender_session_id == target.session_id;
 
-        // Try to claim each idle candidate; first success wins. The atomic
-        // `try_set_pending_task` (UPDATE ... WHERE pending_task_from IS NULL)
-        // guarantees no two drains can both attach to the same target.
-        let mut delivered: Option<&StoredSession> = None;
-        for candidate in &candidates {
-            match state
+    match state.containers.clear(&target.session_id).await {
+        Ok(_) => {
+            let _ = state
                 .db
-                .try_set_pending_task(
-                    &candidate.session_id,
-                    &task.sender_session_id,
-                    &task.message,
-                )
-                .await
-            {
-                Ok(true) => {
-                    delivered = Some(*candidate);
-                    break;
-                }
-                Ok(false) => continue,
-                Err(e) => {
-                    tracing::warn!(error = %e, "Drain: try_set_pending_task failed");
-                    continue;
-                }
-            }
-        }
+                .mark_task_delivered(task.task_id, &target.session_id)
+                .await;
+            // Re-inject roster so the cleared session retains team context.
+            handle_team_status(state, &target.session_id, team_id).await;
 
-        let target = match delivered {
-            Some(t) => t,
-            None => continue,
-        };
-        let role = target.role.as_deref().unwrap_or(&task.target_role);
+            // POST_CLEAR_BRIEFING reconstructs in-flight working state from
+            // durable DB sources (queue, sessions.current_task) so the cleared
+            // session wakes up oriented. Lead gets the rich workflow-aware
+            // version; members get a one-line "your next assignment is coming"
+            // since their useful context is per-task and arrives via [TO:].
+            let is_lead = target.role.as_deref() == Some("Team Lead");
+            let briefing = build_post_clear_briefing(state, team_id, &target, reason, is_lead).await;
+            let _ = state.containers.send(&target.session_id, &briefing).await;
 
-        // Mattermost visibility for the recipient
-        let _ = state
-            .mm
-            .post_in_thread(
-                &target.channel_id,
-                &target.thread_id,
+            // ACK back to the originator (might be the Lead, might be the
+            // session itself for [CLEAR:Self], might be the system for
+            // auto-clear at 90% — sender_session_id covers all three).
+            send_clear_ack(state, task, target_role_label, "ok", "").await;
+
+            // Mattermost mirror so the human reader sees the clear.
+            let mm_msg = if is_self {
+                ":broom: **Context auto-cleared** — membank will reload baseline context on next message.".to_string()
+            } else {
+                ":broom: **Context cleared by Team Lead** — membank will reload baseline context on your next message.".to_string()
+            };
+            let _ = state
+                .mm
+                .post_in_thread(&target.channel_id, &target.thread_id, &mm_msg)
+                .await;
+
+            post_to_coordination_log(
+                state,
+                team_id,
                 &format!(
-                    ":arrow_left: **From {}** (queue_id={}):\n{}",
-                    task.sender_role,
-                    task.task_id,
-                    truncate_preview(&task.message, 4000)
+                    ":broom: **{} cleared {}** (queue_id={}, reason={})",
+                    task.sender_role, target_role_label, task.task_id, reason,
                 ),
             )
             .await;
-
-        let header = format_team_context_header(&members, role);
-        let formatted = format!("{}\n**From {}**: {}", header, task.sender_role, task.message);
-
-        match state.containers.send(&target.session_id, &formatted).await {
-            Ok(()) => {
-                let _ = state
-                    .db
-                    .mark_task_delivered(task.task_id, &target.session_id)
-                    .await;
-                send_drain_ack(state, &task, role, "delivered", "").await;
-                post_to_coordination_log(
-                    state,
-                    team_id,
-                    &format!(
-                        ":arrow_right: **{} → {}** (queue_id={}): {}",
-                        task.sender_role,
-                        role,
-                        task.task_id,
-                        truncate_preview(&task.message, 4000),
-                    ),
-                )
-                .await;
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, role, task_id = task.task_id,
-                    "Drain: containers.send failed; rolling back claim");
-                // Release the slot we just claimed and mark the task failed.
-                let _ = state.db.clear_pending_task(&target.session_id).await;
-                let _ = state
-                    .db
-                    .mark_task_failed(task.task_id, "delivery_unreachable")
-                    .await;
-                send_drain_ack(state, &task, role, "failed", "delivery_unreachable").await;
-            }
+            true
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, session_id = %target.session_id, target_role = target_role_label,
+                "Drain: clear RPC failed");
+            let _ = state.db.mark_task_failed(task.task_id, "clear_failed").await;
+            send_clear_ack(state, task, target_role_label, "failed", "clear_failed").await;
+            false
         }
     }
+}
+
+/// Send an [ACK:CLEAR ...] line back to the originating session. Mirrors
+/// `send_drain_ack` but emits the CLEAR-shaped marker.
+async fn send_clear_ack(
+    state: &AppState,
+    task: &StoredTeamTask,
+    target_label: &str,
+    status: &str,
+    reason: &str,
+) {
+    let Ok(Some(sender)) = state
+        .db
+        .get_session_by_id_prefix(&task.sender_session_id[..8.min(task.sender_session_id.len())])
+        .await
+    else {
+        return;
+    };
+    let ack = if reason.is_empty() {
+        format!(
+            "[ACK:CLEAR target=\"{}\" status={} queue_id={}]",
+            target_label, status, task.task_id,
+        )
+    } else {
+        format!(
+            "[ACK:CLEAR target=\"{}\" status={} reason={} queue_id={}]",
+            target_label, status, reason, task.task_id,
+        )
+    };
+    let _ = state.containers.send(&sender.session_id, &ack).await;
+}
+
+/// Build the [POST_CLEAR_BRIEFING] payload injected into a freshly-cleared
+/// session. Reconstructs in-flight working state from durable DB sources so
+/// the cleared session wakes up oriented rather than amnesiac.
+///
+/// Two flavors:
+/// - **Lead** (workflow-aware): roster, queued tasks per-role, member
+///   current_tasks, breakpoint reason. The Lead's job is coordination — it
+///   needs to know what's in flight to continue routing.
+/// - **Member** (minimal): one line acknowledging the clear and noting that
+///   the next assignment will arrive via the queue. Members coordinate per-
+///   task; they don't carry workflow state across tasks.
+async fn build_post_clear_briefing(
+    state: &AppState,
+    team_id: &str,
+    target: &StoredSession,
+    reason: &str,
+    is_lead: bool,
+) -> String {
+    if !is_lead {
+        let role = target.role.as_deref().unwrap_or("you");
+        return format!(
+            "[POST_CLEAR_BRIEFING]\nReason: {}.\nYour next assignment from the Team Lead will arrive shortly via the task queue. Continue normally — membank reload will refresh your role-specific context on the next message you receive.",
+            describe_clear_reason_full(reason, role),
+        );
+    }
+
+    let members = state.db.get_team_members(team_id).await.unwrap_or_default();
+    let mut roster_lines: Vec<String> = Vec::new();
+    for m in &members {
+        let role = m.role.as_deref().unwrap_or("Unknown");
+        let task_blurb = match m.current_task.as_deref() {
+            Some(t) if !t.is_empty() => {
+                format!(": \"{}\"", truncate_preview(t, 80))
+            }
+            _ => " (idle)".to_string(),
+        };
+        let status = if m.pending_task_from.is_some() {
+            "busy"
+        } else {
+            "idle"
+        };
+        roster_lines.push(format!("  - {} [{}]{}", role, status, task_blurb));
+    }
+
+    let queue_counts = state
+        .db
+        .queued_counts_by_role(team_id)
+        .await
+        .unwrap_or_default();
+    let queue_block = if queue_counts.is_empty() {
+        "  (none)".to_string()
+    } else {
+        queue_counts
+            .iter()
+            .map(|(r, n)| format!("  - {}: {} queued", r, n))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    let next_line = breakpoint_next_hint(reason);
+    format!(
+        "[POST_CLEAR_BRIEFING]\nReason: {}.\n\nRoster (durable from DB):\n{}\n\nQueued tasks awaiting drain:\n{}\n\n{}\n\nUse [TEAM_STATUS] for live detail; pending queued items will deliver as members free up — you do not need to re-issue anything that already has a queue_id.",
+        describe_clear_reason_full(reason, "Team Lead"),
+        roster_lines.join("\n"),
+        queue_block,
+        next_line,
+    )
+}
+
+/// Render the `reason` field into a human sentence for the briefing.
+/// Recognises `auto_NNpct`, `manual`, `self`, and `breakpoint:pr_N_merged`
+/// shapes. Returns an owned String because breakpoint reasons embed dynamic
+/// values (PR number, breakpoint name).
+fn describe_clear_reason_full(reason: &str, _who: &str) -> String {
+    if let Some(rest) = reason.strip_prefix("auto_") {
+        format!("context auto-cleared at the {} high-water threshold", rest)
+    } else if reason == "self" {
+        "self-clear at a workflow boundary".to_string()
+    } else if let Some(detail) = reason.strip_prefix("breakpoint:") {
+        if let Some(pr_part) = detail.strip_prefix("pr_")
+            && let Some(n) = pr_part.strip_suffix("_merged")
+        {
+            return format!("workflow-breakpoint clear after merging PR #{}", n);
+        }
+        format!("workflow-breakpoint clear ({})", detail)
+    } else if reason == "manual" {
+        "Lead-initiated [CLEAR:Role]".to_string()
+    } else {
+        format!("context cleared ({})", reason)
+    }
+}
+
+/// "Next:" suggestion line for the Lead briefing, tailored to the breakpoint.
+/// PR-merge breakpoints suggest reviewing the next story; auto-clears suggest
+/// resuming whatever was in flight; spec/plan breakpoints suggest the obvious
+/// next phase.
+fn breakpoint_next_hint(reason: &str) -> &'static str {
+    if let Some(detail) = reason.strip_prefix("breakpoint:") {
+        if detail.starts_with("pr_") && detail.ends_with("_merged") {
+            return "Next: review the next open PR in the queue, OR pick up the next story for assignment. Check [TEAM_STATUS] for who's idle.";
+        }
+        if detail.starts_with("plan") {
+            return "Next: spawn Developers (one per story) using [SPAWN:Developer] for the highest-priority items.";
+        }
+        if detail.starts_with("spec") {
+            return "Next: invoke the spec-flow `plan` tool on the approved spec to create stories.";
+        }
+        return "Next: continue the workflow from the relevant phase.";
+    }
+    if reason.starts_with("auto_") {
+        return "Next: resume the most recent task — check the user's last message in the thread and the queued items below.";
+    }
+    if reason == "self" {
+        return "Next: continue the workflow from the relevant phase.";
+    }
+    "Next: continue normally."
 }
 
 /// Send a drain-side ACK to the original sender. Status values:
@@ -4527,16 +5061,16 @@ async fn handle_team_interrupt(
     .await;
 }
 
-/// Handle [CLEAR:Role] — Lead clears context on a member's session.
-///
-/// Sends `/clear` (claude-code's own context reset), then re-injects
-/// `[TEAM_STATUS]` so the member retains roster awareness despite losing
-/// conversation history. Membank reload (via the user-scope plugin loaded in
-/// every spawned role) repopulates baseline context on the next message.
-///
-/// Shares the auto-clear cooldown so manual + auto can't ping-pong.
+/// Handle [CLEAR:Role] — Lead clears context on a member's session, OR
+/// `[CLEAR:Self]` — Lead pre-emptively clears its OWN session at a workflow
+/// boundary (between specs/plans/PR-merges). Both flow through the queue:
+/// each resolved target gets one queued clear row, drained by `drain_one_clear`
+/// when the target reaches end-of-turn. The drain side wipes the SDK client,
+/// re-injects [TEAM_STATUS], and ACKs back. Cooldown is enforced at enqueue
+/// time by `enqueue_team_clear` (SQL MAX(delivered_at) lookup), so manual +
+/// auto + self can't ping-pong.
 async fn handle_team_clear(
-    state: &AppState,
+    state: &Arc<AppState>,
     sender_session_id: &str,
     sender_role: &str,
     target_role: &str,
@@ -4566,12 +5100,23 @@ async fn handle_team_clear(
         return;
     }
 
-    let targets = match state.db.get_sessions_by_role(team_id, target_role).await {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::error!(error = %e, team_id, target_role, "Failed to look up clear targets");
-            return;
+    // Resolve targets. [CLEAR:Self] resolves to the Lead's own session;
+    // [CLEAR:Role] resolves to every matching member.
+    let targets: Vec<StoredSession> = if target_role.eq_ignore_ascii_case("self") {
+        match state
+            .db
+            .get_session_by_id_prefix(&sender_session_id[..8.min(sender_session_id.len())])
+            .await
+        {
+            Ok(Some(s)) => vec![s],
+            _ => vec![],
         }
+    } else {
+        state
+            .db
+            .get_sessions_by_role(team_id, target_role)
+            .await
+            .unwrap_or_default()
     };
 
     if targets.is_empty() {
@@ -4598,104 +5143,104 @@ async fn handle_team_clear(
         return;
     }
 
-    let mut ok_roles: Vec<String> = Vec::new();
-    let mut cooldown_roles: Vec<String> = Vec::new();
-    let mut failed_roles: Vec<String> = Vec::new();
+    let mut queued_ids: Vec<i64> = Vec::new();
+    let mut cooldown_targets: Vec<(String, i64)> = Vec::new(); // (label, secs_remaining)
+    let mut failed_targets: Vec<String> = Vec::new();
+    let reason_label = if target_role.eq_ignore_ascii_case("self") {
+        "self"
+    } else {
+        "manual"
+    };
     for t in &targets {
-        let role = t.role.as_deref().unwrap_or(target_role);
-        if !state
-            .containers
-            .try_begin_manual_clear(&t.session_id, AUTO_CLEAR_COOLDOWN_SECS)
+        let label = t.role.as_deref().unwrap_or(target_role).to_string();
+        match state
+            .db
+            .enqueue_team_clear(
+                team_id,
+                &label,
+                &t.session_id,
+                sender_session_id,
+                sender_role,
+                reason_label,
+                AUTO_CLEAR_COOLDOWN_SECS as i64,
+            )
+            .await
         {
-            cooldown_roles.push(role.to_string());
-            tracing::info!(
-                session_id = %t.session_id, role,
-                "Manual clear suppressed by cooldown ({}s)",
-                AUTO_CLEAR_COOLDOWN_SECS
-            );
-            continue;
-        }
-        match state.containers.clear(&t.session_id).await {
-            Ok(_) => {
-                ok_roles.push(role.to_string());
-                // Re-inject roster so the member retains team context.
-                handle_team_status(state, &t.session_id, team_id).await;
-                let _ = state
-                    .mm
-                    .post_in_thread(
-                        &t.channel_id,
-                        &t.thread_id,
-                        ":broom: **Context cleared by Team Lead** — membank will reload baseline context on your next message.",
-                    )
-                    .await;
+            Ok(EnqueueClearResult::Enqueued(id)) | Ok(EnqueueClearResult::AlreadyQueued(id)) => {
+                queued_ids.push(id);
+            }
+            Ok(EnqueueClearResult::Cooldown { remaining_secs }) => {
+                cooldown_targets.push((label, remaining_secs));
             }
             Err(e) => {
-                failed_roles.push(role.to_string());
-                tracing::warn!(error = %e, session_id = %t.session_id, role,
-                    "Failed to clear member session");
+                tracing::error!(error = %e, session_id = %t.session_id, "Failed to enqueue clear task");
+                failed_targets.push(label);
             }
         }
     }
 
+    // ACK summary back to the Lead with queue_ids so it can [CANCEL_QUEUED] if needed.
     if let Ok(Some(sender)) = state
         .db
         .get_session_by_id_prefix(&sender_session_id[..8.min(sender_session_id.len())])
         .await
     {
-        let mut parts: Vec<String> = Vec::new();
-        if !ok_roles.is_empty() {
-            parts.push(format!("count={}", ok_roles.len()));
-        }
-        if !cooldown_roles.is_empty() {
-            parts.push(format!("cooldown={}", cooldown_roles.len()));
-        }
-        if !failed_roles.is_empty() {
-            parts.push(format!("failed={}", failed_roles.len()));
-        }
-        let status = if !ok_roles.is_empty() {
-            "ok"
-        } else if !cooldown_roles.is_empty() && failed_roles.is_empty() {
+        let status = if !queued_ids.is_empty() {
+            "queued"
+        } else if !cooldown_targets.is_empty() && failed_targets.is_empty() {
             "rejected"
         } else {
             "failed"
         };
-        let reason = if status == "rejected" {
+        let reason_field = if status == "rejected" {
             " reason=cooldown"
-        } else if status == "failed" && !failed_roles.is_empty() {
-            " reason=delivery_failed"
+        } else if status == "failed" {
+            " reason=enqueue_failed"
         } else {
             ""
         };
+        let ids_field = if queued_ids.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " queue_ids=[{}]",
+                queued_ids.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(",")
+            )
+        };
         let ack = format!(
-            "[ACK:CLEAR target=\"{}\" status={}{} {}]",
+            "[ACK:CLEAR target=\"{}\" status={}{} count={}{}]",
             target_role,
             status,
-            reason,
-            parts.join(" "),
+            reason_field,
+            queued_ids.len(),
+            ids_field,
         );
+        let cooldown_summary = if cooldown_targets.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "\nCooldown-suppressed: [{}]. Try again in ~{}s.",
+                cooldown_targets
+                    .iter()
+                    .map(|(l, _)| l.clone())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                cooldown_targets.iter().map(|(_, s)| *s).max().unwrap_or(0),
+            )
+        };
         let body = format!(
-            "{}\nCleared: [{}]. Cooldown-suppressed: [{}]. Failed: [{}].\nCleared members will reload baseline context via membank on their next message.",
+            "{}\nClear enqueued for: [{}]. The drain will deliver an [ACK:CLEAR ... status=ok queue_id=N] for each as their turns complete.{}",
             ack,
-            ok_roles.join(", "),
-            cooldown_roles.join(", "),
-            failed_roles.join(", "),
+            queued_ids.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(", "),
+            cooldown_summary,
         );
         let _ = state.containers.send(&sender.session_id, &body).await;
     }
 
-    post_to_coordination_log(
-        state,
-        team_id,
-        &format!(
-            ":broom: **{} cleared {}** — ok: [{}] cooldown: [{}] failed: [{}]",
-            sender_role,
-            target_role,
-            ok_roles.join(", "),
-            cooldown_roles.join(", "),
-            failed_roles.join(", "),
-        ),
-    )
-    .await;
+    // Trigger drain so eligible clears fire immediately (most member targets
+    // are between turns when a Lead-driven clear arrives; only mid-turn ones
+    // wait for ResponseComplete).
+    drain_team_queue(state, team_id).await;
 }
 
 /// Handle [CANCEL_QUEUED:Role(:N)?] — Lead drops still-queued tasks before
@@ -4922,7 +5467,24 @@ async fn broadcast_team_message(
     .await;
 }
 
-/// Handle a [SPAWN:Role] marker from the Team Lead.
+/// Spawn outcome reported back to the drain. The drain uses this to decide
+/// whether to mark the queue row delivered, cancelled, or failed.
+#[derive(Debug, Clone, Copy)]
+enum SpawnOutcome {
+    /// Member spawned successfully. Drain marks task delivered.
+    Delivered,
+    /// Spawn rejected by policy (idle member exists, singleton already
+    /// claimed). ACK already sent to Lead. Drain marks task cancelled.
+    Rejected,
+    /// Spawn failed (claim error, start_session error). ACK already sent.
+    /// Drain marks task failed.
+    Failed,
+}
+
+/// Handle a [SPAWN:Role] marker. Today only invoked via the team_task_queue
+/// drain — the marker handler enqueues, the drain calls this. `queue_id` is
+/// woven into every ACK so the Lead can correlate.
+///
 /// Uses explicit boxed future return to break the async recursion cycle:
 /// start_session → stream_output → handle_team_spawn → start_session
 #[allow(clippy::too_many_arguments)]
@@ -4935,7 +5497,8 @@ fn handle_team_spawn(
     role_name: &str,
     initial_task: &str,
     project: &str,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+    queue_id: Option<i64>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = SpawnOutcome> + Send>> {
     // Own all string params for the async block
     let team_id = team_id.to_string();
     let channel_id = channel_id.to_string();
@@ -4943,6 +5506,10 @@ fn handle_team_spawn(
     let role_name = role_name.to_string();
     let initial_task = initial_task.to_string();
     let project = project.to_string();
+    let queue_suffix = match queue_id {
+        Some(id) => format!(" queue_id={}", id),
+        None => String::new(),
+    };
     Box::pin(async move {
         let team_id = team_id.as_str();
         let channel_id = channel_id.as_str();
@@ -4955,7 +5522,7 @@ fn handle_team_spawn(
             Ok(Some(t)) => t,
             _ => {
                 tracing::error!(team_id, "Team not found for spawn");
-                return;
+                return SpawnOutcome::Failed;
             }
         };
 
@@ -5017,15 +5584,15 @@ fn handle_team_spawn(
                         .await;
                     let header = build_team_context_header(&state.db, team_id, "Team Lead").await;
                     let ack = format!(
-                        "[ACK:SPAWN role=\"{}\" status=rejected reason=idle_available idle=\"{}\"]",
-                        role_def.display_name, idle_names[0],
+                        "[ACK:SPAWN role=\"{}\" status=rejected reason=idle_available idle=\"{}\"{}]",
+                        role_def.display_name, idle_names[0], queue_suffix,
                     );
                     let _ = state.containers.send(&lead.session_id, &format!(
                     "{}\n{}\nSpawn rejected: {} is idle and available. Use [TO:{}] to assign them a task before spawning a new {}.\nThe task you wanted to assign was: {}",
                     ack, header, idle_list, idle_names[0], role_def.display_name, initial_task,
                 )).await;
                 }
-                return;
+                return SpawnOutcome::Rejected;
             }
         }
 
@@ -5071,8 +5638,8 @@ fn handle_team_spawn(
                         .await;
                     let header = build_team_context_header(&state.db, team_id, "Team Lead").await;
                     let ack = format!(
-                        "[ACK:SPAWN role=\"{}\" status=rejected reason=already_exists]",
-                        role_def.display_name,
+                        "[ACK:SPAWN role=\"{}\" status=rejected reason=already_exists{}]",
+                        role_def.display_name, queue_suffix,
                     );
                     let _ = state
                         .containers
@@ -5085,12 +5652,12 @@ fn handle_team_spawn(
                         )
                         .await;
                 }
-                return;
+                return SpawnOutcome::Rejected;
             }
             Err(e) => {
                 tracing::error!(team_id, role = %role_def.display_name, error = %e,
                     "Failed to claim team role slot");
-                return;
+                return SpawnOutcome::Failed;
             }
         };
 
@@ -5112,7 +5679,7 @@ fn handle_team_spawn(
             }
             None => {
                 tracing::error!(project, "Failed to parse repo ref for team spawn");
-                return;
+                return SpawnOutcome::Failed;
             }
         };
 
@@ -5178,7 +5745,10 @@ fn handle_team_spawn(
                         .await;
                     // Feed confirmation back into the lead's Claude session so it can continue
                     let header = build_team_context_header(&state.db, team_id, "Team Lead").await;
-                    let ack = format!("[ACK:SPAWN role=\"{}\" status=ok]", display_name);
+                    let ack = format!(
+                        "[ACK:SPAWN role=\"{}\" status=ok{}]",
+                        display_name, queue_suffix
+                    );
                     if let Err(e) = state.containers.send(&lead.session_id, &format!(
                     "{}\n{}\nSpawn confirmed: {} is now active and has been assigned the task. Wait for their response before sending another task.",
                     ack, header, display_name,
@@ -5206,9 +5776,11 @@ fn handle_team_spawn(
                 );
                 broadcast_team_notification(&state, team_id, &update_msg, &member_session_id).await;
 
-                // New idle member — drain any queued role-fanouts that were
-                // waiting for capacity in this role.
-                drain_team_queue(&state, team_id).await;
+                // Note: previously called drain_team_queue here to pick up any
+                // queued [TO:Role] tasks for the new member. That's now redundant
+                // — when handle_team_spawn is invoked from the drain, the outer
+                // drain loop continues iterating after this call returns.
+                SpawnOutcome::Delivered
             }
             Err(e) => {
                 tracing::error!(error = %e, role = %display_name, "Failed to spawn team member");
@@ -5232,8 +5804,8 @@ fn handle_team_spawn(
                         .await;
                     let header = build_team_context_header(&state.db, team_id, "Team Lead").await;
                     let ack = format!(
-                        "[ACK:SPAWN role=\"{}\" status=failed reason=spawn_failed]",
-                        display_name,
+                        "[ACK:SPAWN role=\"{}\" status=failed reason=spawn_failed{}]",
+                        display_name, queue_suffix,
                     );
                     let _ = state
                         .containers
@@ -5246,6 +5818,7 @@ fn handle_team_spawn(
                         )
                         .await;
                 }
+                SpawnOutcome::Failed
             }
         }
     }) // close Box::pin(async move {

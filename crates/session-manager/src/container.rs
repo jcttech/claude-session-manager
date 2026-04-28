@@ -829,18 +829,12 @@ impl ContainerManager {
 
     /// Try to fire an auto `/clear` for this session.
     ///
-    /// Combines two guards to prevent the runaway loop seen previously with
-    /// `/compact`:
-    ///
-    /// 1. **Armed flag**: must be re-armed via [`rearm_auto_clear`] when context
-    ///    falls below the low threshold. The flag is consumed on a successful
-    ///    fire, so the trigger emits at most once per high-water mark regardless
-    ///    of how many `ResponseComplete` events report >90% in succession.
-    /// 2. **Time cooldown**: even if somehow re-armed, refuses to fire again
-    ///    within `cooldown_secs` of the previous fire — defence-in-depth against
-    ///    spurious low-then-high oscillation across a single turn.
-    ///
-    /// Returns true and resets the cooldown on success.
+    /// **Deprecated in v2.5.4**: clears now flow through `team_task_queue`
+    /// with task_type='clear'. Cooldown is enforced at enqueue time via SQL
+    /// (`MAX(delivered_at)` lookup in `enqueue_team_clear`), so this in-memory
+    /// guard is no longer called from main.rs. Kept for now to avoid breaking
+    /// the public API surface; remove in a future cleanup pass.
+    #[allow(dead_code)]
     pub fn try_begin_auto_clear(&self, session_id: &str, cooldown_secs: u64) -> bool {
         let Some(s) = self.sessions.get(session_id) else {
             return false;
@@ -861,21 +855,18 @@ impl ContainerManager {
         true
     }
 
-    /// Re-arm the auto-clear trigger. Call when context has fallen back below
-    /// the low-water threshold so the next high-water crossing can fire again.
+    /// Re-arm the auto-clear trigger. **Deprecated in v2.5.4** — see
+    /// `try_begin_auto_clear`.
+    #[allow(dead_code)]
     pub fn rearm_auto_clear(&self, session_id: &str) {
         if let Some(s) = self.sessions.get(session_id) {
             s.auto_clear_armed.store(true, Ordering::SeqCst);
         }
     }
 
-    /// Manual cousin of [`try_begin_auto_clear`] for Lead-driven `[CLEAR:Role]`.
-    /// Skips the armed-flag check (the caller is making an explicit decision
-    /// regardless of context level) but enforces the same time cooldown, so
-    /// manual + auto can't ping-pong inside the same window.
-    ///
-    /// Also consumes the armed flag — if the Lead just cleared, auto-clear
-    /// shouldn't immediately fire on top of it for the cooldown window.
+    /// Manual cousin of [`try_begin_auto_clear`]. **Deprecated in v2.5.4** —
+    /// see `try_begin_auto_clear`.
+    #[allow(dead_code)]
     pub fn try_begin_manual_clear(&self, session_id: &str, cooldown_secs: u64) -> bool {
         let Some(s) = self.sessions.get(session_id) else {
             return false;
