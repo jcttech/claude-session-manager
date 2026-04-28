@@ -29,7 +29,7 @@ pub fn generate_default_config(image: &str, network: &str, port: u16) -> String 
     "containerEnv": {{
         "ANTHROPIC_API_KEY": "${{localEnv:ANTHROPIC_API_KEY}}"
     }},
-    "postStartCommand": "python3 -m agent_worker --port 50051 &",
+    "postStartCommand": "nohup python3 -m agent_worker --port 50051 >/tmp/agent-worker.log 2>&1 &",
     "runArgs": ["--network={}", "-p", "{}:50051", "--label", "csm.managed=true"]
 }}"#,
         image, network, port
@@ -67,7 +67,9 @@ pub fn build_override_config(original_content: &str, port: u16) -> anyhow::Resul
     // Set postStartCommand for agent worker
     obj.insert(
         "postStartCommand".to_string(),
-        serde_json::Value::String("python3 -m agent_worker --port 50051 &".to_string()),
+        serde_json::Value::String(
+            "nohup python3 -m agent_worker --port 50051 >/tmp/agent-worker.log 2>&1 &".to_string(),
+        ),
     );
 
     // Add port mapping to runArgs, preserving all existing args (including network)
