@@ -833,6 +833,30 @@ impl ContainerManager {
         }
     }
 
+    /// Manual cousin of [`try_begin_auto_clear`] for Lead-driven `[CLEAR:Role]`.
+    /// Skips the armed-flag check (the caller is making an explicit decision
+    /// regardless of context level) but enforces the same time cooldown, so
+    /// manual + auto can't ping-pong inside the same window.
+    ///
+    /// Also consumes the armed flag — if the Lead just cleared, auto-clear
+    /// shouldn't immediately fire on top of it for the cooldown window.
+    pub fn try_begin_manual_clear(&self, session_id: &str, cooldown_secs: u64) -> bool {
+        let Some(s) = self.sessions.get(session_id) else {
+            return false;
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let last = s.last_auto_clear_at.load(Ordering::SeqCst);
+        if last != 0 && now.saturating_sub(last) < cooldown_secs {
+            return false;
+        }
+        s.last_auto_clear_at.store(now, Ordering::SeqCst);
+        s.auto_clear_armed.store(false, Ordering::SeqCst);
+        true
+    }
+
     /// Get plan mode status for a session
     pub fn get_plan_mode(&self, session_id: &str) -> bool {
         self.sessions

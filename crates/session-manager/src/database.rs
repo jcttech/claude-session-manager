@@ -97,6 +97,24 @@ pub struct StoredPendingRequest {
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
+#[derive(Debug, Clone, FromRow)]
+#[allow(dead_code)]
+pub struct StoredTeamTask {
+    pub task_id: i64,
+    pub team_id: String,
+    pub target_role: String,
+    pub target_session_id: Option<String>,
+    pub is_prefix_match: bool,
+    pub sender_session_id: String,
+    pub sender_role: String,
+    pub message: String,
+    pub status: String,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub delivered_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub cancelled_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub failure_reason: Option<String>,
+}
+
 #[derive(Debug, FromRow)]
 #[allow(dead_code)]
 pub struct AuditLogEntry {
@@ -541,6 +559,52 @@ pub async fn create_schema(pool: &PgPool, schema: &str) -> Result<()> {
          ON {}.sessions(team_id, role) \
          WHERE team_id IS NOT NULL AND role IS NOT NULL \
            AND status IN ('active','disconnected','stuck')",
+        schema
+    ))
+    .execute(pool)
+    .await?;
+
+    // Persistent task queue. Replaces the previous fire-immediately path so the
+    // session-manager — not claude-code's stdin buffer — owns delivery timing.
+    // The Lead can amend/cancel queued tasks before they hit the member; once a
+    // row flips to status='delivered', the only escape is [INTERRUPT:Role].
+    sqlx::query(&format!(
+        r#"
+        CREATE TABLE IF NOT EXISTS {}.team_task_queue (
+            task_id           BIGSERIAL PRIMARY KEY,
+            team_id           TEXT NOT NULL,
+            target_role       TEXT NOT NULL,
+            target_session_id TEXT,
+            is_prefix_match   BOOLEAN NOT NULL,
+            sender_session_id TEXT NOT NULL,
+            sender_role       TEXT NOT NULL,
+            message           TEXT NOT NULL,
+            status            TEXT NOT NULL DEFAULT 'queued',
+            created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            delivered_at      TIMESTAMPTZ,
+            cancelled_at      TIMESTAMPTZ,
+            failure_reason    TEXT
+        )
+        "#,
+        schema
+    ))
+    .execute(pool)
+    .await?;
+
+    // Drain hot path: oldest queued row per team+role, partial index keeps it tight.
+    sqlx::query(&format!(
+        "CREATE INDEX IF NOT EXISTS idx_team_task_queue_drain \
+         ON {}.team_task_queue (team_id, target_role, created_at) \
+         WHERE status = 'queued'",
+        schema
+    ))
+    .execute(pool)
+    .await?;
+
+    // Lookup by sender for [CANCEL_QUEUED:Role] / TEAM_STATUS visibility.
+    sqlx::query(&format!(
+        "CREATE INDEX IF NOT EXISTS idx_team_task_queue_sender \
+         ON {}.team_task_queue (team_id, sender_session_id, status)",
         schema
     ))
     .execute(pool)
@@ -1454,5 +1518,157 @@ impl Database {
         .fetch_optional(&self.pool)
         .await?;
         Ok(role)
+    }
+
+    // --- Team task queue operations ---
+
+    /// Enqueue a [TO:Role] task for delivery. Returns the new task_id.
+    /// `is_prefix_match` records whether the original marker was a prefix
+    /// (e.g. `[TO:Developer]`) vs exact (e.g. `[TO:Developer 2]`); the drain
+    /// uses it to decide whether to fan to any idle member of the role or
+    /// hold for the named one.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn enqueue_team_task(
+        &self,
+        team_id: &str,
+        target_role: &str,
+        is_prefix_match: bool,
+        sender_session_id: &str,
+        sender_role: &str,
+        message: &str,
+    ) -> Result<i64> {
+        let row: (i64,) = sqlx::query_as(&format!(
+            "INSERT INTO {}.team_task_queue \
+                 (team_id, target_role, is_prefix_match, sender_session_id, sender_role, message) \
+             VALUES ($1, $2, $3, $4, $5, $6) \
+             RETURNING task_id",
+            SCHEMA
+        ))
+        .bind(team_id)
+        .bind(target_role)
+        .bind(is_prefix_match)
+        .bind(sender_session_id)
+        .bind(sender_role)
+        .bind(message)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row.0)
+    }
+
+    /// Oldest-first list of all queued tasks for a team. Drain orchestration
+    /// in main.rs walks this list and tries to claim a target for each row.
+    pub async fn list_queued_tasks_for_team(&self, team_id: &str) -> Result<Vec<StoredTeamTask>> {
+        let rows = sqlx::query_as::<_, StoredTeamTask>(&format!(
+            "SELECT task_id, team_id, target_role, target_session_id, is_prefix_match, \
+                    sender_session_id, sender_role, message, status, \
+                    created_at, delivered_at, cancelled_at, failure_reason \
+             FROM {}.team_task_queue \
+             WHERE team_id = $1 AND status = 'queued' \
+             ORDER BY created_at ASC",
+            SCHEMA
+        ))
+        .bind(team_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    /// Mark a queued task as delivered. Caller has already pushed the message
+    /// into the target's container via `containers.send`.
+    pub async fn mark_task_delivered(
+        &self,
+        task_id: i64,
+        target_session_id: &str,
+    ) -> Result<()> {
+        sqlx::query(&format!(
+            "UPDATE {}.team_task_queue \
+             SET status = 'delivered', delivered_at = NOW(), target_session_id = $2 \
+             WHERE task_id = $1",
+            SCHEMA
+        ))
+        .bind(task_id)
+        .bind(target_session_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Mark a queued task as failed (e.g. delivery_unreachable). Used by drain
+    /// when `containers.send` fails so we don't keep retrying a dead session.
+    pub async fn mark_task_failed(&self, task_id: i64, reason: &str) -> Result<()> {
+        sqlx::query(&format!(
+            "UPDATE {}.team_task_queue \
+             SET status = 'failed', failure_reason = $2 \
+             WHERE task_id = $1",
+            SCHEMA
+        ))
+        .bind(task_id)
+        .bind(reason)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Cancel every still-queued task from `sender_session_id` aimed at
+    /// `target_role` (exact role string match). Only rows with status='queued'
+    /// flip — already-delivered rows are left alone (Lead must INTERRUPT).
+    /// Returns the number of cancelled rows.
+    pub async fn cancel_queued_from_sender(
+        &self,
+        team_id: &str,
+        sender_session_id: &str,
+        target_role: &str,
+    ) -> Result<u64> {
+        let result = sqlx::query(&format!(
+            "UPDATE {}.team_task_queue \
+             SET status = 'cancelled', cancelled_at = NOW() \
+             WHERE team_id = $1 AND sender_session_id = $2 AND target_role = $3 \
+               AND status = 'queued'",
+            SCHEMA
+        ))
+        .bind(team_id)
+        .bind(sender_session_id)
+        .bind(target_role)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
+    /// Cancel a specific queued task by id. Sender check ensures Lead can't
+    /// cancel another sender's queue (currently only the Lead enqueues, but
+    /// the check is cheap defence-in-depth). Returns true on success.
+    pub async fn cancel_queued_task_by_id(
+        &self,
+        task_id: i64,
+        sender_session_id: &str,
+    ) -> Result<bool> {
+        let result = sqlx::query(&format!(
+            "UPDATE {}.team_task_queue \
+             SET status = 'cancelled', cancelled_at = NOW() \
+             WHERE task_id = $1 AND sender_session_id = $2 AND status = 'queued'",
+            SCHEMA
+        ))
+        .bind(task_id)
+        .bind(sender_session_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Per-role queued count for a team. Used by [TEAM_STATUS] to surface
+    /// queue depth without dumping every row.
+    pub async fn queued_counts_by_role(&self, team_id: &str) -> Result<Vec<(String, i64)>> {
+        let rows: Vec<(String, i64)> = sqlx::query_as(&format!(
+            "SELECT target_role, COUNT(*)::BIGINT \
+             FROM {}.team_task_queue \
+             WHERE team_id = $1 AND status = 'queued' \
+             GROUP BY target_role \
+             ORDER BY target_role",
+            SCHEMA
+        ))
+        .bind(team_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
     }
 }

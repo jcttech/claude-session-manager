@@ -257,7 +257,7 @@ dependencies = [
 
 [[package]]
 name = "common"
-version = "2.5.1"
+version = "2.5.2"
 dependencies = [
  "anyhow",
  "axum",
@@ -783,7 +783,7 @@ dependencies = [
 
 [[package]]
 name = "graph-client"
-version = "2.5.1"
+version = "2.5.2"
 
 [[package]]
 name = "h2"
@@ -1341,7 +1341,7 @@ checksum = "5e5032e24019045c762d3c0f28f5b6b8bbf38563a65908389bf7978758920897"
 
 [[package]]
 name = "mail-bridge"
-version = "2.5.1"
+version = "2.5.2"
 
 [[package]]
 name = "matchers"
@@ -1360,7 +1360,7 @@ checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
 
 [[package]]
 name = "mattermost-client"
-version = "2.5.1"
+version = "2.5.2"
 dependencies = [
  "anyhow",
  "futures-util",
@@ -2308,7 +2308,7 @@ dependencies = [
 
 [[package]]
 name = "session-manager"
-version = "2.5.1"
+version = "2.5.2"
 dependencies = [
  "anyhow",
  "axum",
