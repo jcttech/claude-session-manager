@@ -35,9 +35,25 @@ pub struct ClaimedSession {
     pub branch: String,
 }
 
+/// Reply payload sent from `stream_output`'s CLI dispatcher back into the
+/// per-session message_processor, where it's forwarded over the bidi gRPC
+/// stream to agent-worker. cli_id correlates with the in-container CLI
+/// connection still waiting on its Future.
+#[derive(Debug, Clone)]
+pub struct CliReply {
+    pub cli_id: String,
+    pub exit_code: i32,
+    pub stdout: String,
+    pub stderr: String,
+}
+
 struct Session {
     name: String,
     message_tx: mpsc::Sender<String>,
+    /// Replies for outstanding CLI commands. Same pattern as message_tx —
+    /// the message_processor's select! loop drains this and writes onto the
+    /// bidi gRPC stream via `GrpcStream::send_cli_response`.
+    cli_response_tx: mpsc::Sender<CliReply>,
     /// Path to worktree if session is using one (for cleanup)
     worktree_path: Option<PathBuf>,
     /// Repo identifier (e.g., "org/repo") for container registry lookups
@@ -511,6 +527,7 @@ impl ContainerManager {
             .map_err(|e| anyhow!("Failed to open gRPC stream: {}", e))?;
 
         let (message_tx, message_rx) = mpsc::channel::<String>(32);
+        let (cli_response_tx, cli_response_rx) = mpsc::channel::<CliReply>(32);
         let is_first_message = Arc::new(AtomicBool::new(true));
         let claude_session_id = Arc::new(Mutex::new(initial_claude_session_id.map(|s| s.to_string())));
         let plan_mode_flag = Arc::new(AtomicBool::new(plan_mode));
@@ -532,6 +549,7 @@ impl ContainerManager {
         tokio::spawn(async move {
             message_processor(
                 message_rx,
+                cli_response_rx,
                 output_tx,
                 session_id_owned,
                 is_first_clone,
@@ -552,6 +570,7 @@ impl ContainerManager {
             Session {
                 name: container_name.to_string(),
                 message_tx,
+                cli_response_tx,
                 worktree_path: None,
                 repo: repo.to_string(),
                 branch: branch.to_string(),
@@ -690,6 +709,35 @@ impl ContainerManager {
             }
         }
         Ok(())
+    }
+
+    /// Hand a `team` CLI reply to the session's message_processor so it gets
+    /// written back through the bidi gRPC stream to agent-worker, which in
+    /// turn relays to the waiting CLI binary inside the container.
+    pub async fn send_cli_response(
+        &self,
+        session_id: &str,
+        cli_id: &str,
+        exit_code: i32,
+        stdout: &str,
+        stderr: &str,
+    ) -> Result<()> {
+        match self.sessions.get(session_id) {
+            Some(session) => session
+                .cli_response_tx
+                .send(CliReply {
+                    cli_id: cli_id.to_string(),
+                    exit_code,
+                    stdout: stdout.to_string(),
+                    stderr: stderr.to_string(),
+                })
+                .await
+                .map_err(|_| anyhow!("Session {} cli_response channel closed", session_id)),
+            None => Err(anyhow!(
+                "Session {} not found in-memory (cli reply dropped)",
+                session_id
+            )),
+        }
     }
 
     /// Set the worktree path for a session (for tracking purposes)
@@ -1124,6 +1172,7 @@ async fn reconnect_stream(container_name: &str, grpc_addr: &str) -> Result<GrpcS
 #[allow(clippy::too_many_arguments)]
 async fn message_processor(
     mut message_rx: mpsc::Receiver<String>,
+    mut cli_response_rx: mpsc::Receiver<CliReply>,
     output_tx: mpsc::Sender<OutputEvent>,
     session_id: String,
     is_first_message: Arc<AtomicBool>,
@@ -1137,6 +1186,22 @@ async fn message_processor(
     system_prompt_append: String,
 ) {
     use grpc::proto::agent_event;
+
+    // Build the per-session env passed into the SDK subprocess on every
+    // CreateSession. Right now it carries CSM_CLI_SOCKET so the in-container
+    // `team` CLI knows where to dial. Path is deterministic on session_id so
+    // reconnects (which open a fresh bidi stream) reuse the same socket
+    // path — the SDK subprocess env is fixed at spawn, so any tool calls
+    // inside the still-running container keep working after a reconnect.
+    let cli_socket_path = format!(
+        "/tmp/csm-cli-{}.sock",
+        &session_id[..8.min(session_id.len())],
+    );
+    let build_session_env = || {
+        let mut env = std::collections::HashMap::new();
+        env.insert("CSM_CLI_SOCKET".to_string(), cli_socket_path.clone());
+        env
+    };
 
     let mut in_turn = false;
     let mut in_background = false;
@@ -1183,7 +1248,7 @@ async fn message_processor(
                         .create(
                             &message,
                             permission_mode,
-                            std::collections::HashMap::new(),
+                            build_session_env(),
                             &system_prompt_append,
                             thinking_tokens,
                             resume_sid.as_deref(),
@@ -1196,6 +1261,7 @@ async fn message_processor(
                             .send(OutputEvent::ProcessDied {
                                 exit_code: Some(1),
                                 signal: Some(format!("Reconnect send error: {}", e)),
+                                raw_json: None,
                             })
                             .await;
                         break;
@@ -1211,6 +1277,7 @@ async fn message_processor(
                         .send(OutputEvent::ProcessDied {
                             exit_code: Some(1),
                             signal: Some(format!("Reconnect failed: {}", e)),
+                            raw_json: None,
                         })
                         .await;
                     break;
@@ -1224,6 +1291,25 @@ async fn message_processor(
 
         tokio::select! {
             biased;
+
+            // CLI replies: send the response back through the bidi gRPC
+            // stream so agent-worker's pending_cli future resolves and the
+            // CLI binary inside the container prints + exits.
+            reply = cli_response_rx.recv() => {
+                let Some(reply) = reply else {
+                    tracing::debug!(session_id = %session_id, "CLI response channel closed");
+                    // Channel close just means stream_output finished; not
+                    // fatal for this loop.
+                    continue;
+                };
+                if let Err(e) = active_stream
+                    .send_cli_response(&reply.cli_id, reply.exit_code, &reply.stdout, &reply.stderr)
+                    .await
+                {
+                    tracing::warn!(error = %e, cli_id = %reply.cli_id,
+                        "Failed to send CliResponse on bidi stream");
+                }
+            }
 
             // Accept new user messages only when not already processing a turn
             msg = message_rx.recv(), if !in_turn => {
@@ -1264,7 +1350,7 @@ async fn message_processor(
                     active_stream.create(
                         &message,
                         permission_mode,
-                        std::collections::HashMap::new(),
+                        build_session_env(),
                         &system_prompt_append,
                         thinking_tokens,
                         stored_sid.as_deref(),
@@ -1413,6 +1499,11 @@ async fn message_processor(
                                         .send(OutputEvent::ProcessDied {
                                             exit_code: Some(1),
                                             signal: None,
+                                            raw_json: if result.result_text.is_empty() {
+                                                None
+                                            } else {
+                                                Some(result.result_text.clone())
+                                            },
                                         })
                                         .await;
                                 } else {
@@ -1437,16 +1528,62 @@ async fn message_processor(
                                     event_count,
                                     error_type = %err.error_type,
                                     message = %err.message,
+                                    raw_json_len = err.raw_json.len(),
                                     "gRPC: Agent error"
                                 );
                                 let _ = output_tx
                                     .send(OutputEvent::ProcessDied {
                                         exit_code: Some(1),
                                         signal: Some(format!("{}: {}", err.error_type, err.message)),
+                                        raw_json: if err.raw_json.is_empty() {
+                                            None
+                                        } else {
+                                            Some(err.raw_json.clone())
+                                        },
                                     })
                                     .await;
                                 in_turn = false;
                                 in_background = false;
+                            }
+                            agent_event::Event::RateLimit(rl) => {
+                                tracing::info!(
+                                    event_count,
+                                    status = %rl.status,
+                                    limit_type = %rl.limit_type,
+                                    resets_at = rl.resets_at,
+                                    utilization = rl.utilization,
+                                    "gRPC: RateLimit event"
+                                );
+                                let _ = output_tx
+                                    .send(OutputEvent::RateLimit {
+                                        status: rl.status.clone(),
+                                        resets_at: rl.resets_at,
+                                        limit_type: rl.limit_type.clone(),
+                                        utilization: rl.utilization,
+                                        raw_json: rl.raw_json.clone(),
+                                    })
+                                    .await;
+                            }
+                            agent_event::Event::CliCommand(cmd) => {
+                                tracing::info!(
+                                    event_count,
+                                    cli_id = %cmd.cli_id,
+                                    verb = %cmd.verb,
+                                    args_len = cmd.args.len(),
+                                    "gRPC: CliCommand received"
+                                );
+                                // Forward to stream_output for dispatch (it
+                                // owns AppState). Reply flows back via the
+                                // cli_response channel so we don't have to
+                                // hand the bidi stream to stream_output.
+                                let _ = output_tx
+                                    .send(OutputEvent::CliCommand {
+                                        cli_id: cmd.cli_id.clone(),
+                                        verb: cmd.verb.clone(),
+                                        args: cmd.args.clone(),
+                                        flags: cmd.flags.clone().into_iter().collect(),
+                                    })
+                                    .await;
                             }
                         }
                     }

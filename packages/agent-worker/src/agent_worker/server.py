@@ -4,12 +4,16 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import logging
+import os
 import time
+import uuid
 
 from claude_agent_sdk._internal.message_parser import parse_message
 from claude_agent_sdk.types import (
     AssistantMessage,
+    RateLimitEvent,
     ResultMessage,
     StreamEvent,
     SystemMessage,
@@ -23,9 +27,11 @@ from .event_mapper import (
     extract_context_tokens_from_stream,
     fallback_result_event,
     map_assistant_message,
+    map_rate_limit_event,
     map_result_message,
     map_stream_event,
     map_system_message,
+    raw_error_event,
 )
 from .session_manager import SessionManager
 
@@ -58,20 +64,23 @@ class AgentWorkerServicer(agent_pb2_grpc.AgentWorkerServicer):
             message = parse_message(raw_data)
         except Exception as parse_exc:
             exc_str = str(parse_exc)
-            if "rate_limit_event" in exc_str:
-                logger.info("Rate limit event received: %s", parse_exc)
-                if isinstance(raw_data, dict):
-                    logger.info("Rate limit details: %s", raw_data)
-            elif isinstance(raw_data, dict) and raw_data.get("type") == "result":
+            if isinstance(raw_data, dict) and raw_data.get("type") == "result":
                 logger.error(
                     "ResultMessage parse failed — forcing exit: %s",
                     parse_exc,
                 )
                 evt = fallback_result_event(raw_data, turn_start, context_tokens)
                 return evt, True, context_tokens
-            else:
-                logger.warning("Skipping unparseable message: %s", parse_exc)
-            return None, False, context_tokens
+            # Anything we can't parse — including malformed rate_limit_event
+            # rows — is forwarded as a raw_json AgentError so session-manager
+            # can surface it instead of silently dropping the signal.
+            logger.warning("Forwarding unparseable SDK message: %s", parse_exc)
+            evt = raw_error_event(
+                raw_data,
+                f"unparseable SDK message: {exc_str}",
+                error_type="parse_failed",
+            )
+            return evt, False, context_tokens
 
         msg_type = type(message).__name__
         if isinstance(message, SystemMessage):
@@ -107,12 +116,30 @@ class AgentWorkerServicer(agent_pb2_grpc.AgentWorkerServicer):
             event = map_stream_event(message)
             return event, False, context_tokens
 
+        elif isinstance(message, RateLimitEvent):
+            info = message.rate_limit_info
+            logger.info(
+                "RateLimitEvent: status=%s type=%s resets_at=%s utilization=%s",
+                info.status,
+                info.rate_limit_type,
+                info.resets_at,
+                info.utilization,
+            )
+            return map_rate_limit_event(message), False, context_tokens
+
         elif isinstance(message, UserMessage):
             return None, False, context_tokens  # Tool results flowing back — not surfaced to chat
 
         else:
-            logger.warning("Unhandled message type: %s", msg_type)
-            return None, False, context_tokens
+            # Forward unknown SDK message types upstream as raw errors so we
+            # can iterate without first round-tripping through a proto change.
+            logger.warning("Forwarding unhandled SDK message type: %s", msg_type)
+            evt = raw_error_event(
+                raw_data,
+                f"unhandled SDK message type: {msg_type}",
+                error_type="unhandled_type",
+            )
+            return evt, False, context_tokens
 
     async def Session(self, request_iterator, context):
         """Bidirectional streaming: one gRPC stream = one SDK session lifecycle.
@@ -133,6 +160,19 @@ class AgentWorkerServicer(agent_pb2_grpc.AgentWorkerServicer):
         event_queue: asyncio.Queue = asyncio.Queue()
         # Shared mutable turn_start timestamp (updated by request_handler)
         turn_start = time.monotonic()
+
+        # `team` CLI correlation. Each in-container CLI invocation gets a
+        # cli_id; we push CliCommand onto event_queue (forwarded upstream),
+        # then the host's CliResponse arrives via request_handler and we
+        # resolve the matching Future. Scoped to this Session task group, so
+        # there's no cross-session leakage by construction.
+        pending_cli: dict[str, asyncio.Future] = {}
+        # Per-session Unix socket path. Populated when CreateSession.env
+        # carries CSM_CLI_SOCKET; empty disables the CLI socket entirely
+        # (e.g. legacy callers).
+        cli_socket_path: str | None = None
+        cli_socket_server: asyncio.AbstractServer | None = None
+        cli_socket_task: asyncio.Task | None = None
 
         async def sdk_reader():
             """Continuously read from SDK message stream and push events to queue."""
@@ -173,9 +213,91 @@ class AgentWorkerServicer(agent_pb2_grpc.AgentWorkerServicer):
                 await event_queue.put(error_event(str(exc), "sdk_reader_error"))
                 await event_queue.put(None)
 
+        async def handle_cli_socket(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+            """Per-connection handler for the in-container `team` CLI.
+
+            Wire format (one JSON object per line):
+              request:  {"verb": "...", "args": [...], "flags": {...}}
+              response: {"exit_code": N, "stdout": "...", "stderr": "..."}
+
+            We allocate cli_id here so the CLI doesn't need to. Pushes a
+            CliCommand onto the bidi event_queue and awaits the matching
+            CliResponse from request_handler.
+            """
+            try:
+                line = await asyncio.wait_for(reader.readline(), timeout=5.0)
+                if not line:
+                    return
+                try:
+                    payload = json.loads(line.decode("utf-8"))
+                except json.JSONDecodeError as e:
+                    err = json.dumps({"exit_code": 2, "stdout": "",
+                                      "stderr": f"team: malformed request: {e}\n"}) + "\n"
+                    writer.write(err.encode("utf-8"))
+                    await writer.drain()
+                    return
+
+                cli_id = uuid.uuid4().hex
+                fut: asyncio.Future = asyncio.get_event_loop().create_future()
+                pending_cli[cli_id] = fut
+
+                cmd = agent_pb2.CliCommand(
+                    cli_id=cli_id,
+                    verb=str(payload.get("verb", "")),
+                    args=[str(a) for a in payload.get("args", []) or []],
+                    flags={str(k): str(v) for k, v in (payload.get("flags") or {}).items()},
+                )
+                await event_queue.put(agent_pb2.AgentEvent(cli_command=cmd))
+
+                try:
+                    resp = await asyncio.wait_for(fut, timeout=30.0)
+                    body = json.dumps({
+                        "exit_code": int(resp.exit_code),
+                        "stdout": resp.stdout,
+                        "stderr": resp.stderr,
+                    }) + "\n"
+                except asyncio.TimeoutError:
+                    body = json.dumps({
+                        "exit_code": 124,
+                        "stdout": "",
+                        "stderr": "team: timed out waiting for session-manager response\n",
+                    }) + "\n"
+                finally:
+                    pending_cli.pop(cli_id, None)
+
+                writer.write(body.encode("utf-8"))
+                await writer.drain()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("CLI socket handler failed")
+            finally:
+                try:
+                    writer.close()
+                    await writer.wait_closed()
+                except Exception:
+                    pass
+
+        async def start_cli_socket(path: str):
+            """Bind the per-session Unix socket. Idempotent: removes a stale
+            file from a prior crash before binding."""
+            nonlocal cli_socket_server
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
+            except OSError as e:
+                logger.warning("CLI socket unlink failed for %s: %s", path, e)
+            cli_socket_server = await asyncio.start_unix_server(handle_cli_socket, path=path)
+            try:
+                os.chmod(path, 0o600)
+            except OSError:
+                pass
+            logger.info("CLI socket listening on %s", path)
+
         async def request_handler():
             """Read gRPC requests and dispatch to SDK client."""
-            nonlocal client, session_id, msg_stream, turn_start
+            nonlocal client, session_id, msg_stream, turn_start, cli_socket_path, cli_socket_task
             try:
                 async for request in request_iterator:
                     input_type = request.WhichOneof("input")
@@ -185,16 +307,24 @@ class AgentWorkerServicer(agent_pb2_grpc.AgentWorkerServicer):
                         logger.info("Session: create prompt=%s...",
                                     request.create.prompt[:80])
                         req = request.create
+                        env_map = dict(req.env)
+                        # Lift CSM_CLI_SOCKET out of the env map so we can bind
+                        # the socket here, but still pass it through to the
+                        # SDK subprocess so the LLM's Bash tool inherits it.
+                        cli_sock = env_map.get("CSM_CLI_SOCKET", "").strip()
                         client = await self.sessions.create_session(
                             req.prompt,
                             permission_mode=req.permission_mode,
-                            env=dict(req.env),
+                            env=env_map,
                             system_prompt_append=req.system_prompt_append,
                             max_turns=req.max_turns or None,
                             max_thinking_tokens=req.max_thinking_tokens or None,
                             resume_session_id=req.resume_session_id or None,
                         )
                         msg_stream = client._query.receive_messages().__aiter__()
+                        if cli_sock and cli_socket_task is None:
+                            cli_socket_path = cli_sock
+                            cli_socket_task = asyncio.create_task(start_cli_socket(cli_sock))
 
                     elif input_type == "follow_up":
                         logger.info("Session: follow_up prompt=%s...",
@@ -205,6 +335,18 @@ class AgentWorkerServicer(agent_pb2_grpc.AgentWorkerServicer):
                             )
                             continue
                         await client.query(request.follow_up.prompt)
+
+                    elif input_type == "cli_response":
+                        # Match the host's reply with the awaiting CLI handler.
+                        resp = request.cli_response
+                        fut = pending_cli.get(resp.cli_id)
+                        if fut is not None and not fut.done():
+                            fut.set_result(resp)
+                        else:
+                            logger.debug(
+                                "CliResponse for unknown cli_id=%s (timed out?)",
+                                resp.cli_id,
+                            )
             except asyncio.CancelledError:
                 return
             except Exception as exc:
@@ -254,7 +396,7 @@ class AgentWorkerServicer(agent_pb2_grpc.AgentWorkerServicer):
             logger.exception("Session failed")
             yield error_event(str(exc), "session_error")
         finally:
-            # Cancel both tasks on cleanup
+            # Cancel all task-group members on cleanup
             if reader_task is not None and not reader_task.done():
                 reader_task.cancel()
                 try:
@@ -267,6 +409,33 @@ class AgentWorkerServicer(agent_pb2_grpc.AgentWorkerServicer):
                     await handler_task
                 except asyncio.CancelledError:
                     pass
+
+            # Tear down the CLI socket. Cancel any pending CLI handlers so
+            # the futures don't leak (each waiter sees CancelledError and
+            # writes a structured error back to its own connected CLI).
+            for fut in list(pending_cli.values()):
+                if not fut.done():
+                    fut.cancel()
+            pending_cli.clear()
+            if cli_socket_server is not None:
+                cli_socket_server.close()
+                try:
+                    await cli_socket_server.wait_closed()
+                except Exception:
+                    pass
+            if cli_socket_task is not None and not cli_socket_task.done():
+                cli_socket_task.cancel()
+                try:
+                    await cli_socket_task
+                except asyncio.CancelledError:
+                    pass
+            if cli_socket_path:
+                try:
+                    os.unlink(cli_socket_path)
+                except FileNotFoundError:
+                    pass
+                except OSError as e:
+                    logger.warning("CLI socket unlink on shutdown failed: %s", e)
 
         logger.info("Session: ended, yielded %d events", events_yielded)
         if session_id:

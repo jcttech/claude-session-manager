@@ -134,6 +134,24 @@ pub struct StoredTeamTask {
     pub spawn_payload: Option<serde_json::Value>,
 }
 
+/// Snapshot of the per-team rate-limit pause. Only one row per team_id at a
+/// time; updated in-place on every transition (allowed → allowed_warning →
+/// rejected → allowed).
+#[derive(Debug, Clone, FromRow)]
+#[allow(dead_code)]
+pub struct TeamRateLimit {
+    pub team_id: String,
+    pub status: String,
+    pub resets_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub limit_type: String,
+    pub utilization: Option<f64>,
+    pub raw_json: String,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+    /// Mattermost post we keep editing in place so the team thread doesn't
+    /// fill with duplicate "rate limit hit" cards on every retry.
+    pub notice_post_id: Option<String>,
+}
+
 #[derive(Debug, FromRow)]
 #[allow(dead_code)]
 pub struct AuditLogEntry {
@@ -586,7 +604,10 @@ pub async fn create_schema(pool: &PgPool, schema: &str) -> Result<()> {
     // Persistent task queue. Replaces the previous fire-immediately path so the
     // session-manager — not claude-code's stdin buffer — owns delivery timing.
     // The Lead can amend/cancel queued tasks before they hit the member; once a
-    // row flips to status='delivered', the only escape is [INTERRUPT:Role].
+    // row flips to status='running', the only escape is [INTERRUPT:Role].
+    // Lifecycle: queued → running → completed (success) | cancelled (interrupt
+    // / cancel_queued) | failed (delivery error). Rate-limit retry flips
+    // running → queued, preserving created_at order.
     sqlx::query(&format!(
         r#"
         CREATE TABLE IF NOT EXISTS {}.team_task_queue (
@@ -639,6 +660,17 @@ pub async fn create_schema(pool: &PgPool, schema: &str) -> Result<()> {
     .execute(pool)
     .await?;
 
+    // Status rename: pre-state-machine refactor, terminal success was
+    // 'delivered' (overloaded with "dispatched"). Now 'running' covers the
+    // dispatched-and-in-flight phase, and 'completed' is the terminal success
+    // state. This idempotently migrates existing rows.
+    sqlx::query(&format!(
+        "UPDATE {}.team_task_queue SET status = 'completed' WHERE status = 'delivered'",
+        schema
+    ))
+    .execute(pool)
+    .await?;
+
     // Drain hot path: oldest queued row per team+role, partial index keeps it tight.
     sqlx::query(&format!(
         "CREATE INDEX IF NOT EXISTS idx_team_task_queue_drain \
@@ -676,6 +708,39 @@ pub async fn create_schema(pool: &PgPool, schema: &str) -> Result<()> {
         "CREATE INDEX IF NOT EXISTS idx_team_task_queue_clear_history \
          ON {}.team_task_queue (target_session_id, delivered_at DESC) \
          WHERE task_type = 'clear'",
+        schema
+    ))
+    .execute(pool)
+    .await?;
+
+    // Team-level rate-limit pause. One row per team while the CLI is in
+    // `rejected` (or `allowed_warning`) state; the row is deleted (or status
+    // flipped to `allowed`) when the limit window resets. drain_team_queue
+    // skips work whenever a row exists with status='rejected' AND
+    // resets_at > NOW().
+    sqlx::query(&format!(
+        r#"
+        CREATE TABLE IF NOT EXISTS {}.team_rate_limits (
+            team_id     TEXT PRIMARY KEY,
+            status      TEXT NOT NULL,
+            resets_at   TIMESTAMPTZ,
+            limit_type  TEXT NOT NULL DEFAULT '',
+            utilization DOUBLE PRECISION,
+            raw_json    TEXT NOT NULL DEFAULT '',
+            updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            notice_post_id TEXT
+        )
+        "#,
+        schema
+    ))
+    .execute(pool)
+    .await?;
+
+    // Cheap scan to find pauses whose window has expired.
+    sqlx::query(&format!(
+        "CREATE INDEX IF NOT EXISTS idx_team_rate_limits_resets_at \
+         ON {}.team_rate_limits (resets_at) \
+         WHERE status = 'rejected'",
         schema
     ))
     .execute(pool)
@@ -1653,7 +1718,7 @@ impl Database {
             "SELECT task_id FROM {}.team_task_queue \
              WHERE team_id = $1 AND target_role = $2 AND task_type = 'spawn' \
                AND md5(message) = md5($3) \
-               AND status IN ('queued', 'delivered') \
+               AND status IN ('queued', 'running', 'completed') \
                AND created_at > NOW() - make_interval(secs => $4) \
              ORDER BY task_id DESC LIMIT 1",
             SCHEMA
@@ -1705,7 +1770,7 @@ impl Database {
         // gate, so two ResponseCompletes back-to-back can't ping-pong /clear.
         let last: Option<(Option<chrono::DateTime<chrono::Utc>>,)> = sqlx::query_as(&format!(
             "SELECT MAX(delivered_at) FROM {}.team_task_queue \
-             WHERE target_session_id = $1 AND task_type = 'clear' AND status = 'delivered'",
+             WHERE target_session_id = $1 AND task_type = 'clear' AND status = 'completed'",
             SCHEMA
         ))
         .bind(target_session_id)
@@ -1789,16 +1854,24 @@ impl Database {
         Ok(rows.into_iter().map(|(t,)| t).collect())
     }
 
-    /// Mark a queued task as delivered. Caller has already pushed the message
-    /// into the target's container via `containers.send`.
-    pub async fn mark_task_delivered(
+    /// Mark a synchronous task (spawn / clear) as terminally completed.
+    /// Caller has already pushed the side effect (started a member, cleared
+    /// a context). These task types have no asynchronous in-flight phase:
+    /// the side effect *is* the work, so they go queued → completed
+    /// directly without visiting 'running'.
+    ///
+    /// Note: `delivered_at` here is the column name (when the work was
+    /// dispatched), not the status value — the column predates the rename
+    /// and is reused as a "dispatched at" timestamp for both running and
+    /// completed rows.
+    pub async fn mark_task_completed(
         &self,
         task_id: i64,
         target_session_id: &str,
     ) -> Result<()> {
         sqlx::query(&format!(
             "UPDATE {}.team_task_queue \
-             SET status = 'delivered', delivered_at = NOW(), target_session_id = $2 \
+             SET status = 'completed', delivered_at = NOW(), target_session_id = $2 \
              WHERE task_id = $1",
             SCHEMA
         ))
@@ -1807,6 +1880,235 @@ impl Database {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    /// Mark a message-type task as in-flight on `target_session_id`. The
+    /// previous design jumped straight to 'delivered' here; that conflated
+    /// "dispatched" with "presumed completed" and left no way to distinguish
+    /// a turn that's still running from one that finished. The new state
+    /// machine is queued → running → completed, with running → queued
+    /// available for retry on rate-limit pause.
+    pub async fn mark_task_running(
+        &self,
+        task_id: i64,
+        target_session_id: &str,
+    ) -> Result<()> {
+        sqlx::query(&format!(
+            "UPDATE {}.team_task_queue \
+             SET status = 'running', delivered_at = NOW(), target_session_id = $2 \
+             WHERE task_id = $1",
+            SCHEMA
+        ))
+        .bind(task_id)
+        .bind(target_session_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Flip the running message-task on `target_session_id` to terminal
+    /// 'completed'. Called from the `ResponseComplete` handler — that's the
+    /// canonical "the turn this task started actually finished" signal.
+    /// Idempotent: a second call is a no-op because the WHERE clause only
+    /// matches `status='running'`. Returns the task_id we transitioned, if
+    /// any (useful for logs / metrics).
+    pub async fn mark_message_task_completed_for_session(
+        &self,
+        target_session_id: &str,
+    ) -> Result<Option<i64>> {
+        let row: Option<(i64,)> = sqlx::query_as(&format!(
+            "UPDATE {}.team_task_queue \
+             SET status = 'completed' \
+             WHERE target_session_id = $1 \
+               AND status = 'running' \
+               AND task_type = 'message' \
+             RETURNING task_id",
+            SCHEMA
+        ))
+        .bind(target_session_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|(t,)| t))
+    }
+
+    /// Flip the running message-task on `target_session_id` to terminal
+    /// 'cancelled'. Called from the interrupt path so an aborted turn
+    /// doesn't get racy-promoted to 'completed' if a `ResponseComplete`
+    /// happens to fire after the cancel signal. Idempotent.
+    pub async fn mark_running_message_task_cancelled_for_session(
+        &self,
+        target_session_id: &str,
+        reason: &str,
+    ) -> Result<Option<i64>> {
+        let row: Option<(i64,)> = sqlx::query_as(&format!(
+            "UPDATE {}.team_task_queue \
+             SET status = 'cancelled', \
+                 cancelled_at = NOW(), \
+                 failure_reason = $2 \
+             WHERE target_session_id = $1 \
+               AND status = 'running' \
+               AND task_type = 'message' \
+             RETURNING task_id",
+            SCHEMA
+        ))
+        .bind(target_session_id)
+        .bind(reason)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|(t,)| t))
+    }
+
+    /// Push the running message-task on `target_session_id` back to 'queued'
+    /// so it gets redelivered on the next drain pass. Preserves `created_at`
+    /// (and therefore queue ordering relative to other tasks). Used by the
+    /// rate-limit pause path: a turn that errored because the API window
+    /// closed needs to be retried, but keeping it ahead of (or behind) other
+    /// queued tasks should follow the original arrival order.
+    ///
+    /// `deliver_after` lets the caller hold redelivery until the rate-limit
+    /// window actually reopens — drain ignores rows whose `deliver_after`
+    /// is in the future.
+    pub async fn requeue_running_message_task_for_session(
+        &self,
+        target_session_id: &str,
+        deliver_after: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Option<i64>> {
+        let row: Option<(i64,)> = sqlx::query_as(&format!(
+            "UPDATE {}.team_task_queue \
+             SET status = 'queued', \
+                 delivered_at = NULL, \
+                 target_session_id = NULL, \
+                 deliver_after = $2 \
+             WHERE target_session_id = $1 \
+               AND status = 'running' \
+               AND task_type = 'message' \
+             RETURNING task_id",
+            SCHEMA
+        ))
+        .bind(target_session_id)
+        .bind(deliver_after)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|(t,)| t))
+    }
+
+    // ---- team_rate_limits --------------------------------------------------
+
+    /// Upsert the team's rate-limit state. Pass `resets_at_unix=0` if the SDK
+    /// didn't include a reset timestamp. `notice_post_id` is preserved across
+    /// updates (we keep editing the same Mattermost card).
+    pub async fn upsert_team_rate_limit(
+        &self,
+        team_id: &str,
+        status: &str,
+        resets_at_unix: i64,
+        limit_type: &str,
+        utilization: Option<f64>,
+        raw_json: &str,
+    ) -> Result<()> {
+        let resets_at = if resets_at_unix > 0 {
+            chrono::DateTime::<chrono::Utc>::from_timestamp(resets_at_unix, 0)
+        } else {
+            None
+        };
+        sqlx::query(&format!(
+            "INSERT INTO {}.team_rate_limits \
+                 (team_id, status, resets_at, limit_type, utilization, raw_json, updated_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, NOW()) \
+             ON CONFLICT (team_id) DO UPDATE SET \
+                 status = EXCLUDED.status, \
+                 resets_at = EXCLUDED.resets_at, \
+                 limit_type = EXCLUDED.limit_type, \
+                 utilization = EXCLUDED.utilization, \
+                 raw_json = EXCLUDED.raw_json, \
+                 updated_at = NOW()",
+            SCHEMA
+        ))
+        .bind(team_id)
+        .bind(status)
+        .bind(resets_at)
+        .bind(limit_type)
+        .bind(utilization)
+        .bind(raw_json)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Persist (or clear) the Mattermost post id for the team's rate-limit
+    /// notice card so subsequent transitions update the same post.
+    pub async fn set_team_rate_limit_post_id(
+        &self,
+        team_id: &str,
+        post_id: Option<&str>,
+    ) -> Result<()> {
+        sqlx::query(&format!(
+            "UPDATE {}.team_rate_limits SET notice_post_id = $2 WHERE team_id = $1",
+            SCHEMA
+        ))
+        .bind(team_id)
+        .bind(post_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn get_team_rate_limit(&self, team_id: &str) -> Result<Option<TeamRateLimit>> {
+        let row = sqlx::query_as::<_, TeamRateLimit>(&format!(
+            "SELECT team_id, status, resets_at, limit_type, utilization, raw_json, \
+                    updated_at, notice_post_id \
+             FROM {}.team_rate_limits WHERE team_id = $1",
+            SCHEMA
+        ))
+        .bind(team_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
+    /// True if this team is currently rate-limit-rejected and the reset window
+    /// has not yet elapsed. Drain orchestration uses this to skip delivery.
+    pub async fn is_team_rate_limited(&self, team_id: &str) -> Result<bool> {
+        let row: Option<(bool,)> = sqlx::query_as(&format!(
+            "SELECT TRUE FROM {}.team_rate_limits \
+             WHERE team_id = $1 AND status = 'rejected' \
+               AND (resets_at IS NULL OR resets_at > NOW()) \
+             LIMIT 1",
+            SCHEMA
+        ))
+        .bind(team_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.is_some())
+    }
+
+    /// Team_ids whose `rejected` window has passed; the scheduled-drain
+    /// ticker walks these to flip them back to `allowed` and trigger a drain.
+    pub async fn teams_with_expired_rate_limits(&self) -> Result<Vec<String>> {
+        let rows: Vec<(String,)> = sqlx::query_as(&format!(
+            "SELECT team_id FROM {}.team_rate_limits \
+             WHERE status = 'rejected' AND resets_at IS NOT NULL AND resets_at <= NOW()",
+            SCHEMA
+        ))
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(|(t,)| t).collect())
+    }
+
+    /// Mark a previously-rejected team back to `allowed`. Returns the post id
+    /// of the existing notice (if any) so the caller can edit it in place.
+    pub async fn clear_team_rate_limit(&self, team_id: &str) -> Result<Option<String>> {
+        let row: Option<(Option<String>,)> = sqlx::query_as(&format!(
+            "UPDATE {}.team_rate_limits \
+             SET status = 'allowed', resets_at = NULL, updated_at = NOW() \
+             WHERE team_id = $1 \
+             RETURNING notice_post_id",
+            SCHEMA
+        ))
+        .bind(team_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.and_then(|(p,)| p))
     }
 
     /// Mark a queued task as failed (e.g. delivery_unreachable). Used by drain

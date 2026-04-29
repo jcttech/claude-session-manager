@@ -33,98 +33,13 @@ const APP_VERSION: &str = env!("APP_VERSION");
 
 /// Cached regex for network request detection (compiled once on first use)
 static NETWORK_REQUEST_RE: OnceLock<Regex> = OnceLock::new();
-/// Team marker regexes (compiled once on first use)
-static TEAM_SPAWN_RE: OnceLock<Regex> = OnceLock::new();
-static TEAM_MSG_RE: OnceLock<Regex> = OnceLock::new();
-static TEAM_BROADCAST_RE: OnceLock<Regex> = OnceLock::new();
-static TEAM_MSG_END_RE: OnceLock<Regex> = OnceLock::new();
-static TEAM_STATUS_RE: OnceLock<Regex> = OnceLock::new();
-static PR_READY_RE: OnceLock<Regex> = OnceLock::new();
-static PR_REVIEWED_RE: OnceLock<Regex> = OnceLock::new();
-static TEAM_INTERRUPT_RE: OnceLock<Regex> = OnceLock::new();
-static TEAM_CLEAR_RE: OnceLock<Regex> = OnceLock::new();
-static TEAM_CANCEL_QUEUED_RE: OnceLock<Regex> = OnceLock::new();
-/// Detects `gh pr merge` success output for the system-fallback breakpoint
-/// detector (Part D2). Matches both `gh`'s `Merged pull request #N` and the
-/// inline GitHub UI line some CI surfaces emit. Anywhere in the line, not
-/// anchored — `gh` may indent its success message under other output.
-static PR_MERGED_RE: OnceLock<Regex> = OnceLock::new();
+// Every team control signal — including the post-merge self-clear breakpoint
+// — now arrives as a CliCommand event. No regex matchers on the LLM's text
+// stream remain.
 
 fn network_request_regex() -> &'static Regex {
     NETWORK_REQUEST_RE.get_or_init(|| {
         Regex::new(r"\[NETWORK_REQUEST:\s*([^\]]+)\]").expect("Invalid regex pattern")
-    })
-}
-
-fn team_spawn_regex() -> &'static Regex {
-    // Anchored to start-of-line: markers must be the first thing on the line
-    // (with optional leading whitespace). Mid-line markers are ignored so they
-    // don't swallow surrounding text or enter accumulation mode unexpectedly.
-    TEAM_SPAWN_RE.get_or_init(|| {
-        Regex::new(r"^\s*\[SPAWN:([^\]]+?)(?:\s+--worktree)?\]\s*(.*)").expect("Invalid regex")
-    })
-}
-
-fn team_msg_regex() -> &'static Regex {
-    TEAM_MSG_RE.get_or_init(|| Regex::new(r"^\s*\[TO:([^\]]+)\]\s*(.*)").expect("Invalid regex"))
-}
-
-fn team_broadcast_regex() -> &'static Regex {
-    TEAM_BROADCAST_RE
-        .get_or_init(|| Regex::new(r"^\s*\[BROADCAST\]\s*(.*)").expect("Invalid regex"))
-}
-
-fn team_msg_end_regex() -> &'static Regex {
-    // [/MSG] is also anchored — must be on its own line (with optional whitespace).
-    // This prevents false matches when [/MSG] appears inside quoted text or code blocks.
-    TEAM_MSG_END_RE.get_or_init(|| Regex::new(r"^\s*\[/MSG\]\s*$").expect("Invalid regex"))
-}
-
-fn team_status_regex() -> &'static Regex {
-    TEAM_STATUS_RE.get_or_init(|| Regex::new(r"\[TEAM_STATUS\]").expect("Invalid regex"))
-}
-
-fn pr_ready_regex() -> &'static Regex {
-    PR_READY_RE.get_or_init(|| Regex::new(r"^\s*\[PR_READY:(\d+)\]").expect("Invalid regex"))
-}
-
-fn pr_reviewed_regex() -> &'static Regex {
-    PR_REVIEWED_RE.get_or_init(|| Regex::new(r"^\s*\[PR_REVIEWED:(\d+)\]").expect("Invalid regex"))
-}
-
-fn team_interrupt_regex() -> &'static Regex {
-    // [INTERRUPT:Role] aborts the in-flight turn on a matching member's
-    // session. Prefix match (e.g. [INTERRUPT:Developer]) interrupts every
-    // matching session; use the exact role (e.g. [INTERRUPT:Developer 2])
-    // for a single target.
-    TEAM_INTERRUPT_RE
-        .get_or_init(|| Regex::new(r"^\s*\[INTERRUPT:([^\]]+)\]\s*$").expect("Invalid regex"))
-}
-
-fn team_clear_regex() -> &'static Regex {
-    // [CLEAR:Role] sends `/clear` to a matching member, then re-injects
-    // `[TEAM_STATUS]` so they retain roster context. Same prefix-match rules
-    // as [INTERRUPT:Role]; gated by the same cooldown as auto-clear.
-    TEAM_CLEAR_RE
-        .get_or_init(|| Regex::new(r"^\s*\[CLEAR:([^\]]+)\]\s*$").expect("Invalid regex"))
-}
-
-fn team_cancel_queued_regex() -> &'static Regex {
-    // Two forms:
-    //   [CANCEL_QUEUED:Role]      — cancel all queued from sender→role
-    //   [CANCEL_QUEUED:Role:N]    — cancel just task_id N (sender-owned)
-    // The role capture stops at `]` or `:` so the optional task_id parses.
-    TEAM_CANCEL_QUEUED_RE.get_or_init(|| {
-        Regex::new(r"^\s*\[CANCEL_QUEUED:([^\]:]+)(?::(\d+))?\]\s*$").expect("Invalid regex")
-    })
-}
-
-fn pr_merged_regex() -> &'static Regex {
-    // Matches the success line `gh pr merge` prints, e.g.:
-    //   Merged pull request #47 (Story G title)
-    // Captures the PR number for the breakpoint reason field.
-    PR_MERGED_RE.get_or_init(|| {
-        Regex::new(r"Merged pull request #(\d+)").expect("Invalid regex")
     })
 }
 
@@ -140,16 +55,6 @@ struct AppState {
     /// PRs that have passed the [PR_REVIEWED] gate, keyed by "team_id:pr_number".
     /// Only PRs in this set should be merged by the Team Lead.
     reviewed_prs: DashMap<String, ()>,
-    /// Short-window dedupe of identical intent markers (`[SPAWN:Role]` /
-    /// `[TO:Role]`). LLMs occasionally emit the same marker twice; this
-    /// suppresses the duplicate so it doesn't fan out to two members.
-    /// Key → first-seen instant; entries past INTENT_DEDUPE_TTL are GC'd.
-    intent_dedupe: DashMap<String, std::time::Instant>,
-    /// Per-(sender, target_role) burst throttle. Catches the case where the
-    /// LLM rephrases the *same intent* in rapid succession — message-hash
-    /// dedupe (`intent_dedupe`) misses, but the burst is still spurious.
-    /// Window is much shorter than INTENT_DEDUPE_TTL.
-    to_throttle: DashMap<String, std::time::Instant>,
     /// Per-team mutex to serialize `team_task_queue` drain passes. Without
     /// this, two concurrent ResponseComplete events on members of the same
     /// team could both walk the queue and double-deliver the same task_id
@@ -159,72 +64,17 @@ struct AppState {
 
 // `spawn_locks` was removed in v2.5.4 — its serialization role is subsumed by
 // `drain_locks` since SPAWN now flows through `team_task_queue` like TO/CLEAR.
-
-/// How long an identical intent marker is suppressed after first being seen.
-const INTENT_DEDUPE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
-
-/// How long a (sender, target_role) pair is throttled after a [TO:] / broadcast
-/// fires. Short enough not to block legitimate follow-ups, long enough to
-/// collapse LLM-stutter bursts that reword the same intent.
-const BURST_THROTTLE_TTL: std::time::Duration = std::time::Duration::from_secs(10);
+//
+// `intent_dedupe` / `to_throttle` and their constants were removed in the
+// CLI-grammar cutover: each `team` CLI invocation is an explicit Bash call,
+// not text the LLM might re-emit, so marker-stutter dedupe is no longer
+// needed. Duplicate `team to` calls just create two queue rows; the lead
+// can `team cancel` if needed.
 
 /// Cooldown between any two `/clear` operations on the same session — auto or
 /// manual. Prevents the runaway loop seen previously with `/compact`, and
 /// prevents Lead-driven `[CLEAR:Role]` from being spammed inside one window.
 const AUTO_CLEAR_COOLDOWN_SECS: u64 = 180;
-
-/// Returns true if `key` was seen in `map` within `ttl` (caller should drop).
-/// Otherwise records the current time and returns false.
-fn seen_within(
-    map: &DashMap<String, std::time::Instant>,
-    key: String,
-    ttl: std::time::Duration,
-) -> bool {
-    let now = std::time::Instant::now();
-    match map.entry(key) {
-        dashmap::mapref::entry::Entry::Occupied(mut e) => {
-            if now.duration_since(*e.get()) < ttl {
-                true
-            } else {
-                e.insert(now);
-                false
-            }
-        }
-        dashmap::mapref::entry::Entry::Vacant(e) => {
-            e.insert(now);
-            false
-        }
-    }
-}
-
-/// Returns true if this intent was seen within INTENT_DEDUPE_TTL (caller
-/// should drop it). Otherwise records the current time and returns false.
-fn intent_seen_recently(map: &DashMap<String, std::time::Instant>, key: String) -> bool {
-    seen_within(map, key, INTENT_DEDUPE_TTL)
-}
-
-/// Build a stable dedupe key for an intent. `kind` distinguishes spawn vs
-/// route; the message hash keeps the key bounded regardless of task length.
-fn intent_key(
-    team_id: &str,
-    sender_session_id: &str,
-    kind: &str,
-    target: &str,
-    message: &str,
-) -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut h = DefaultHasher::new();
-    message.trim().hash(&mut h);
-    format!(
-        "{}|{}|{}|{}|{:x}",
-        team_id,
-        sender_session_id,
-        kind,
-        target,
-        h.finish()
-    )
-}
 
 #[derive(Deserialize)]
 struct CallbackPayload {
@@ -292,8 +142,6 @@ async fn main() -> Result<()> {
         liveness,
         coordination_channel_id: tokio::sync::RwLock::new(coordination_channel_id),
         reviewed_prs: DashMap::new(),
-        intent_dedupe: DashMap::new(),
-        to_throttle: DashMap::new(),
         drain_locks: DashMap::new(),
     });
 
@@ -564,29 +412,32 @@ async fn main() -> Result<()> {
         session_watchdog(watchdog_state).await;
     });
 
-    // GC stale intent-dedupe entries every 2x TTL so the map stays bounded.
-    let dedupe_state = state.clone();
-    let _dedupe_gc_handle = tokio::spawn(async move {
-        let mut tick = tokio::time::interval(INTENT_DEDUPE_TTL * 2);
-        loop {
-            tick.tick().await;
-            let now = std::time::Instant::now();
-            dedupe_state
-                .intent_dedupe
-                .retain(|_, ts| now.duration_since(*ts) < INTENT_DEDUPE_TTL);
-        }
-    });
-
-    // Scheduled-drain ticker: every 30s, find teams with at least one queued
-    // task whose deliver_after has passed and trigger drain_team_queue. Cheap
-    // (one indexed scan over team_task_queue) and 30s latency is fine for the
-    // "deliver in N hours" use case.
+    // Scheduled-drain ticker: every 30s, (a) flip any rate-limit rows whose
+    // window has expired back to `allowed` and post the resume notice, then
+    // (b) drain teams with at least one queued task whose deliver_after has
+    // passed. Cheap (two indexed scans) and 30s latency is fine for both the
+    // "deliver in N hours" path and the rate-limit resume path.
     let scheduled_state = state.clone();
     let _scheduled_drain_handle = tokio::spawn(async move {
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tick.tick().await;
+
+            // 1. Resume any teams whose rate-limit window has expired. This
+            //    runs before the drain pass so newly-resumed teams get a
+            //    chance to flush their backlog in the same tick.
+            match scheduled_state.db.teams_with_expired_rate_limits().await {
+                Ok(team_ids) => {
+                    for team_id in team_ids {
+                        clear_rate_limit_notice_and_drain(&scheduled_state, &team_id).await;
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "Rate-limit resume query failed");
+                }
+            }
+
             match scheduled_state.db.teams_with_ready_scheduled_tasks().await {
                 Ok(team_ids) => {
                     for team_id in team_ids {
@@ -2830,101 +2681,6 @@ fn format_ctx_suffix(input_tokens: u64) -> String {
 /// the 60s in-memory dedupe.
 const SPAWN_DEDUPE_WINDOW_SECS: i64 = 300;
 
-/// Enqueue a [SPAWN:Role] task and fire a drain pass. Replaces the previous
-/// fire-and-forget tokio::spawn path. The SQL-level dedupe inside
-/// `enqueue_team_spawn` catches LLM re-emissions that slipped past the
-/// in-memory `intent_dedupe` (ticket: re-emitted spawn marker fired late
-/// after first one already succeeded; spawned Developer 2 by accident).
-#[allow(clippy::too_many_arguments)]
-fn fire_team_spawn(
-    state: &Arc<AppState>,
-    team_id: &str,
-    channel_id: &str,
-    session_id: &str,
-    sender_role: &str,
-    role_name: &str,
-    initial_task: &str,
-    project: &str,
-) {
-    let spawn_state = state.clone();
-    let spawn_tid = team_id.to_string();
-    let spawn_cid = channel_id.to_string();
-    let spawn_sid = session_id.to_string();
-    let spawn_role = sender_role.to_string();
-    let role_name = role_name.to_string();
-    let initial_task = initial_task.to_string();
-    let spawn_project = project.to_string();
-    tokio::spawn(async move {
-        let payload = serde_json::json!({
-            "channel_id": spawn_cid,
-            "project": spawn_project,
-        });
-        let result = spawn_state
-            .db
-            .enqueue_team_spawn(
-                &spawn_tid,
-                &role_name,
-                &spawn_sid,
-                &spawn_role,
-                &initial_task,
-                &payload,
-                SPAWN_DEDUPE_WINDOW_SECS,
-            )
-            .await;
-        match result {
-            Ok(Ok(task_id)) => {
-                // Send LLM-side queued ACK so the Lead correlates the queue_id.
-                if let Ok(Some(lead)) = spawn_state
-                    .db
-                    .get_session_by_id_prefix(&spawn_sid[..8.min(spawn_sid.len())])
-                    .await
-                {
-                    let ack = format!(
-                        "[ACK:SPAWN role=\"{}\" status=queued queue_id={}]",
-                        role_name, task_id,
-                    );
-                    let _ = spawn_state
-                        .containers
-                        .send(
-                            &lead.session_id,
-                            &format!(
-                                "{}\nSpawn enqueued. The drain will deliver an [ACK:SPAWN ... status=ok queue_id={}] once the new member is live; until then you may [CANCEL_QUEUED:{}:{}] to abort.",
-                                ack, task_id, role_name, task_id,
-                            ),
-                        )
-                        .await;
-                }
-                drain_team_queue(&spawn_state, &spawn_tid).await;
-            }
-            Ok(Err(existing_id)) => {
-                tracing::info!(
-                    team_id = %spawn_tid, role = %role_name, existing_id,
-                    "Suppressed duplicate [SPAWN:{}] within {}s SQL window",
-                    role_name, SPAWN_DEDUPE_WINDOW_SECS
-                );
-                if let Ok(Some(lead)) = spawn_state
-                    .db
-                    .get_session_by_id_prefix(&spawn_sid[..8.min(spawn_sid.len())])
-                    .await
-                {
-                    let ack = format!(
-                        "[ACK:SPAWN role=\"{}\" status=rejected reason=duplicate_intent existing_queue_id={}]",
-                        role_name, existing_id,
-                    );
-                    let _ = spawn_state.containers.send(&lead.session_id, &format!(
-                        "{}\nA prior [SPAWN:{}] with the same task content is already in flight (queue_id={}). Wait for its ACK rather than re-emitting.",
-                        ack, role_name, existing_id,
-                    )).await;
-                }
-            }
-            Err(e) => {
-                tracing::error!(error = %e, team_id = %spawn_tid, role = %role_name,
-                    "Failed to enqueue spawn task");
-            }
-        }
-    });
-}
-
 #[allow(clippy::too_many_arguments)]
 async fn stream_output(
     state: Arc<AppState>,
@@ -2936,17 +2692,9 @@ async fn stream_output(
     mut rx: mpsc::Receiver<OutputEvent>,
 ) {
     let network_re = network_request_regex();
-    let spawn_re = team_spawn_regex();
-    let msg_re = team_msg_regex();
-    let broadcast_re = team_broadcast_regex();
-    let msg_end_re = team_msg_end_regex();
-    let status_re = team_status_regex();
-    let pr_ready_re = pr_ready_regex();
-    let pr_reviewed_re = pr_reviewed_regex();
-    let interrupt_re = team_interrupt_regex();
-    let clear_re = team_clear_regex();
-    let cancel_queued_re = team_cancel_queued_regex();
-    let pr_merged_re = pr_merged_regex();
+    // All team control commands (spawn / to / interrupt / cancel / clear /
+    // status / broadcast / pr-ready / pr-reviewed / pr-merged) flow through
+    // the `team` CLI as CliCommand events — no in-stream marker parsing.
 
     // Look up team context for this session (cached once)
     let team_info: Option<(String, String)> = {
@@ -2974,12 +2722,15 @@ async fn stream_output(
 
     let mut card = LiveCard::new();
 
-    // Team messaging state machine
-    let mut team_msg_target: Option<String> = None; // "Role Name" or "__broadcast__"
-    let mut team_msg_buffer: Vec<String> = Vec::new();
-    // Pending spawn: accumulates multi-line task until [/MSG] or next marker, then fires spawn.
-    // (role_name, use_worktree)
-    let mut pending_spawn: Option<String> = None;
+    // Per-session error dedupe — once the worker is stuck (rate limit or any
+    // other repeating error) we keep editing the same Mattermost card instead
+    // of stamping a new "Process died" post for every retry.
+    let mut last_error_post_id: Option<String> = None;
+    let mut last_error_signature: Option<String> = None;
+    let mut last_error_at: Option<tokio::time::Instant> = None;
+    // While the team is in a known rate-limit-rejected window, swallow
+    // ProcessDied entirely (the rate-limit notice card is the source of truth).
+    let mut rate_limited_until: Option<tokio::time::Instant> = None;
 
     tracing::info!(session_id = %session_id, "stream_output: started");
 
@@ -3005,288 +2756,6 @@ async fn stream_output(
                     OutputEvent::TextLine(line) => {
                         state.liveness.update_activity(&session_id, "TextLine");
                         tracing::debug!(session_id = %session_id, line_len = line.len(), "stream_output: TextLine received");
-
-                        // --- Team marker interception (only for team sessions) ---
-                        if let Some((tid, sender_role)) = &team_info {
-
-                            // Multi-line SPAWN accumulation mode
-                            if let Some(ref spawn_role) = pending_spawn {
-                                let has_end_marker = msg_end_re.is_match(&line);
-                                let end_in_line = !has_end_marker && line.contains("[/MSG]");
-
-                                if has_end_marker || end_in_line {
-                                    if end_in_line
-                                        && let Some(pos) = line.find("[/MSG]")
-                                    {
-                                        let before = line[..pos].trim();
-                                        if !before.is_empty() {
-                                            team_msg_buffer.push(before.to_string());
-                                        }
-                                    }
-                                    let task = team_msg_buffer.join("\n");
-                                    team_msg_buffer.clear();
-                                    let spawn_role = spawn_role.clone();
-                                    pending_spawn = None;
-                                    fire_team_spawn(
-                                        &state, tid, &channel_id, &session_id, sender_role,
-                                        &spawn_role, &task, &project,
-                                    );
-                                } else {
-                                    team_msg_buffer.push(line);
-                                }
-                                continue;
-                            }
-
-                            // Multi-line message accumulation mode
-                            if team_msg_target.is_some() {
-                                // Check for [/MSG] — either standalone or at end of line
-                                let has_end_marker = msg_end_re.is_match(&line);
-                                let end_in_line = !has_end_marker && line.contains("[/MSG]");
-
-                                if has_end_marker || end_in_line {
-                                    // If [/MSG] is embedded in the line, capture text before it
-                                    if end_in_line
-                                        && let Some(pos) = line.find("[/MSG]")
-                                    {
-                                        let before = line[..pos].trim();
-                                        if !before.is_empty() {
-                                            team_msg_buffer.push(before.to_string());
-                                        }
-                                    }
-                                    // Flush accumulated message
-                                    let message = team_msg_buffer.join("\n");
-                                    team_msg_buffer.clear();
-                                    let target = team_msg_target.take().unwrap();
-                                    // Clear pending task — member is responding
-                                    let _ = state.db.clear_pending_task(&session_id).await;
-                                    if target == "__broadcast__" {
-                                        let preview = truncate_preview(&message, 80);
-                                        card.append_text(&format!("> :loudspeaker: **Broadcast**: {}", preview));
-                                        card.dirty = true;
-                                        broadcast_team_message(&state, &session_id, sender_role, &message, tid, &channel_id).await;
-                                    } else {
-                                        let preview = truncate_preview(&message, 80);
-                                        card.append_text(&format!("> :speech_balloon: **To {}**: {}", target, preview));
-                                        card.dirty = true;
-                                        route_team_message(&state, &session_id, sender_role, &target, &message, tid, &channel_id).await;
-                                    }
-                                } else {
-                                    team_msg_buffer.push(line);
-                                }
-                                continue;
-                            }
-
-                            // Check for [SPAWN:Role] marker
-                            if let Some(caps) = spawn_re.captures(&line) {
-                                let role_name = caps[1].trim().to_string();
-                                let inline_task = caps[2].trim().to_string();
-                                drain_batch_to_card(&mut card, &state, &channel_id, &thread_id, &mut batch, &mut batch_bytes).await;
-                                card.append_text(&format!("> :rocket: **Spawning {}**...", role_name));
-                                card.dirty = true;
-
-                                // Check for single-line spawn: [SPAWN:Role] task [/MSG]
-                                if let Some(end_pos) = inline_task.find("[/MSG]") {
-                                    let task = inline_task[..end_pos].trim().to_string();
-                                    fire_team_spawn(
-                                        &state, tid, &channel_id, &session_id, sender_role,
-                                        &role_name, &task, &project,
-                                    );
-                                } else if inline_task.is_empty() {
-                                    // No inline text and no [/MSG] — enter multi-line mode
-                                    // to accumulate the task description
-                                    pending_spawn = Some(role_name);
-                                    team_msg_buffer.clear();
-                                } else {
-                                    // Has inline text but no [/MSG] — enter multi-line mode
-                                    // to accumulate continuation lines
-                                    pending_spawn = Some(role_name);
-                                    team_msg_buffer.clear();
-                                    team_msg_buffer.push(inline_task);
-                                }
-                                continue;
-                            }
-
-                            // Check for [TO:Role] marker
-                            if let Some(caps) = msg_re.captures(&line) {
-                                let target_role = caps[1].trim().to_string();
-                                let inline_msg = caps[2].trim().to_string();
-                                // Clear pending task — member is responding
-                                let _ = state.db.clear_pending_task(&session_id).await;
-
-                                // Check if [/MSG] is already in the inline text (single-line message).
-                                // Without this, [TO:Role] message [/MSG] on one line would get stuck
-                                // because [/MSG] detection only runs on subsequent TextLines.
-                                if let Some(end_pos) = inline_msg.find("[/MSG]") {
-                                    let message = inline_msg[..end_pos].trim().to_string();
-                                    if !message.is_empty() {
-                                        let preview = truncate_preview(&message, 80);
-                                        card.append_text(&format!("> :speech_balloon: **To {}**: {}", target_role, preview));
-                                        card.dirty = true;
-                                        route_team_message(&state, &session_id, sender_role, &target_role, &message, tid, &channel_id).await;
-                                    }
-                                } else {
-                                    // Enter multi-line accumulation mode
-                                    team_msg_target = Some(target_role);
-                                    team_msg_buffer.clear();
-                                    if !inline_msg.is_empty() {
-                                        team_msg_buffer.push(inline_msg);
-                                    }
-                                }
-                                continue;
-                            }
-
-                            // Check for [BROADCAST] marker
-                            if let Some(caps) = broadcast_re.captures(&line) {
-                                let inline_msg = caps[1].trim().to_string();
-                                // Clear pending task — member is responding
-                                let _ = state.db.clear_pending_task(&session_id).await;
-
-                                // Check if [/MSG] is already in the inline text (single-line message)
-                                if let Some(end_pos) = inline_msg.find("[/MSG]") {
-                                    let message = inline_msg[..end_pos].trim().to_string();
-                                    if !message.is_empty() {
-                                        let preview = truncate_preview(&message, 80);
-                                        card.append_text(&format!("> :loudspeaker: **Broadcast**: {}", preview));
-                                        card.dirty = true;
-                                        broadcast_team_message(&state, &session_id, sender_role, &message, tid, &channel_id).await;
-                                    }
-                                } else {
-                                    // Enter multi-line accumulation mode
-                                    team_msg_target = Some("__broadcast__".to_string());
-                                    team_msg_buffer.clear();
-                                    if !inline_msg.is_empty() {
-                                        team_msg_buffer.push(inline_msg);
-                                    }
-                                }
-                                continue;
-                            }
-
-                            // Check for [TEAM_STATUS] marker
-                            if status_re.is_match(&line) {
-                                handle_team_status(&state, &session_id, tid).await;
-                                continue;
-                            }
-
-                            // Check for [INTERRUPT:Role] marker (Lead-only).
-                            // Aborts the matching member's in-flight turn via
-                            // the agent-worker Interrupt RPC. Natural
-                            // ResponseComplete after interrupt clears
-                            // pending_task_from on its own.
-                            if let Some(caps) = interrupt_re.captures(&line) {
-                                let target_role = caps[1].trim().to_string();
-                                drain_batch_to_card(&mut card, &state, &channel_id, &thread_id, &mut batch, &mut batch_bytes).await;
-                                card.append_text(&format!("> :octagonal_sign: **Interrupting {}**...", target_role));
-                                card.dirty = true;
-                                handle_team_interrupt(
-                                    &state, &session_id, sender_role, &target_role, tid,
-                                ).await;
-                                continue;
-                            }
-
-                            // Check for [CLEAR:Role] marker (Lead-only).
-                            // Sends `/clear` to the matching member then
-                            // re-injects [TEAM_STATUS] so they retain roster
-                            // context. Shares the auto-clear cooldown.
-                            if let Some(caps) = clear_re.captures(&line) {
-                                let target_role = caps[1].trim().to_string();
-                                drain_batch_to_card(&mut card, &state, &channel_id, &thread_id, &mut batch, &mut batch_bytes).await;
-                                card.append_text(&format!("> :broom: **Clearing context for {}**...", target_role));
-                                card.dirty = true;
-                                handle_team_clear(
-                                    &state, &session_id, sender_role, &target_role, tid,
-                                ).await;
-                                continue;
-                            }
-
-                            // Check for [CANCEL_QUEUED:Role(:N)?] marker (Lead-only).
-                            // Cancels still-queued tasks from this sender to
-                            // target_role; with :N targets a specific task_id.
-                            // Already-delivered tasks cannot be cancelled.
-                            if let Some(caps) = cancel_queued_re.captures(&line) {
-                                let target_role = caps[1].trim().to_string();
-                                let task_id_opt = caps
-                                    .get(2)
-                                    .and_then(|m| m.as_str().parse::<i64>().ok());
-                                drain_batch_to_card(&mut card, &state, &channel_id, &thread_id, &mut batch, &mut batch_bytes).await;
-                                let label = match task_id_opt {
-                                    Some(id) => format!("queue_id={} → {}", id, target_role),
-                                    None => format!("all queued → {}", target_role),
-                                };
-                                card.append_text(&format!("> :wastebasket: **Cancelling {}**...", label));
-                                card.dirty = true;
-                                handle_cancel_queued(
-                                    &state, &session_id, sender_role, &target_role,
-                                    task_id_opt, tid,
-                                ).await;
-                                continue;
-                            }
-
-                            // Check for [PR_READY:N] marker (team members signal PR is ready)
-                            if let Some(caps) = pr_ready_re.captures(&line) {
-                                let pr_num = caps[1].to_string();
-                                card.append_text(&format!("> :mag: **PR #{} review gate**...", pr_num));
-                                card.dirty = true;
-                                handle_pr_ready(&state, &session_id, tid, sender_role, &pr_num, &channel_id).await;
-                                continue;
-                            }
-
-                            // Check for [PR_REVIEWED:N] marker (team member confirms review comments addressed)
-                            if let Some(caps) = pr_reviewed_re.captures(&line) {
-                                let pr_num = caps[1].to_string();
-                                card.append_text(&format!("> :white_check_mark: **PR #{} review complete** — forwarding to Team Lead", pr_num));
-                                card.dirty = true;
-                                // Clear pending task — member is done with review gate
-                                let _ = state.db.clear_pending_task(&session_id).await;
-                                handle_pr_reviewed(&state, &session_id, tid, sender_role, &pr_num, &channel_id).await;
-                                continue;
-                            }
-
-                            // Part D2 system fallback: detect `gh pr merge` success
-                            // in the Lead's stream and enqueue [CLEAR:Self]. The SQL
-                            // cooldown collapses with any [CLEAR:Self] the Lead also
-                            // emits, so double-firing is harmless. Only fires for
-                            // the Lead — members don't merge PRs.
-                            if sender_role == "Team Lead"
-                                && let Some(caps) = pr_merged_re.captures(&line)
-                            {
-                                let pr_num = caps[1].to_string();
-                                let reason = format!("breakpoint:pr_{}_merged", pr_num);
-                                let role_label = sender_role.to_string();
-                                let session_for_clear = session_id.clone();
-                                let tid_for_clear = tid.clone();
-                                let state_for_clear = state.clone();
-                                tokio::spawn(async move {
-                                    match state_for_clear
-                                        .db
-                                        .enqueue_team_clear(
-                                            &tid_for_clear,
-                                            &role_label,
-                                            &session_for_clear,
-                                            &session_for_clear,
-                                            &role_label,
-                                            &reason,
-                                            AUTO_CLEAR_COOLDOWN_SECS as i64,
-                                        )
-                                        .await
-                                    {
-                                        Ok(EnqueueClearResult::Enqueued(task_id)) => {
-                                            tracing::info!(
-                                                session_id = %session_for_clear, pr_num, task_id,
-                                                "Breakpoint detector: enqueued [CLEAR:Self] after PR merge"
-                                            );
-                                            drain_team_queue(&state_for_clear, &tid_for_clear).await;
-                                        }
-                                        Ok(_) => { /* cooldown or already-queued: nothing to do */ }
-                                        Err(e) => {
-                                            tracing::warn!(error = %e, pr_num,
-                                                "Breakpoint detector: enqueue_team_clear failed");
-                                        }
-                                    }
-                                });
-                                // NOTE: don't `continue` — the line is still legitimate
-                                // tool output the user wants to see in the card.
-                            }
-                        }
 
                         // --- Existing marker checks ---
                         // Check for network request markers
@@ -3335,38 +2804,6 @@ async fn stream_output(
                     OutputEvent::ResponseComplete { input_tokens, output_tokens, context_tokens } => {
                         state.liveness.update_activity(&session_id, "ResponseComplete");
 
-                        // Flush any pending multi-line spawn (response ended without [/MSG])
-                        if let Some(spawn_role) = pending_spawn.take()
-                            && let Some((tid, sender_role)) = &team_info
-                        {
-                            let task = team_msg_buffer.join("\n");
-                            team_msg_buffer.clear();
-                            fire_team_spawn(
-                                &state, tid, &channel_id, &session_id, sender_role,
-                                &spawn_role, &task, &project,
-                            );
-                        }
-
-                        // Flush any pending multi-line team message (response ended without [/MSG])
-                        if let Some(target) = team_msg_target.take()
-                            && let Some((tid, sender_role)) = &team_info
-                        {
-                            let message = team_msg_buffer.join("\n");
-                            team_msg_buffer.clear();
-                            let _ = state.db.clear_pending_task(&session_id).await;
-                            if target == "__broadcast__" {
-                                let preview = truncate_preview(&message, 80);
-                                card.append_text(&format!("> :loudspeaker: **Broadcast**: {}", preview));
-                                card.dirty = true;
-                                broadcast_team_message(&state, &session_id, sender_role, &message, tid, &channel_id).await;
-                            } else {
-                                let preview = truncate_preview(&message, 80);
-                                card.append_text(&format!("> :speech_balloon: **To {}**: {}", target, preview));
-                                card.dirty = true;
-                                route_team_message(&state, &session_id, sender_role, &target, &message, tid, &channel_id).await;
-                            }
-                        }
-
                         // context_tokens = actual context window usage (last API call)
                         // input_tokens = cumulative across all API calls (for billing)
                         let ctx_display = context_tokens;
@@ -3393,8 +2830,35 @@ async fn stream_output(
                         // then drain the queue — this member's slot just freed, and
                         // there may be a queued task waiting for them (or for any
                         // idle member of their role).
+                        //
+                        // Also flip the message-type queue row that drove this
+                        // turn from 'running' → 'completed'. The transition is
+                        // idempotent (WHERE status='running'), so a duplicate
+                        // ResponseComplete for the same turn is a safe no-op.
                         if let Some((ref tid, _)) = team_info {
                             let _ = state.db.clear_pending_task(&session_id).await;
+                            match state
+                                .db
+                                .mark_message_task_completed_for_session(&session_id)
+                                .await
+                            {
+                                Ok(Some(task_id)) => {
+                                    tracing::debug!(
+                                        session_id = %session_id, task_id,
+                                        "queue: running → completed on ResponseComplete",
+                                    );
+                                }
+                                Ok(None) => {
+                                    // Either this turn wasn't queue-driven
+                                    // (user asked the lead something directly)
+                                    // or the row was already terminal. Either
+                                    // way, no action needed.
+                                }
+                                Err(e) => {
+                                    tracing::warn!(error = %e, session_id = %session_id,
+                                        "queue: failed to mark message task completed");
+                                }
+                            }
                             drain_team_queue(&state, tid).await;
                         }
 
@@ -3522,18 +2986,182 @@ async fn stream_output(
                             }
                         }
                     }
-                    OutputEvent::ProcessDied { exit_code, signal } => {
-                        tracing::warn!(session_id = %session_id, ?exit_code, ?signal, "stream_output: ProcessDied");
+                    OutputEvent::ProcessDied { exit_code, signal, raw_json } => {
+                        tracing::warn!(
+                            session_id = %session_id,
+                            ?exit_code, ?signal,
+                            raw_json_len = raw_json.as_deref().map(str::len).unwrap_or(0),
+                            "stream_output: ProcessDied",
+                        );
+
+                        // While we're in a known rate-limit-rejected window
+                        // every queued retry produces another error result —
+                        // the rate-limit notice card already explains it, so
+                        // skip stamping ProcessDied cards entirely.
+                        let suppress_for_rate_limit = rate_limited_until
+                            .map(|d| tokio::time::Instant::now() < d)
+                            .unwrap_or(false);
+                        if suppress_for_rate_limit {
+                            tracing::debug!(
+                                session_id = %session_id,
+                                "ProcessDied suppressed: team is rate-limited"
+                            );
+                            // The turn died — its work was never actually
+                            // applied. Re-enqueue the task so the queue
+                            // redelivers it once the window reopens, and
+                            // free the member's slot so it can pick up the
+                            // re-queued row (or be reassigned).
+                            if let Some((tid, _)) = team_info.as_ref() {
+                                requeue_in_flight_after_rate_limit(&state, tid, &session_id).await;
+                            }
+                            // Don't broadcast `disconnected` either — the
+                            // session is fine, the API window is closed.
+                            continue;
+                        }
+
                         drain_batch_to_card(&mut card, &state, &channel_id, &thread_id, &mut batch, &mut batch_bytes).await;
 
-                        card.finalize_error(exit_code, &signal);
-                        card.flush(&state, &channel_id, &thread_id).await;
-                        card.post_id = None;
+                        // Dedupe consecutive identical ProcessDied posts. If
+                        // the same signature lands within the dedupe window,
+                        // edit the existing post instead of creating a new one.
+                        let signature = format!(
+                            "{}|{}",
+                            exit_code.map(|c| c.to_string()).unwrap_or_else(|| "?".into()),
+                            signal.clone().unwrap_or_default(),
+                        );
+                        let now = tokio::time::Instant::now();
+                        let dedupe_window = std::time::Duration::from_secs(60);
+                        let should_dedupe = matches!(
+                            (&last_error_post_id, &last_error_signature, last_error_at),
+                            (Some(_), Some(prev), Some(t))
+                                if prev == &signature && now.duration_since(t) < dedupe_window
+                        );
+
+                        if should_dedupe {
+                            // Bump a counter on the existing post so the user
+                            // can see the retries are still happening.
+                            let post_id = last_error_post_id.clone().unwrap();
+                            let body = format!(
+                                ":warning: Process died (exit {}{}) — repeating; last seen {}",
+                                exit_code.map(|c| c.to_string()).unwrap_or_else(|| "?".into()),
+                                signal.as_deref().map(|s| format!(", {}", s)).unwrap_or_default(),
+                                chrono::Utc::now().format("%H:%M:%S UTC"),
+                            );
+                            let _ = state.mm.update_post(&post_id, &body).await;
+                            last_error_at = Some(now);
+                        } else {
+                            card.finalize_error(exit_code, &signal);
+                            card.flush(&state, &channel_id, &thread_id).await;
+                            last_error_post_id = card.post_id.clone();
+                            last_error_signature = Some(signature);
+                            last_error_at = Some(now);
+                            card.post_id = None;
+                        }
+
+                        // Forward raw_json (if any) so unmodeled SDK errors
+                        // surface in logs — we add typed handling later if a
+                        // pattern shows up.
+                        if let Some(rj) = raw_json.as_deref() {
+                            tracing::warn!(
+                                session_id = %session_id,
+                                raw = %rj,
+                                "ProcessDied raw payload",
+                            );
+                        }
 
                         // Notify team about the death
                         if let Some((ref tid, ref role)) = team_info {
                             let _ = state.db.update_session_status(&session_id, "disconnected").await;
                             notify_team_session_lost(&state, tid, &session_id, role, "process died").await;
+                        }
+                    }
+                    OutputEvent::CliCommand { cli_id, verb, args, flags } => {
+                        tracing::info!(
+                            session_id = %session_id, %cli_id, %verb,
+                            args_len = args.len(),
+                            "stream_output: CliCommand",
+                        );
+                        let team_id = team_info.as_ref().map(|(t, _)| t.clone());
+                        let role = team_info.as_ref().map(|(_, r)| r.clone());
+                        let outcome = handle_cli_command(
+                            &state, &session_id, team_id.as_deref(), role.as_deref(),
+                            &verb, &args, &flags,
+                        ).await;
+                        if let Err(e) = state
+                            .containers
+                            .send_cli_response(&session_id, &cli_id,
+                                outcome.exit_code, &outcome.stdout, &outcome.stderr)
+                            .await
+                        {
+                            tracing::warn!(error = %e, %cli_id,
+                                "Failed to deliver CliResponse to message_processor");
+                        }
+                    }
+                    OutputEvent::RateLimit { status, resets_at, limit_type, utilization, raw_json } => {
+                        tracing::info!(
+                            session_id = %session_id,
+                            %status, %limit_type, resets_at, utilization,
+                            "stream_output: RateLimit",
+                        );
+
+                        // Rate-limit signals are team-scoped — same Anthropic
+                        // account drives every member. If this session has no
+                        // team_id, just log and move on.
+                        let Some((tid, _role)) = team_info.as_ref() else {
+                            continue;
+                        };
+
+                        // Persist regardless of status so we have history.
+                        let util_opt = if utilization >= 0.0 { Some(utilization) } else { None };
+                        if let Err(e) = state
+                            .db
+                            .upsert_team_rate_limit(
+                                tid, &status, resets_at, &limit_type, util_opt, &raw_json,
+                            )
+                            .await
+                        {
+                            tracing::warn!(error = %e, team_id = %tid, "Failed to persist team rate limit");
+                        }
+
+                        match status.as_str() {
+                            "rejected" => {
+                                // Pause local ProcessDied chatter for the
+                                // remainder of the window (with a sane cap so
+                                // we don't sit silent forever if resets_at is
+                                // bogus).
+                                let pause_secs = if resets_at > 0 {
+                                    let now_unix = chrono::Utc::now().timestamp();
+                                    (resets_at - now_unix).clamp(60, 6 * 60 * 60) as u64
+                                } else {
+                                    15 * 60
+                                };
+                                rate_limited_until = Some(
+                                    tokio::time::Instant::now()
+                                        + std::time::Duration::from_secs(pause_secs),
+                                );
+
+                                // Post (or update) a single notice card on the
+                                // team coordination thread.
+                                post_or_update_rate_limit_notice(
+                                    &state, tid, &status, resets_at, &limit_type, util_opt,
+                                )
+                                .await;
+                            }
+                            "allowed_warning" => {
+                                // Soft heads-up — also surface as a notice but
+                                // don't pause anything.
+                                post_or_update_rate_limit_notice(
+                                    &state, tid, &status, resets_at, &limit_type, util_opt,
+                                )
+                                .await;
+                            }
+                            "allowed" => {
+                                rate_limited_until = None;
+                                clear_rate_limit_notice_and_drain(&state, tid).await;
+                            }
+                            other => {
+                                tracing::debug!(status = %other, "RateLimit: unknown status (no-op)");
+                            }
                         }
                     }
                     OutputEvent::WorkerDisconnected { reason } => {
@@ -3757,6 +3385,912 @@ async fn post_to_coordination_log(state: &AppState, team_id: &str, message: &str
         .await;
 }
 
+/// Format a rate-limit notice body. Centralised so the "rejected" card and
+/// the later "resumed" edit share one renderer.
+fn format_rate_limit_notice(
+    status: &str,
+    resets_at_unix: i64,
+    limit_type: &str,
+    utilization: Option<f64>,
+) -> String {
+    let when = if resets_at_unix > 0 {
+        chrono::DateTime::<chrono::Utc>::from_timestamp(resets_at_unix, 0)
+            .map(|t| t.format("%Y-%m-%d %H:%M UTC").to_string())
+            .unwrap_or_else(|| "unknown".to_string())
+    } else {
+        "unknown".to_string()
+    };
+    let kind = if limit_type.is_empty() {
+        "session".to_string()
+    } else {
+        limit_type.replace('_', " ")
+    };
+    let util_str = utilization
+        .map(|u| format!(" ({}% used)", (u * 100.0).round() as i64))
+        .unwrap_or_default();
+    match status {
+        "rejected" => format!(
+            ":no_entry: **{} limit hit**{}. Team task queue paused — resumes {}. Any turn that errors during the window is re-queued and redelivered automatically once the limit resets.",
+            kind, util_str, when,
+        ),
+        "allowed_warning" => format!(
+            ":warning: **{} limit warning**{}. Approaching cap — resets {}.",
+            kind, util_str, when,
+        ),
+        "allowed" => format!(
+            ":white_check_mark: **{} limit cleared.** Team task queue resumed.",
+            kind,
+        ),
+        other => format!(
+            ":information_source: Rate-limit status: {} (kind={}, resets {}{})",
+            other, kind, when, util_str,
+        ),
+    }
+}
+
+/// Post a single notice card on the team coordination thread, or edit the
+/// previous one in place. Updates `team_rate_limits.notice_post_id` so the
+/// next transition keeps editing the same row.
+async fn post_or_update_rate_limit_notice(
+    state: &Arc<AppState>,
+    team_id: &str,
+    status: &str,
+    resets_at_unix: i64,
+    limit_type: &str,
+    utilization: Option<f64>,
+) {
+    let body = format_rate_limit_notice(status, resets_at_unix, limit_type, utilization);
+
+    // Try to edit the existing notice first (idempotent on repeated rejects).
+    let existing = match state.db.get_team_rate_limit(team_id).await {
+        Ok(Some(rl)) => rl.notice_post_id,
+        _ => None,
+    };
+    if let Some(post_id) = existing {
+        if state.mm.update_post(&post_id, &body).await.is_ok() {
+            return;
+        }
+        // Edit failed (post deleted?) — fall through to create a new one.
+        tracing::warn!(team_id, "Failed to edit existing rate-limit notice; reposting");
+    }
+
+    // Need a coordination thread to post into.
+    let Some(coord_channel_id) = ensure_coordination_channel(state).await else {
+        return;
+    };
+    let team = match state.db.get_team(team_id).await {
+        Ok(Some(t)) => t,
+        _ => return,
+    };
+    let Some(thread_id) = team.coordination_thread_id else {
+        return;
+    };
+
+    match state
+        .mm
+        .post_in_thread(&coord_channel_id, &thread_id, &body)
+        .await
+    {
+        Ok(post_id) => {
+            if let Err(e) = state
+                .db
+                .set_team_rate_limit_post_id(team_id, Some(&post_id))
+                .await
+            {
+                tracing::warn!(error = %e, "Failed to persist rate-limit notice post id");
+            }
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to post rate-limit notice");
+        }
+    }
+}
+
+/// Outcome of a `team` CLI dispatch — turned into a CliResponse on the wire.
+struct CliOutcome {
+    exit_code: i32,
+    stdout: String,
+    stderr: String,
+}
+
+impl CliOutcome {
+    fn ok<S: Into<String>>(stdout: S) -> Self {
+        Self { exit_code: 0, stdout: stdout.into(), stderr: String::new() }
+    }
+    fn err<S: Into<String>>(code: i32, stderr: S) -> Self {
+        Self { exit_code: code, stdout: String::new(), stderr: stderr.into() }
+    }
+}
+
+/// Dispatch a `team` CLI verb. The CLI binary inside the container has
+/// already validated argv; here we just translate verb + args to existing
+/// internal helpers and produce stdout/stderr/exit_code for the reply.
+///
+/// Currently supported verbs: `status`, `to`. Other verbs return a stub
+/// non-zero exit until they're wired up in follow-up slices — the marker
+/// path remains the supported way to invoke them in the meantime.
+async fn handle_cli_command(
+    state: &Arc<AppState>,
+    sender_session_id: &str,
+    team_id: Option<&str>,
+    sender_role: Option<&str>,
+    verb: &str,
+    args: &[String],
+    flags: &std::collections::HashMap<String, String>,
+) -> CliOutcome {
+    let want_json = flags.get("json").map(|v| v == "1").unwrap_or(false);
+    match verb {
+        "status" => cli_verb_status(state, team_id, want_json).await,
+        "to" => cli_verb_to(state, sender_session_id, team_id, sender_role, args).await,
+        "spawn" => cli_verb_spawn(state, sender_session_id, team_id, sender_role, args).await,
+        "interrupt" => {
+            cli_verb_interrupt(state, sender_session_id, team_id, sender_role, args).await
+        }
+        "cancel" => {
+            cli_verb_cancel(state, sender_session_id, team_id, args, flags).await
+        }
+        "clear" => cli_verb_clear(state, sender_session_id, team_id, sender_role, args).await,
+        "broadcast" => {
+            cli_verb_broadcast(state, sender_session_id, team_id, sender_role, args).await
+        }
+        "pr-ready" => {
+            cli_verb_pr_ready(state, sender_session_id, team_id, sender_role, args).await
+        }
+        "pr-reviewed" => {
+            cli_verb_pr_reviewed(state, sender_session_id, team_id, sender_role, args).await
+        }
+        "pr-merged" => {
+            cli_verb_pr_merged(state, sender_session_id, team_id, sender_role, args).await
+        }
+        other => CliOutcome::err(2, format!("team: unknown verb '{}'\n", other)),
+    }
+}
+
+async fn cli_verb_status(
+    state: &Arc<AppState>,
+    team_id: Option<&str>,
+    want_json: bool,
+) -> CliOutcome {
+    let Some(team_id) = team_id else {
+        return CliOutcome::err(
+            1,
+            "team status: this session is not part of a team.\n".to_string(),
+        );
+    };
+
+    let members = match state.db.get_team_members(team_id).await {
+        Ok(m) => m,
+        Err(e) => return CliOutcome::err(1, format!("team status: {}\n", e)),
+    };
+    let queue_counts = state
+        .db
+        .queued_counts_by_role(team_id)
+        .await
+        .unwrap_or_default();
+    let rate_limit = state.db.get_team_rate_limit(team_id).await.ok().flatten();
+
+    if want_json {
+        let queue_obj: serde_json::Map<String, serde_json::Value> = queue_counts
+            .into_iter()
+            .map(|(role, n)| (role, serde_json::Value::from(n)))
+            .collect();
+        let members_json: Vec<serde_json::Value> = members
+            .iter()
+            .map(|m| {
+                let status = if m.pending_task_from.is_some() { "running" } else { "idle" };
+                serde_json::json!({
+                    "session_id": m.session_id,
+                    "role": m.role,
+                    "status": status,
+                    "current_task": m.current_task,
+                    "context_tokens": m.context_tokens,
+                })
+            })
+            .collect();
+        let rl_json = rate_limit.map(|rl| {
+            serde_json::json!({
+                "status": rl.status,
+                "resets_at": rl.resets_at.map(|t| t.to_rfc3339()),
+                "limit_type": rl.limit_type,
+                "utilization": rl.utilization,
+            })
+        }).unwrap_or(serde_json::Value::Null);
+        let body = serde_json::json!({
+            "team_id": team_id,
+            "members": members_json,
+            "queue_pending": queue_obj,
+            "rate_limit": rl_json,
+        });
+        return CliOutcome::ok(body.to_string());
+    }
+
+    // Human-readable: roster table + queue depth + rate-limit footer.
+    let mut out = String::new();
+    out.push_str(&format!("Team {}\n", team_id));
+    if members.is_empty() {
+        out.push_str("  (no members)\n");
+    } else {
+        for m in &members {
+            let role = m.role.as_deref().unwrap_or("<unknown>");
+            let status = if m.pending_task_from.is_some() { "running" } else { "idle" };
+            let task_preview = m.current_task
+                .as_deref()
+                .map(|t| truncate_preview(t, 60))
+                .unwrap_or_default();
+            if task_preview.is_empty() {
+                out.push_str(&format!("  - {} ({})\n", role, status));
+            } else {
+                out.push_str(&format!("  - {} ({}) — {}\n", role, status, task_preview));
+            }
+        }
+    }
+    if !queue_counts.is_empty() {
+        out.push_str("Pending queue:\n");
+        for (role, n) in &queue_counts {
+            out.push_str(&format!("  - {}: {}\n", role, n));
+        }
+    }
+    if let Some(rl) = rate_limit
+        && rl.status == "rejected"
+    {
+        let when = rl.resets_at
+            .map(|t| t.format("%Y-%m-%d %H:%M UTC").to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        out.push_str(&format!(
+            "Rate-limit: REJECTED ({}) — resumes {}\n",
+            if rl.limit_type.is_empty() { "session" } else { rl.limit_type.as_str() },
+            when,
+        ));
+    }
+    CliOutcome::ok(out)
+}
+
+async fn cli_verb_to(
+    state: &Arc<AppState>,
+    sender_session_id: &str,
+    team_id: Option<&str>,
+    sender_role: Option<&str>,
+    args: &[String],
+) -> CliOutcome {
+    let Some(team_id) = team_id else {
+        return CliOutcome::err(1, "team to: this session is not part of a team.\n".to_string());
+    };
+    let Some(sender_role) = sender_role else {
+        return CliOutcome::err(1, "team to: missing sender role.\n".to_string());
+    };
+    if args.len() < 2 {
+        return CliOutcome::err(2, "team to: usage: team to <role> <message>\n".to_string());
+    }
+    let target_role = &args[0];
+    let message = &args[1];
+    if message.trim().is_empty() {
+        return CliOutcome::err(2, "team to: message is empty.\n".to_string());
+    }
+
+    // Match the marker path's "is_prefix_match" convention: a role string
+    // without a numeric suffix means "any member of this role"; with a
+    // suffix it's an exact session. drain_team_queue honours that flag.
+    let is_prefix = !target_role
+        .rsplit_once(' ')
+        .map(|(_, tail)| tail.chars().all(|c| c.is_ascii_digit()) && !tail.is_empty())
+        .unwrap_or(false);
+
+    match state
+        .db
+        .enqueue_team_task(
+            team_id,
+            target_role,
+            is_prefix,
+            sender_session_id,
+            sender_role,
+            message,
+            None,
+        )
+        .await
+    {
+        Ok(task_id) => {
+            // Drain inline so a freshly-queued task lands on an idle target
+            // immediately when one exists. Pause checks inside drain handle
+            // rate-limit gating naturally.
+            drain_team_queue(state, team_id).await;
+            CliOutcome::ok(format!("queue_id={} status=queued role={}\n", task_id, target_role))
+        }
+        Err(e) => CliOutcome::err(1, format!("team to: enqueue failed: {}\n", e)),
+    }
+}
+
+async fn cli_verb_spawn(
+    state: &Arc<AppState>,
+    sender_session_id: &str,
+    team_id: Option<&str>,
+    sender_role: Option<&str>,
+    args: &[String],
+) -> CliOutcome {
+    let Some(team_id) = team_id else {
+        return CliOutcome::err(1, "team spawn: this session is not part of a team.\n");
+    };
+    let Some(sender_role) = sender_role else {
+        return CliOutcome::err(1, "team spawn: missing sender role.\n");
+    };
+    if sender_role != "Team Lead" {
+        return CliOutcome::err(
+            3,
+            "team spawn: rejected — only the Team Lead may spawn members.\n",
+        );
+    }
+    if args.len() < 2 {
+        return CliOutcome::err(2, "team spawn: usage: team spawn <role> <task>\n");
+    }
+    let role_name = &args[0];
+    let initial_task = &args[1];
+    if initial_task.trim().is_empty() {
+        return CliOutcome::err(2, "team spawn: task is empty.\n");
+    }
+
+    // The spawn task needs the lead's channel/project to spawn the new
+    // member into. Look up the lead's session row for that.
+    let lead = match state
+        .db
+        .get_session_by_id_prefix(&sender_session_id[..8.min(sender_session_id.len())])
+        .await
+    {
+        Ok(Some(s)) => s,
+        Ok(None) => return CliOutcome::err(1, "team spawn: lead session not found.\n"),
+        Err(e) => return CliOutcome::err(1, format!("team spawn: lookup failed: {}\n", e)),
+    };
+
+    let payload = serde_json::json!({
+        "channel_id": lead.channel_id,
+        "project": lead.project,
+    });
+
+    match state
+        .db
+        .enqueue_team_spawn(
+            team_id, role_name, sender_session_id, sender_role,
+            initial_task, &payload, SPAWN_DEDUPE_WINDOW_SECS,
+        )
+        .await
+    {
+        Ok(Ok(task_id)) => {
+            drain_team_queue(state, team_id).await;
+            CliOutcome::ok(format!(
+                "queue_id={} status=queued role={}\n", task_id, role_name,
+            ))
+        }
+        Ok(Err(existing_id)) => CliOutcome::err(
+            // Exit 4 = duplicate intent (a same-role + same-task spawn is
+            // already in flight). Lead can poll `team status` to see it.
+            4,
+            format!(
+                "team spawn: rejected reason=duplicate_intent existing_queue_id={} role={}\n",
+                existing_id, role_name,
+            ),
+        ),
+        Err(e) => CliOutcome::err(1, format!("team spawn: enqueue failed: {}\n", e)),
+    }
+}
+
+async fn cli_verb_interrupt(
+    state: &Arc<AppState>,
+    _sender_session_id: &str,
+    team_id: Option<&str>,
+    sender_role: Option<&str>,
+    args: &[String],
+) -> CliOutcome {
+    let Some(team_id) = team_id else {
+        return CliOutcome::err(1, "team interrupt: this session is not part of a team.\n");
+    };
+    let Some(sender_role) = sender_role else {
+        return CliOutcome::err(1, "team interrupt: missing sender role.\n");
+    };
+    if sender_role != "Team Lead" {
+        return CliOutcome::err(3, "team interrupt: rejected — Team Lead only.\n");
+    }
+    if args.is_empty() {
+        return CliOutcome::err(2, "team interrupt: usage: team interrupt <role>\n");
+    }
+    let target_role = &args[0];
+
+    let targets = match state.db.get_sessions_by_role(team_id, target_role).await {
+        Ok(t) => t,
+        Err(e) => return CliOutcome::err(1, format!("team interrupt: lookup failed: {}\n", e)),
+    };
+    if targets.is_empty() {
+        return CliOutcome::err(
+            5,
+            format!("team interrupt: no member matches role '{}'.\n", target_role),
+        );
+    }
+
+    let mut interrupted = 0i32;
+    let mut failed = 0i32;
+    for t in &targets {
+        let role = t.role.as_deref().unwrap_or(target_role);
+        // Flip the running queue row → 'cancelled' regardless of whether
+        // the SDK actually had a turn to cancel (matches the marker
+        // handler's behaviour). Idempotent.
+        if let Err(e) = state
+            .db
+            .mark_running_message_task_cancelled_for_session(&t.session_id, "interrupted_by_lead")
+            .await
+        {
+            tracing::warn!(error = %e, session_id = %t.session_id, role,
+                "queue: failed to mark running task cancelled (cli)");
+        }
+        match state.containers.interrupt(&t.session_id).await {
+            Ok(true) => {
+                interrupted += 1;
+                let _ = state
+                    .mm
+                    .post_in_thread(
+                        &t.channel_id, &t.thread_id,
+                        ":octagonal_sign: **Interrupted by Team Lead** — current turn aborted.",
+                    )
+                    .await;
+            }
+            Ok(false) => failed += 1,
+            Err(e) => {
+                failed += 1;
+                tracing::warn!(error = %e, session_id = %t.session_id, role, "interrupt RPC failed (cli)");
+            }
+        }
+    }
+
+    let exit_code = if failed > 0 && interrupted == 0 { 6 } else { 0 };
+    CliOutcome { exit_code,
+        stdout: format!(
+            "interrupted={} failed={} role={}\n",
+            interrupted, failed, target_role,
+        ),
+        stderr: if failed > 0 {
+            format!("team interrupt: {} session(s) had no in-flight turn or RPC failed.\n", failed)
+        } else { String::new() },
+    }
+}
+
+async fn cli_verb_cancel(
+    state: &Arc<AppState>,
+    sender_session_id: &str,
+    team_id: Option<&str>,
+    args: &[String],
+    flags: &std::collections::HashMap<String, String>,
+) -> CliOutcome {
+    let Some(team_id) = team_id else {
+        return CliOutcome::err(1, "team cancel: this session is not part of a team.\n");
+    };
+
+    // Mode 1: cancel a single queue_id (when one is provided as positional).
+    if let Some(qid_str) = args.first() {
+        let task_id: i64 = match qid_str.parse() {
+            Ok(n) => n,
+            Err(_) => {
+                return CliOutcome::err(
+                    2, format!("team cancel: '{}' is not a valid queue_id.\n", qid_str),
+                );
+            }
+        };
+        match state
+            .db
+            .cancel_queued_task_by_id(task_id, sender_session_id)
+            .await
+        {
+            Ok(true) => CliOutcome::ok(format!("cancelled queue_id={}\n", task_id)),
+            // Already-running / delivered / wrong sender → nothing flipped.
+            Ok(false) => CliOutcome::err(
+                7,
+                format!(
+                    "team cancel: queue_id={} not cancellable (already delivered, or not yours).\n",
+                    task_id,
+                ),
+            ),
+            Err(e) => CliOutcome::err(1, format!("team cancel: {}\n", e)),
+        }
+    } else {
+        // Mode 2: cancel everything queued from this sender, optionally
+        // filtered by --role=<target_role>.
+        let Some(role) = flags.get("role") else {
+            return CliOutcome::err(
+                2,
+                "team cancel: provide a queue_id or --role=<target_role>.\n",
+            );
+        };
+        match state
+            .db
+            .cancel_queued_from_sender(team_id, sender_session_id, role)
+            .await
+        {
+            Ok(count) => CliOutcome::ok(format!(
+                "cancelled count={} role={}\n",
+                count, role,
+            )),
+            Err(e) => CliOutcome::err(1, format!("team cancel: {}\n", e)),
+        }
+    }
+}
+
+async fn cli_verb_clear(
+    state: &Arc<AppState>,
+    sender_session_id: &str,
+    team_id: Option<&str>,
+    sender_role: Option<&str>,
+    args: &[String],
+) -> CliOutcome {
+    let Some(team_id) = team_id else {
+        return CliOutcome::err(1, "team clear: this session is not part of a team.\n");
+    };
+    let Some(sender_role) = sender_role else {
+        return CliOutcome::err(1, "team clear: missing sender role.\n");
+    };
+    if args.is_empty() {
+        return CliOutcome::err(2, "team clear: usage: team clear <role|Self>\n");
+    }
+    let target_role = &args[0];
+
+    // 'Self' means clear the caller. Anyone may self-clear; only the lead
+    // may clear others.
+    let is_self = target_role.eq_ignore_ascii_case("Self");
+    if !is_self && sender_role != "Team Lead" {
+        return CliOutcome::err(
+            3,
+            "team clear: rejected — Team Lead may clear others; anyone may 'Self' clear.\n",
+        );
+    }
+
+    // Resolve target sessions.
+    let targets = if is_self {
+        match state
+            .db
+            .get_session_by_id_prefix(&sender_session_id[..8.min(sender_session_id.len())])
+            .await
+        {
+            Ok(Some(s)) => vec![s],
+            _ => return CliOutcome::err(5, "team clear: caller session not found.\n"),
+        }
+    } else {
+        match state.db.get_sessions_by_role(team_id, target_role).await {
+            Ok(t) if !t.is_empty() => t,
+            Ok(_) => return CliOutcome::err(
+                5,
+                format!("team clear: no member matches role '{}'.\n", target_role),
+            ),
+            Err(e) => return CliOutcome::err(1, format!("team clear: lookup failed: {}\n", e)),
+        }
+    };
+
+    let mut queued_ids: Vec<i64> = Vec::new();
+    let mut cooldown_skipped = 0i32;
+    let mut already_queued = 0i32;
+    for t in &targets {
+        let role = t.role.as_deref().unwrap_or(target_role);
+        let result = state
+            .db
+            .enqueue_team_clear(
+                team_id, role, &t.session_id, sender_session_id, sender_role,
+                if is_self { "self_clear" } else { "lead_clear" },
+                AUTO_CLEAR_COOLDOWN_SECS as i64,
+            )
+            .await;
+        match result {
+            Ok(EnqueueClearResult::Enqueued(id)) => queued_ids.push(id),
+            Ok(EnqueueClearResult::AlreadyQueued(_)) => already_queued += 1,
+            Ok(EnqueueClearResult::Cooldown { remaining_secs: _ }) => cooldown_skipped += 1,
+            Err(e) => return CliOutcome::err(1, format!("team clear: enqueue failed: {}\n", e)),
+        }
+    }
+
+    drain_team_queue(state, team_id).await;
+
+    let mut out = String::new();
+    if !queued_ids.is_empty() {
+        out.push_str(&format!(
+            "queued count={} queue_ids={:?}\n",
+            queued_ids.len(), queued_ids,
+        ));
+    }
+    if already_queued > 0 {
+        out.push_str(&format!("already_queued={}\n", already_queued));
+    }
+    if cooldown_skipped > 0 {
+        out.push_str(&format!("cooldown_skipped={}\n", cooldown_skipped));
+    }
+    if queued_ids.is_empty() && already_queued == 0 && cooldown_skipped == 0 {
+        // No row matched any branch — defensive (shouldn't happen).
+        out.push_str("no_action\n");
+    }
+    CliOutcome::ok(out)
+}
+
+async fn cli_verb_broadcast(
+    state: &Arc<AppState>,
+    sender_session_id: &str,
+    team_id: Option<&str>,
+    sender_role: Option<&str>,
+    args: &[String],
+) -> CliOutcome {
+    let Some(team_id) = team_id else {
+        return CliOutcome::err(1, "team broadcast: this session is not part of a team.\n");
+    };
+    let Some(sender_role) = sender_role else {
+        return CliOutcome::err(1, "team broadcast: missing sender role.\n");
+    };
+    if sender_role != "Team Lead" {
+        return CliOutcome::err(3, "team broadcast: rejected — Team Lead only.\n");
+    }
+    if args.is_empty() {
+        return CliOutcome::err(2, "team broadcast: usage: team broadcast <message>\n");
+    }
+    let message = &args[0];
+    if message.trim().is_empty() {
+        return CliOutcome::err(2, "team broadcast: message is empty.\n");
+    }
+
+    // Enumerate every active member except the sender. We resolve the roster
+    // here (under the same DB read) so a member who spawns mid-broadcast
+    // doesn't get a partial fanout — they'll be picked up by the next
+    // explicit `team to`.
+    let members = match state.db.get_team_members(team_id).await {
+        Ok(m) => m,
+        Err(e) => return CliOutcome::err(1, format!("team broadcast: roster lookup failed: {}\n", e)),
+    };
+    let recipients: Vec<&StoredSession> = members
+        .iter()
+        .filter(|m| m.session_id != sender_session_id && m.status == "active")
+        .filter(|m| m.role.is_some())
+        .collect();
+    if recipients.is_empty() {
+        return CliOutcome::err(
+            5,
+            "team broadcast: no other active members on this team.\n",
+        );
+    }
+
+    // One queue row per recipient → independently cancellable / pause-aware /
+    // ordered alongside the rest of the queue. Each row uses the recipient's
+    // exact role (not a prefix) so the drain delivers it to *that* member.
+    let mut queue_ids: Vec<i64> = Vec::new();
+    for m in &recipients {
+        let Some(role) = m.role.as_deref() else { continue };
+        match state
+            .db
+            .enqueue_team_task(
+                team_id, role, /* is_prefix_match */ false,
+                sender_session_id, sender_role, message, None,
+            )
+            .await
+        {
+            Ok(id) => queue_ids.push(id),
+            Err(e) => {
+                tracing::warn!(error = %e, role, "team broadcast: enqueue failed for one member");
+            }
+        }
+    }
+
+    if queue_ids.is_empty() {
+        return CliOutcome::err(
+            1, "team broadcast: every per-member enqueue failed; nothing dispatched.\n",
+        );
+    }
+
+    drain_team_queue(state, team_id).await;
+    CliOutcome::ok(format!(
+        "broadcast count={} queue_ids={:?}\n",
+        queue_ids.len(), queue_ids,
+    ))
+}
+
+async fn cli_verb_pr_ready(
+    state: &Arc<AppState>,
+    sender_session_id: &str,
+    team_id: Option<&str>,
+    sender_role: Option<&str>,
+    args: &[String],
+) -> CliOutcome {
+    let Some(team_id) = team_id else {
+        return CliOutcome::err(1, "team pr-ready: this session is not part of a team.\n");
+    };
+    let Some(sender_role) = sender_role else {
+        return CliOutcome::err(1, "team pr-ready: missing sender role.\n");
+    };
+    if args.is_empty() {
+        return CliOutcome::err(2, "team pr-ready: usage: team pr-ready <pr_number>\n");
+    }
+    let pr_number = &args[0];
+    if pr_number.parse::<u32>().is_err() {
+        return CliOutcome::err(2, format!("team pr-ready: '{}' is not a valid PR number.\n", pr_number));
+    }
+    // Existing handler does the review-gate injection + Mattermost
+    // visibility. Preserves all the prior side effects (system message back
+    // to the sender instructing them to wait for Claude Reviewer CI, etc.)
+    // — this CLI verb is a thin shim onto it.
+    handle_pr_ready(state, sender_session_id, team_id, sender_role, pr_number, "").await;
+    CliOutcome::ok(format!("pr-ready pr={} status=acknowledged\n", pr_number))
+}
+
+async fn cli_verb_pr_merged(
+    state: &Arc<AppState>,
+    sender_session_id: &str,
+    team_id: Option<&str>,
+    sender_role: Option<&str>,
+    args: &[String],
+) -> CliOutcome {
+    let Some(team_id) = team_id else {
+        return CliOutcome::err(1, "team pr-merged: this session is not part of a team.\n");
+    };
+    let Some(sender_role) = sender_role else {
+        return CliOutcome::err(1, "team pr-merged: missing sender role.\n");
+    };
+    if sender_role != "Team Lead" {
+        return CliOutcome::err(
+            3,
+            "team pr-merged: rejected — Team Lead only (members don't merge).\n",
+        );
+    }
+    if args.is_empty() {
+        return CliOutcome::err(2, "team pr-merged: usage: team pr-merged <pr_number>\n");
+    }
+    let pr_number = &args[0];
+    if pr_number.parse::<u32>().is_err() {
+        return CliOutcome::err(
+            2, format!("team pr-merged: '{}' is not a valid PR number.\n", pr_number),
+        );
+    }
+
+    // Workflow-boundary self-clear. The lead just merged a PR; the
+    // per-PR review chatter is no longer load-bearing for the next phase.
+    // Goes through the queue with the standard cooldown so a back-to-back
+    // double-call (or coincident auto-clear) collapses cleanly.
+    let reason = format!("breakpoint:pr_{}_merged", pr_number);
+    match state
+        .db
+        .enqueue_team_clear(
+            team_id, sender_role, sender_session_id, sender_session_id,
+            sender_role, &reason, AUTO_CLEAR_COOLDOWN_SECS as i64,
+        )
+        .await
+    {
+        Ok(EnqueueClearResult::Enqueued(task_id)) => {
+            drain_team_queue(state, team_id).await;
+            CliOutcome::ok(format!(
+                "pr-merged pr={} status=queued queue_id={} reason={}\n",
+                pr_number, task_id, reason,
+            ))
+        }
+        Ok(EnqueueClearResult::AlreadyQueued(task_id)) => CliOutcome::ok(format!(
+            "pr-merged pr={} status=already_queued queue_id={}\n",
+            pr_number, task_id,
+        )),
+        Ok(EnqueueClearResult::Cooldown { remaining_secs }) => CliOutcome::ok(format!(
+            "pr-merged pr={} status=cooldown remaining_secs={}\n",
+            pr_number, remaining_secs,
+        )),
+        Err(e) => CliOutcome::err(1, format!("team pr-merged: {}\n", e)),
+    }
+}
+
+async fn cli_verb_pr_reviewed(
+    state: &Arc<AppState>,
+    sender_session_id: &str,
+    team_id: Option<&str>,
+    sender_role: Option<&str>,
+    args: &[String],
+) -> CliOutcome {
+    let Some(team_id) = team_id else {
+        return CliOutcome::err(1, "team pr-reviewed: this session is not part of a team.\n");
+    };
+    let Some(sender_role) = sender_role else {
+        return CliOutcome::err(1, "team pr-reviewed: missing sender role.\n");
+    };
+    if args.is_empty() {
+        return CliOutcome::err(2, "team pr-reviewed: usage: team pr-reviewed <pr_number>\n");
+    }
+    let pr_number = &args[0];
+    if pr_number.parse::<u32>().is_err() {
+        return CliOutcome::err(
+            2, format!("team pr-reviewed: '{}' is not a valid PR number.\n", pr_number),
+        );
+    }
+    // Member is done with the review gate. Match the marker handler's
+    // behaviour: clear pending_task_from before forwarding so the member
+    // shows idle while the lead reviews. Then notify the lead.
+    let _ = state.db.clear_pending_task(sender_session_id).await;
+    handle_pr_reviewed(state, sender_session_id, team_id, sender_role, pr_number, "").await;
+    CliOutcome::ok(format!("pr-reviewed pr={} status=forwarded_to_lead\n", pr_number))
+}
+
+/// When a member's turn dies during a rate-limit pause, push the row in the
+/// 'running' state back to 'queued' so the next drain pass redelivers it.
+/// The original `created_at` is preserved → the task keeps its place in line
+/// relative to other queued work; no orphan-row duplication.
+///
+/// `pending_task_from` is cleared so the member shows idle again (and is
+/// eligible to pick up the re-queued row, or any other queued task, on
+/// resume).
+///
+/// Idempotent: subsequent ProcessDied events on the same session find no
+/// running row and return false — no double-bump.
+async fn requeue_in_flight_after_rate_limit(
+    state: &Arc<AppState>,
+    team_id: &str,
+    session_id: &str,
+) -> bool {
+    // Push delivery to (resets_at + 60s) so we don't slam the API the instant
+    // the window flips. Fall back to NOW() if we don't have a reset
+    // timestamp — `drain_team_queue` is paused via `is_team_rate_limited`
+    // anyway.
+    let deliver_after = state
+        .db
+        .get_team_rate_limit(team_id)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|rl| rl.resets_at)
+        .map(|t| t + chrono::Duration::seconds(60))
+        .unwrap_or_else(chrono::Utc::now);
+
+    let task_id = match state
+        .db
+        .requeue_running_message_task_for_session(session_id, deliver_after)
+        .await
+    {
+        Ok(Some(id)) => id,
+        Ok(None) => {
+            // Nothing in 'running' for this session — nothing to retry.
+            // Clear the pending slot defensively (a turn might have died
+            // before the queue row transitioned).
+            let _ = state.db.clear_pending_task(session_id).await;
+            return false;
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, team_id, session_id, "requeue: UPDATE running→queued failed");
+            return false;
+        }
+    };
+
+    let _ = state.db.clear_pending_task(session_id).await;
+
+    tracing::info!(
+        team_id, session_id, task_id,
+        deliver_after = %deliver_after,
+        "Re-queued in-flight task killed by rate limit (running → queued)",
+    );
+
+    post_to_coordination_log(
+        state,
+        team_id,
+        &format!(
+            ":arrows_counterclockwise: Rate-limit re-queue: queue_id={} returned to pending; redelivers after {}",
+            task_id,
+            deliver_after.format("%H:%M UTC"),
+        ),
+    )
+    .await;
+    true
+}
+
+/// Resume after a rate-limit window: flip the row to `allowed`, edit the
+/// existing notice, and trigger a queue drain pass for any pending tasks
+/// that piled up.
+async fn clear_rate_limit_notice_and_drain(state: &Arc<AppState>, team_id: &str) {
+    let prior_post_id = match state.db.clear_team_rate_limit(team_id).await {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(error = %e, team_id, "Failed to clear team rate limit");
+            None
+        }
+    };
+    let body = format_rate_limit_notice("allowed", 0, "", None);
+    if let Some(post_id) = prior_post_id {
+        let _ = state.mm.update_post(&post_id, &body).await;
+    } else if let Some(coord_channel_id) = ensure_coordination_channel(state).await
+        && let Ok(Some(team)) = state.db.get_team(team_id).await
+        && let Some(thread_id) = team.coordination_thread_id
+    {
+        let _ = state.mm.post_in_thread(&coord_channel_id, &thread_id, &body).await;
+    }
+    drain_team_queue(state, team_id).await;
+}
+
 /// Build the team context header prepended to every message delivered to a team member.
 async fn build_team_context_header(db: &Database, team_id: &str, recipient_role: &str) -> String {
     let members = db.get_team_members(team_id).await.unwrap_or_default();
@@ -3786,8 +4320,8 @@ fn format_team_context_header(members: &[StoredSession], recipient_role: &str) -
         })
         .collect();
     format!(
-        "[TEAM: You are {}. Members: {}. \
-         Use markers to communicate: [SPAWN:Role] task, [TO:Role] message, [BROADCAST] message, [TEAM_STATUS]]",
+        "[TEAM: You are {}. Members: {}. Run `team status` for queue depth + rate-limit state; \
+         `team to <role> <message>` to assign work; `team --help` for the full verb list.]",
         recipient_role,
         member_list.join(", ")
     )
@@ -3824,218 +4358,198 @@ The user requested {dev_count} developer(s) for this team.
 ## Available Roles
 {roles_table}
 
-## Spawning Team Members
-IMPORTANT: Before spawning, ALWAYS check if existing team members of the same role are idle — use [TO:Role] to assign work to idle members instead of spawning new ones. The system will REJECT spawn requests when idle members of that role exist.
-Run [TEAM_STATUS] first to check the current roster and avoid duplicates.
-Spawn markers MUST start at the beginning of a new line. Include the task, then end with [/MSG] on its own line.
-  [SPAWN:Developer] Short task
-  [/MSG]
-Or multi-line:
-  [SPAWN:Developer]
-  Detailed task description
-  spanning multiple lines
-  [/MSG]
-  [SPAWN:Developer --worktree] Force worktree isolation
-Developer roles are auto-numbered (Developer 1, Developer 2, ...). Other roles are singletons.
+## Team CLI (the `team` binary)
+All team-control actions flow through a single CLI installed in this container.
+Invoke it from the `Bash` tool exactly like `git` or `gh` — the binary returns
+synchronously with the result on stdout (and a non-zero exit code on failure).
+There is NO marker grammar — do not emit `[TO:...]`, `[SPAWN:...]`, `[ACK:...]`
+or anything similar in your response text. Those used to be parsed out of
+your output and they no longer are. Use the CLI.
 
-## Communication Markers
-CRITICAL: All markers MUST start at the beginning of a new line. Do NOT embed markers in the middle of a sentence or paragraph — they will be ignored. Each marker must be the first thing on its line.
-  [TO:Role Name] message [/MSG]
-  [TO:Role Name]
-  Multi-line message
-  [/MSG]
-  [BROADCAST] message [/MSG]
-  [TEAM_STATUS]
-[/MSG] must also be on its own line when ending a multi-line message.
+Verbs:
+  team status [--json]
+      Roster + queue depth + rate-limit window. Always run this first when
+      planning routing decisions. `--json` returns structured output.
 
-## Control Markers (Lead-only)
-  [INTERRUPT:Role Name]   Abort a member's in-flight turn. Use when they are
-                          off-track or stuck. Their slot frees on the natural
-                          ResponseComplete that follows. Prefix match (e.g.
-                          [INTERRUPT:Developer]) interrupts every matching
-                          member; use the exact role for one.
-  [CLEAR:Role Name]       Genuinely reset a member's conversation history (drops
-                          the live SDK client; reconnect on next message starts
-                          fresh, no resume). Now flows through the task queue:
-                          you'll get [ACK:CLEAR ... status=queued queue_id=N]
-                          immediately, then [ACK:CLEAR ... status=ok queue_id=N]
-                          when the drain delivers (mid-turn members are deferred
-                          to ResponseComplete, so the clear is always safe).
-                          Membank reloads baseline context on their next message.
-                          Use sparingly — context loss costs continuity. Shares
-                          a 180s SQL cooldown with auto-clear, so back-to-back
-                          requests within that window are rejected with
-                          reason=cooldown.
-  [CLEAR:Self]            Pre-emptively clear YOUR OWN context at a workflow
-                          boundary (between specs, after a plan tool call,
-                          after merging a story PR). Safe to emit mid-turn:
-                          the clear is queued and fires after this turn's
-                          ResponseComplete, so the response containing the
-                          marker completes first. After the clear you receive
-                          a [POST_CLEAR_BRIEFING] reconstructing in-flight
-                          state from durable DB sources (roster + queued
-                          tasks + member current_tasks). See "Context Hygiene
-                          at Workflow Boundaries" below.
-  [CANCEL_QUEUED:Role]      Drop ALL still-queued tasks from you to that role.
-  [CANCEL_QUEUED:Role:N]    Drop just queue_id=N. Already-delivered tasks
-                            cannot be cancelled — use [INTERRUPT:Role] for those.
+  team to <role> "<message>"
+      Enqueue a task to a role. Returns `queue_id=N status=queued role=...`.
+      Role can be a prefix (any idle member of that role wins) or exact
+      ("Developer 2"). Multiple `team to` calls FIFO-deliver as members free.
+
+  team spawn <role> "<initial_task>"
+      Spawn a new member with their first task baked in. Returns
+      `queue_id=N status=queued role=...`. Exits 4 if the same role+task is
+      already in flight (duplicate_intent dedupe over a 5min SQL window) —
+      poll `team status` to see the existing queue_id. Exits 3 if invoked
+      by a non-Lead.
+
+  team interrupt <role>
+      Abort a member's in-flight turn (Lead-only). Prefix match interrupts
+      every member of that role; exact match targets one. Returns
+      `interrupted=N failed=M role=...`. The queue row for the running
+      task flips to `cancelled` automatically.
+
+  team cancel <queue_id>
+  team cancel --role=<role>
+      Drop a still-queued task before delivery. With a queue_id, that one
+      row only (must be yours). With --role, all queued rows from you to
+      that role. Already-running tasks can't be cancelled — use
+      `team interrupt` for those.
+
+  team clear <role|Self>
+      Reset a member's context (Lead-only for others; anyone may
+      `team clear Self`). Goes through the queue with a 180s cooldown.
+      Returns `queued count=K queue_ids=[...]` plus optional
+      `cooldown_skipped=M` / `already_queued=M` lines for diagnostics.
+      `team clear Self` is workflow-boundary safe: it queues the clear,
+      this turn finishes streaming, then the clear fires.
+
+  team broadcast "<message>"
+      Lead-only. Fans the message out as one queue row per active member
+      (excluding you). Each row is independently cancellable / drainable
+      / pause-aware. Returns `broadcast count=N queue_ids=[...]`. Prefer
+      this over a manual loop of `team to` calls — the membership is
+      resolved atomically at dispatch, so nobody is missed if a member
+      spawns mid-fanout.
+
+  team pr-merged <pr_number>
+      Lead-only. Run as the LAST step after `gh pr merge <N>`. Queues a
+      self-clear at the workflow boundary (per-PR review chatter is no
+      longer load-bearing for the next phase). Shares the 180s clear
+      cooldown, so back-to-back calls collapse cleanly. Returns
+      `pr-merged pr=N status=queued queue_id=K reason=breakpoint:pr_N_merged`,
+      or `status=cooldown` / `status=already_queued` when the no-op path fires.
+
+Reading CLI exit codes:
+  0  — action completed.
+  1  — internal failure (DB / lookup error). Investigate via `team status`.
+  2  — usage error (bad argv). Don't retry — fix the invocation.
+  3  — rejected: lead-only verb invoked by non-lead.
+  4  — rejected: duplicate intent (spawn within dedupe window).
+  5  — rejected: target_not_found (role missing on team).
+  6  — partial failure (e.g. interrupt: some sessions had no in-flight turn).
+  7  — rejected: queue_id not cancellable (already running, or not yours).
+ 64  — verb not implemented yet (transitional; should not appear).
+
+Sending messages between members ALWAYS goes through `team to`. The team
+context header `[TEAM: ...]` you see prepended to incoming messages is
+informational — it is NOT a CLI verb you emit.
 
 ## Task Queue Model
-[TO:Role] does NOT deliver immediately — your task is enqueued in the database
-and given a queue_id. The system delivers it the moment the target role has
-an idle member. While a task is queued you can amend it (cancel + re-emit).
+`team to` does NOT deliver immediately — your task is enqueued and given a
+queue_id. The system delivers it the moment the target role has an idle
+member. State machine:
 
-You'll see two ACKs per task:
-  1. [ACK:TO ... status=queued queue_id=N]   — confirms enqueue (right after [TO:])
-  2. [ACK:TO ... status=delivered queue_id=N] — confirms hand-off to a member
+  queued ──drain success──► running ──ResponseComplete──► completed
+     │                        │
+     │                        ├─team interrupt──────► cancelled
+     │                        │
+     │                        └─rate-limit error────► queued (retry, deliver_after bumped)
+     │
+     └─team cancel──► cancelled
 
 If you want to halt a member entirely:
-  - [CANCEL_QUEUED:Role]  — first, so the next queued task doesn't immediately replace what you stop
-  - [INTERRUPT:Role]      — then, to abort the in-flight turn
+  1. `team cancel --role=<role>` first, so the next queued task doesn't immediately
+     replace what you stop.
+  2. `team interrupt <role>` to abort the in-flight turn.
 
 Messages from team members arrive prefixed with their role.
-Each message you receive will include a [TEAM: ...] header with the current roster.
+Every message you receive includes a `[TEAM: ...]` header with the current roster.
+
+## Rate Limits
+When the Anthropic CLI signals a `rate_limit_event`, the team task queue
+auto-pauses team-wide. In-flight turns that error during the window are
+re-queued (preserving created_at order) and redelivered automatically once
+the window resets. You'll see one notice card on the team coordination
+thread; you do not need to do anything about it. `team status` shows the
+window in its footer.
 
 ## Scheduled Tasks (out-of-band)
 The user can type `/schedule <role> <+5h|+30m|+2d|RFC3339> <message>` directly
 into your thread to enqueue a delayed task — useful for things like "ping the
 Developer in 5 hours to continue work after the rate-limit window." The system
 intercepts these before you ever see them, inserts into the queue with a
-deliver_after timestamp, and they fire when due. You will receive the standard
-[ACK:TO ... status=delivered queue_id=N] when the drain hands one off, even
-though you never emitted the corresponding [TO:]. Treat such ACKs as
-informational — no action required unless a member then escalates.
+deliver_after timestamp, and they fire when due. You'll see them arrive as
+normal `From <role>` messages once delivered.
 
-## Structured Acknowledgements
-After every [SPAWN:Role] and [TO:Role] you emit, the system replies with an [ACK:...] line. **Treat these as authoritative ground truth** — the English message is for the user; the ACK is for you. Examples:
-
-  [ACK:SPAWN role="Architect" status=queued queue_id=17]                                ← enqueue receipt
-  [ACK:SPAWN role="Architect" status=ok queue_id=17]                                    ← drain delivered, member live
-  [ACK:SPAWN role="Architect" status=rejected reason=already_exists queue_id=18]
-  [ACK:SPAWN role="Developer" status=rejected reason=idle_available idle="Developer 1" queue_id=19]
-  [ACK:SPAWN role="Developer" status=rejected reason=duplicate_intent existing_queue_id=15]  ← SQL dedupe (same role + same task content within 5min)
-  [ACK:SPAWN role="QA Engineer" status=failed reason=spawn_failed queue_id=20]
-  [ACK:TO target="Developer" status=queued queue_id=42]            ← enqueue receipt
-  [ACK:TO target="Developer 2" status=delivered queue_id=42]       ← later, when drain hands off
-  [ACK:TO target="Developer 5" status=failed reason=delivery_unreachable queue_id=43]
-  [ACK:TO target="Architect" status=failed reason=target_not_found]
-  [ACK:TO target="Developer" status=rejected reason=burst_throttle]
-  [ACK:BROADCAST status=rejected reason=burst_throttle]
-  [ACK:INTERRUPT target="Developer 2" status=ok count=1]
-  [ACK:INTERRUPT target="Developer" status=ok count=2 failed=1]
-  [ACK:INTERRUPT target="Architect" status=failed reason=target_not_found]
-  [ACK:INTERRUPT target="Architect" status=rejected reason=not_lead]
-  [ACK:CLEAR target="Developer" status=queued count=2 queue_ids=[51,52]]                 ← enqueue receipt (one row per matching member)
-  [ACK:CLEAR target="Developer 2" status=ok queue_id=51]                                 ← drain delivered, session was reset
-  [ACK:CLEAR target="Self" status=queued count=1 queue_ids=[53]]                         ← Lead pre-emptive self-clear at workflow boundary
-  [ACK:CLEAR target="Self" status=ok queue_id=53]                                        ← drain delivered AFTER this turn's ResponseComplete
-  [ACK:CLEAR target="Developer" status=rejected reason=cooldown count=0]                 ← clear delivered to that target within last 180s
-  [ACK:CLEAR target="Architect" status=failed reason=target_not_found]
-  [ACK:CANCEL_QUEUED target="Developer" status=ok count=3]
-  [ACK:CANCEL_QUEUED target="Developer" status=ok count=0 queue_id=42]  ← already delivered, nothing to cancel
-
-Status values:
-  ok        — the action completed; proceed with downstream work.
-  queued    — the [TO:Role] task was enqueued; a `delivered` ACK will follow.
-  delivered — the queued task was handed off to a member.
-  rejected  — refused by policy. Do NOT retry the same action — change strategy.
-  failed    — transient error. You MAY retry once after checking [TEAM_STATUS].
-
-Decision matrix (read the `reason` to pick the right next move):
-  - status=queued                   → the task is in the queue with the given queue_id. Don't re-emit. Use [CANCEL_QUEUED:<role>:<queue_id>] to amend before delivery.
-  - status=delivered                → the queued task has reached the member. From here, only [INTERRUPT:<role>] can stop it.
-  - rejected reason=already_exists  → role is on team; use [TO:<role>] instead of spawning.
-  - rejected reason=idle_available  → use [TO:<idle>] (the `idle="..."` field tells you who).
-  - rejected reason=duplicate_intent → an identical [SPAWN:Role] with the same task content was enqueued in the last 5 minutes (existing_queue_id given). Wait for its ACK rather than re-emitting; this is the SQL dedupe catching a re-emission.
-  - rejected reason=burst_throttle  → you fired the same target/broadcast within ~10s. Stop — the prior intent is in flight.
-  - rejected reason=cooldown        → that target's `/clear` (auto or manual or self) ran within the last ~3min. Wait it out, or use [TEAM_STATUS] and try again later.
-  - rejected reason=not_lead        → control marker is Lead-only. Members can't [INTERRUPT:], [CLEAR:], or [CANCEL_QUEUED:].
-  - failed   reason=target_not_found → roster is missing that role; [SPAWN:<role>] or pick a different target.
-  - failed   reason=delivery_unreachable → member's session died between enqueue and drain; [TEAM_STATUS], then re-spawn or reassign.
-  - failed   reason=spawn_failed    → check [TEAM_STATUS]; one retry permitted, then escalate to user.
-
-ACKs may arrive in the NEXT turn rather than the current one (the system pushes
-them as a follow-up message on the bidi stream, which buffers until your turn
-completes). If you do not see an [ACK:...] line at the start of your NEXT turn
-after emitting a marker, then assume the marker was malformed (not at line
-start, missing [/MSG], etc.) and re-emit it correctly. Do not re-emit
-mid-turn just because you don't see an ACK yet — that's the source of the
-spurious-double-spawn class of bugs.
-
-**PR Review Gate**: Team members use [PR_READY:N] and [PR_REVIEWED:N] markers. The system ensures they address Claude Reviewer CI comments before the PR reaches you. You will receive a notification when a PR has passed the review gate.
+## PR Review Gate
+Members signal PR lifecycle through `team pr-ready <N>` and `team pr-reviewed
+<N>`. The system gates PR delivery to you on the Claude Reviewer CI passing
+PLUS the member running `team pr-reviewed <N>`. Only PRs that arrive with
+"review gate PASSED" in the message body are cleared for merge.
 
 ## Your Responsibilities
 {responsibilities}
 
 ## Task Assignment Protocol
-- [TO:Role] enqueues — the task waits in the database until the role has an idle member, then delivers
-- You can pile up multiple [TO:Role] messages; they will deliver in FIFO order as members free up
-- DO NOT retry an enqueued task on a `queued` ACK — it's already in the queue
-- If you change your mind before delivery, use [CANCEL_QUEUED:Role:N] (specific) or [CANCEL_QUEUED:Role] (all to that role) — then re-emit the corrected [TO:Role]
-- After delivery (`delivered` ACK), only [INTERRUPT:Role] can stop the work
-- Do NOT assign the same task to multiple developers unless you explicitly want parallel approaches
-- Use [TEAM_STATUS] to inspect roster + queue depth
+- `team to <role>` enqueues — the task waits in the DB until the role has an idle member.
+- Pile up multiple `team to` calls; they FIFO-deliver as members free.
+- Don't retry on `status=queued` — it's already in the queue.
+- If you change your mind before delivery, `team cancel <queue_id>` then re-issue.
+- After delivery (member starts running), only `team interrupt` can stop the work.
+- Don't assign the same task to multiple developers unless you want parallel approaches.
+- Run `team status` to inspect roster + queue depth + rate-limit state.
+- Before spawning, ALWAYS check `team status` — `team spawn` is rejected
+  (exit 4) when a same-role same-task is in flight. Prefer `team to` to
+  reuse an idle existing member.
 
 ## Context Hygiene at Workflow Boundaries
-The system gives you durable amnesia points — use them. Long-running coordination
-sessions that never clear accumulate per-PR review chatter, debugging traces, and
-exploratory diffs that bear no value once the work has merged. Auto-clear at 90%
-will eventually fire, but it's an emergency wipe; prefer voluntary clears at
-phase boundaries where the workflow is naturally re-enterable from durable
-GitHub state.
+Long-running coordination sessions accumulate per-PR review chatter and
+exploratory diffs that bear no value once work merges. Auto-clear at 90% will
+eventually fire, but it's an emergency wipe; prefer voluntary clears at phase
+boundaries.
 
-**Self-clear** — emit `[CLEAR:Self]` as the LAST marker in your response after:
+**Self-clear** — `team clear Self` as the LAST CLI call in your response after:
 - Acknowledging an approved spec from the Architect, before invoking `plan`
 - Finishing a `plan` tool call, before spawning developers for the new stories
 - Merging a story PR, before reviewing or assigning the next one
 
-`[CLEAR:Self]` is mid-turn-safe by construction (the queued clear fires on this
-turn's ResponseComplete, after the response has streamed). After the clear you
-receive [TEAM_STATUS] + [POST_CLEAR_BRIEFING] reconstructing roster + queued
-tasks + member current_tasks. You wake up oriented for the next phase without
-the prior phase's working memory.
+`team clear Self` is mid-turn-safe by construction (the queued clear fires on
+this turn's ResponseComplete, after the response has streamed). After the clear
+you receive a `POST_CLEAR_BRIEFING` reconstructing roster + queued tasks +
+member current_tasks. You wake up oriented for the next phase.
 
-**Member-clear** — emit `[CLEAR:Role]` BEFORE the next `[TO:Role]` after:
+**Member-clear** — `team clear <Role>` BEFORE the next `team to <Role>` after:
 - Merging a Developer's PR (story done; clear them before assigning the next story)
-- The Architect finishes a spec / `architecture` / clarification round (before next assignment)
-- Any member completes a multi-turn deliverable and you're handing them a different deliverable
+- The Architect finishes a spec / `architecture` / clarification round
+- Any member completes a multi-turn deliverable and you're reassigning them
 
-The canonical pattern (drain serializes; clear fires first, then the new task
-hits a clean session):
+The canonical pattern (drain serializes — the clear fires first, then the new
+task hits a clean session):
 ```
-[CLEAR:Developer 2]
-[TO:Developer 2] start work on Story I [/MSG]
+team clear "Developer 2"
+team to "Developer 2" "start work on Story I"
 ```
 
-Do NOT clear mid-story or mid-deliverable; only at completion boundaries. The
-member's per-task working memory (file paths, debugging context) is load-bearing
-within a story but irrelevant once the PR merges.
+Don't clear mid-story or mid-deliverable; only at completion boundaries.
 
 ## Development Workflow (spec-flow)
-The team follows the spec-flow workflow. Coordinate members through these phases IN ORDER:
+Coordinate members through these phases IN ORDER:
 
-1. **Specify** (Architect): Spawn Architect first to use the spec-flow `specify` tool for spec issues, `clarify` to resolve gaps
+1. **Specify** (Architect): `team spawn Architect "use spec-flow specify..."`, `clarify` to resolve gaps
 2. **Plan** (You): Once specs are approved, use the spec-flow `plan` tool to break specs into stories
-3. **Implement** (Developers): Only AFTER stories exist, spawn Developers who use the spec-flow `implement` tool for each story
-4. **Review** (You): Review PRs using gh CLI, delegate fixes via [TO:Role], merge when CI passes
+3. **Implement** (Developers): Only AFTER stories exist, `team spawn Developer "..."` for each story
+4. **Review** (You): Review PRs using gh CLI, delegate fixes via `team to <role>`, merge when CI passes
 
 IMPORTANT: Do NOT spawn Developers until stories have been planned from approved specs.
 
 ## PR Review & Completion
-Team members use the [PR_READY:N] / [PR_REVIEWED:N] review gate. The Claude Reviewer CI automatically reviews PRs and will APPROVE them once all comments are addressed. PRs only reach you after the Claude Reviewer has approved AND the team member has completed the gate.
-
-**CRITICAL MERGE RULE**: NEVER merge a PR unless you received an explicit "review gate PASSED" notification from the system for that specific PR number. If a team member mentions a PR via [TO:Team Lead] without the review gate notification, do NOT merge it — tell them to use [PR_READY:N] first. Only PRs delivered to you with "review gate PASSED" in the message are cleared for merge.
+**CRITICAL MERGE RULE**: NEVER merge a PR unless you received an explicit
+"review gate PASSED" notification from the system for that specific PR number.
+If a team member mentions a PR via `team to "Team Lead"` without the review
+gate notification, do NOT merge it — tell them to run `team pr-ready <N>` first.
 
 When you receive a review-gate-passed PR notification:
 
-1. **Verify Claude Reviewer approved**: `gh pr view <number> --json reviews --jq '.reviews[] | "\(.state): \(.body)"'` — confirm the Claude Reviewer has APPROVED
+1. **Verify Claude Reviewer approved**: `gh pr view <number> --json reviews --jq '.reviews[] | "\(.state): \(.body)"'`
 2. **Verify all CI passes**: `gh pr checks <number>` — all checks must be green
-3. **Review the diff**: `gh pr view <number>` and `gh pr diff <number>` — sanity-check the implementation
-4. **Verify architectural alignment**: Complex fixes (interface changes, new dependencies, restructuring, security patterns) should have been escalated to the Architect during the review gate. Check that the Architect approved these changes before merging. If you see architectural changes without Architect sign-off, send the PR back.
-5. If changes needed, send SPECIFIC feedback via [TO:Role] with file paths, line numbers, and what needs to change
+3. **Review the diff**: `gh pr view <number>` and `gh pr diff <number>`
+4. **Verify architectural alignment**: complex fixes should have been escalated to the Architect during the review gate.
+5. If changes needed, send SPECIFIC feedback via `team to <role> "<file:line — what to change>"`
 6. Wait for fixes before re-reviewing — do not merge until Claude Reviewer has approved and all CI passes
 7. After merging implementation PRs, ask Architect to run the spec-flow `architecture` tool to update project docs
-8. Merge with `gh pr merge <number> --squash` ONLY when ALL of the above are satisfied"#,
+8. Merge with `gh pr merge <number> --squash` ONLY when ALL of the above are satisfied
+9. Run `team pr-merged <number>` as the LAST step — this queues your self-clear at the workflow boundary so the next PR review starts with a clean context"#,
     ))
 }
 
@@ -4044,43 +4558,53 @@ fn build_team_member_prompt(role: &StoredTeamRole) -> String {
     format!(
         r#"You are the **{display_name}** on a development team.
 
-## Communication Markers
-CRITICAL: All markers MUST start at the beginning of a new line. Do NOT embed markers in the middle of a sentence or paragraph — they will be ignored. Each marker must be the first thing on its line.
-  [TO:Role Name] message [/MSG]
-  [TO:Role Name]
-  Multi-line message
-  [/MSG]
-  [BROADCAST] message [/MSG]
-  [TEAM_STATUS]
-[/MSG] must also be on its own line when ending a multi-line message.
+## Team CLI (the `team` binary)
+All cross-member communication flows through the `team` CLI. Invoke it from
+the `Bash` tool. There is NO marker grammar — do not emit `[TO:...]` etc. in
+your response text; those are no longer parsed.
+
+Verbs you'll use:
+  team status                            Roster + queue depth.
+  team to "<role>" "<message>"           Send a message to another member.
+  team to "Team Lead" "<summary>"        How you report results back.
+  team clear Self                        Reset YOUR OWN context. Cooldown applies.
+
+The Team Lead also has `team spawn`, `team interrupt`, `team cancel`, `team
+clear <other-role>` — those are Lead-only and exit 3 if you try them.
 
 Messages from other members arrive prefixed with their role.
-Each message you receive will include a [TEAM: ...] header with the current roster.
+Every message you receive includes a `[TEAM: ...]` header with the current roster.
 
 ## Your Responsibilities
 {responsibilities}
 
 ## Workflow
-- Wait for task assignment from the Team Lead before starting work
-- ALWAYS report back to the Team Lead when your task is complete using [TO:Team Lead] with a summary of what you did
-- After completing any assigned work (reviews, architecture updates, analysis), notify Team Lead: [TO:Team Lead] with results
-- Address review feedback promptly when delegated by Team Lead
-- Do NOT start new work until your current PR is merged or you are reassigned
-- One task at a time — finish current work before accepting new assignments
-- IMPORTANT: Never finish a response without sending [TO:Team Lead] — the Team Lead cannot see your work unless you explicitly send it
+- Wait for task assignment from the Team Lead before starting work.
+- ALWAYS report back to the Team Lead when your task is complete via
+  `team to "Team Lead" "<summary of what you did>"`.
+- After completing any assigned work (reviews, architecture updates, analysis),
+  notify Team Lead with results.
+- Address review feedback promptly when delegated by Team Lead.
+- Do NOT start new work until your current PR is merged or you are reassigned.
+- One task at a time — finish current work before accepting new assignments.
+- IMPORTANT: Never finish a response without `team to "Team Lead" "..."` — the
+  Team Lead cannot see your work unless you explicitly send it.
 
 ## PR Review Gate (IMPORTANT)
-After creating a PR, do NOT send it directly to the Team Lead. Instead use the review gate:
-1. Signal the PR is ready: `[PR_READY:N]` (where N is the PR number)
-2. The system will instruct you to wait for the Claude Reviewer CI to post its review
-3. If the Claude Reviewer **APPROVES** → skip to step 7
+After creating a PR, do NOT send it directly to the Team Lead via `team to`.
+Use the review gate:
+
+1. `team pr-ready <N>` (N = PR number) — signals the PR is ready and triggers the Claude Reviewer CI gate.
+2. The system will instruct you to wait for the Claude Reviewer CI to post its review.
+3. If the Claude Reviewer **APPROVES** → skip to step 7.
 4. If it **REQUESTS CHANGES** — categorise each comment as Simple or Complex:
    - **Simple** (fix yourself): code style, naming, missing error handling, missing tests, minor localised bugs, dead code
    - **Complex** (escalate to Architect): interface/API changes, new dependencies, module restructuring, security/auth pattern changes, design pattern deviations, schema changes
-5. Fix Simple issues with actual code changes (documentation-only fixes are NOT acceptable)
-6. For Complex issues: send your proposed solution to the Architect via [TO:Architect] — wait for their feedback, then implement. Push fixes and repeat from step 2 until the Claude Reviewer APPROVES.
-7. Signal completion: `[PR_REVIEWED:N]` — the system notifies the Team Lead for final review and merge
-Do NOT use [TO:Team Lead] for PR notifications — use [PR_READY:N] and [PR_REVIEWED:N] instead."#,
+5. Fix Simple issues with actual code changes (documentation-only fixes are NOT acceptable).
+6. For Complex issues: `team to "Architect" "<proposed solution>"` — wait for their feedback, then implement. Push fixes and repeat from step 2 until the Claude Reviewer APPROVES.
+7. `team pr-reviewed <N>` — confirms review comments are addressed and forwards the PR to the Team Lead.
+
+Do NOT use `team to "Team Lead"` for PR notifications — use `team pr-ready <N>` and `team pr-reviewed <N>`."#,
         display_name = role.display_name,
         responsibilities = role.responsibilities,
     )
@@ -4155,214 +4679,6 @@ fn truncate_preview(s: &str, max_bytes: usize) -> String {
     }
 }
 
-/// Route a message from one team member to another (or all matching a role).
-/// `[TO:Developer]` fans out to "Developer", "Developer 1", "Developer 2", etc.
-async fn route_team_message(
-    state: &Arc<AppState>,
-    sender_session_id: &str,
-    sender_role: &str,
-    target_role: &str,
-    message: &str,
-    team_id: &str,
-    _channel_id: &str,
-) {
-    // Burst throttle (rephrase-tolerant): if this sender already fired a
-    // [TO:<target_role>] within BURST_THROTTLE_TTL — regardless of message
-    // content — drop with a visible rejection. This catches LLM-stutter that
-    // rewords the intent (which would slip past the message-hash dedupe below).
-    let throttle_key = format!("{}|{}|TO|{}", team_id, sender_session_id, target_role);
-    if seen_within(&state.to_throttle, throttle_key, BURST_THROTTLE_TTL) {
-        tracing::info!(
-            team_id, target_role,
-            "Throttled [TO:{}] burst within {}s window",
-            target_role, BURST_THROTTLE_TTL.as_secs()
-        );
-        if let Ok(Some(sender)) = state
-            .db
-            .get_session_by_id_prefix(&sender_session_id[..8.min(sender_session_id.len())])
-            .await
-        {
-            let ack = format!(
-                "[ACK:TO target=\"{}\" status=rejected reason=burst_throttle]",
-                target_role,
-            );
-            let _ = state.containers.send(&sender.session_id, &format!(
-                "{}\nBurst throttle: another [TO:{}] from you fired within the last {}s. Wait before retrying — a follow-up so soon is almost always an LLM-stutter.",
-                ack, target_role, BURST_THROTTLE_TTL.as_secs(),
-            )).await;
-        }
-        return;
-    }
-
-    // Suppress duplicate [TO:Role] markers: identical (sender, target, message)
-    // within INTENT_DEDUPE_TTL is dropped. Catches LLM-stutter and replayed
-    // markers that would otherwise fan the same task to multiple members.
-    let dedupe_key = intent_key(team_id, sender_session_id, "TO", target_role, message);
-    if intent_seen_recently(&state.intent_dedupe, dedupe_key) {
-        tracing::info!(
-            team_id, target_role,
-            "Suppressed duplicate [TO:{}] within {}s window",
-            target_role, INTENT_DEDUPE_TTL.as_secs()
-        );
-        return;
-    }
-
-    // Verify the target role exists on the team. We retry briefly because a
-    // just-emitted [SPAWN:Role] may not have its sessions row visible yet —
-    // without the retry, a "spawn then immediately TO" pattern would falsely
-    // reject. If still missing after retries, reject upfront so the Lead can
-    // spawn first; otherwise we'd just be enqueuing tasks that can never drain.
-    let mut targets = Vec::new();
-    for attempt in 0..6 {
-        match state.db.get_sessions_by_role(team_id, target_role).await {
-            Ok(sessions) if !sessions.is_empty() => {
-                targets = sessions;
-                break;
-            }
-            Ok(_) => {
-                if attempt < 5 {
-                    tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-                } else {
-                    if let Ok(Some(sender)) = state
-                        .db
-                        .get_session_by_id_prefix(
-                            &sender_session_id[..8.min(sender_session_id.len())],
-                        )
-                        .await
-                    {
-                        let _ = state
-                            .mm
-                            .post_in_thread(
-                                &sender.channel_id,
-                                &sender.thread_id,
-                                &format!(
-                                    ":warning: No active team member with role **{}**.",
-                                    target_role
-                                ),
-                            )
-                            .await;
-                        let ack = format!(
-                            "[ACK:TO target=\"{}\" status=failed reason=target_not_found]",
-                            target_role,
-                        );
-                        let _ = state
-                            .containers
-                            .send(
-                                &sender.session_id,
-                                &format!(
-                                    "{}\nNo active team member with role {}. Use [TEAM_STATUS] to inspect the roster, or [SPAWN:{}] to add one.",
-                                    ack, target_role, target_role,
-                                ),
-                            )
-                            .await;
-                    }
-                    return;
-                }
-            }
-            Err(e) => {
-                tracing::error!(error = %e, "Failed to look up team member by role");
-                return;
-            }
-        }
-    }
-
-    // Prefix vs exact: [TO:Developer] (multiple matches OR single match where
-    // the stored role differs from the marker — e.g. "Developer 1") is a
-    // prefix match. The drain uses this to decide whether any idle member of
-    // the role qualifies, or only the named one.
-    let is_prefix_match = targets.len() > 1
-        || (targets.len() == 1
-            && targets[0]
-                .role
-                .as_deref()
-                .map(|r| r != target_role)
-                .unwrap_or(false));
-
-    // Always-enqueue: persist the task in team_task_queue, then drain. Drain
-    // observes idle targets and atomically claims them; if all are busy the
-    // task waits in the queue for the next ResponseComplete to free a slot.
-    // This is what gives the Lead the ability to [CANCEL_QUEUED:Role] before
-    // delivery — claude-code's stdin buffer no longer hides messages from us.
-    let task_id = match state
-        .db
-        .enqueue_team_task(
-            team_id,
-            target_role,
-            is_prefix_match,
-            sender_session_id,
-            sender_role,
-            message,
-            None,
-        )
-        .await
-    {
-        Ok(id) => id,
-        Err(e) => {
-            tracing::error!(error = %e, team_id, target_role, "Failed to enqueue team task");
-            if let Ok(Some(sender)) = state
-                .db
-                .get_session_by_id_prefix(&sender_session_id[..8.min(sender_session_id.len())])
-                .await
-            {
-                let ack = format!(
-                    "[ACK:TO target=\"{}\" status=failed reason=enqueue_failed]",
-                    target_role,
-                );
-                let _ = state
-                    .containers
-                    .send(&sender.session_id, &format!("{}\nQueue write failed.", ack))
-                    .await;
-            }
-            return;
-        }
-    };
-
-    // LLM-side ACK fires immediately so the Lead's session sees the queue_id
-    // and can [CANCEL_QUEUED:Role:N] before delivery. The Mattermost mirror is
-    // deferred until after drain — see below.
-    let sender_lookup = state
-        .db
-        .get_session_by_id_prefix(&sender_session_id[..8.min(sender_session_id.len())])
-        .await;
-    if let Ok(Some(ref sender)) = sender_lookup {
-        let ack = format!(
-            "[ACK:TO target=\"{}\" status=queued queue_id={}]",
-            target_role, task_id,
-        );
-        let _ = state.containers.send(&sender.session_id, &format!(
-            "{}\nQueued for {}. Use [CANCEL_QUEUED:{}] or [CANCEL_QUEUED:{}:{}] to amend before delivery; you'll receive [ACK:TO ... status=delivered queue_id={}] when it lands.",
-            ack, target_role, target_role, target_role, task_id, task_id,
-        )).await;
-    }
-
-    // Drain inline. Per-team mutex inside drain_team_queue serializes overlapping
-    // calls so two ResponseCompletes can't double-deliver. We capture the set of
-    // task_ids actually delivered so we can suppress the "Queued for…" mirror
-    // when delivery happened in this same call (otherwise the Lead's thread gets
-    // both ":outbox_tray: Queued" and ":arrow_right: Delivered" with identical
-    // bodies seconds apart).
-    let delivered_now = drain_team_queue(state, team_id).await;
-
-    // Only publish the human-facing "Queued" mirror if delivery actually waited.
-    // The mirror is intentionally body-less — the body lands in the "Delivered
-    // to…" post when the drain hands it off, so no need to repeat it here.
-    if !delivered_now.contains(&task_id)
-        && let Ok(Some(sender)) = sender_lookup
-    {
-        let _ = state
-            .mm
-            .post_in_thread(
-                &sender.channel_id,
-                &sender.thread_id,
-                &format!(
-                    ":outbox_tray: **Queued for {}** (queue_id={}) — awaiting capacity. `[CANCEL_QUEUED:{}:{}]` to amend.",
-                    target_role, task_id, target_role, task_id,
-                ),
-            )
-            .await;
-    }
-}
-
 /// Drain queued tasks for a team. Walks the queue oldest-first, atomically
 /// claims an idle target per task, sends the message via `containers.send`,
 /// and emits the delivery ACK to the sender. Per-team mutex serializes
@@ -4390,6 +4706,20 @@ async fn drain_team_queue(state: &Arc<AppState>, team_id: &str) -> Vec<i64> {
     let _guard = lock.lock().await;
 
     let mut delivered_ids: Vec<i64> = Vec::new();
+
+    // Hold delivery while the upstream rate-limit window is closed. The
+    // scheduled-drain ticker flips the row back to `allowed` once
+    // `resets_at` has passed and re-runs this drain.
+    match state.db.is_team_rate_limited(team_id).await {
+        Ok(true) => {
+            tracing::debug!(team_id, "drain_team_queue: skipped (rate-limited)");
+            return delivered_ids;
+        }
+        Ok(false) => {}
+        Err(e) => {
+            tracing::warn!(error = %e, team_id, "drain_team_queue: rate-limit lookup failed; proceeding");
+        }
+    }
 
     let queued = match state.db.list_queued_tasks_for_team(team_id).await {
         Ok(q) => q,
@@ -4447,7 +4777,6 @@ async fn drain_one_message(
             .db
             .mark_task_failed(task.task_id, "target_not_found")
             .await;
-        send_drain_ack(state, task, &task.target_role, "failed", "target_not_found").await;
         return false;
     }
 
@@ -4511,11 +4840,14 @@ async fn drain_one_message(
 
     match state.containers.send(&target.session_id, &formatted).await {
         Ok(()) => {
+            // Message tasks have a meaningful in-flight phase: the member is
+            // working on the prompt until ResponseComplete. Park the row in
+            // 'running' until that signal lands (or until rate-limit / error
+            // forces it back to 'queued').
             let _ = state
                 .db
-                .mark_task_delivered(task.task_id, &target.session_id)
+                .mark_task_running(task.task_id, &target.session_id)
                 .await;
-            send_drain_ack(state, task, role, "delivered", "").await;
             post_to_coordination_log(
                 state,
                 team_id,
@@ -4539,7 +4871,6 @@ async fn drain_one_message(
                 .db
                 .mark_task_failed(task.task_id, "delivery_unreachable")
                 .await;
-            send_drain_ack(state, task, role, "failed", "delivery_unreachable").await;
             false
         }
     }
@@ -4583,12 +4914,12 @@ async fn drain_one_spawn(state: &Arc<AppState>, team_id: &str, task: &StoredTeam
         SpawnOutcome::Delivered => {
             // We don't have a single target_session_id to record (the new
             // member's session_id is internal to handle_team_spawn). Record
-            // the sender's session_id as a placeholder; mark_task_delivered
+            // the sender's session_id as a placeholder; mark_task_completed
             // requires a non-null target. The semantic value here is "the
-            // task is no longer pending."
+            // spawn finished — task is no longer pending."
             let _ = state
                 .db
-                .mark_task_delivered(task.task_id, &task.sender_session_id)
+                .mark_task_completed(task.task_id, &task.sender_session_id)
                 .await;
             true
         }
@@ -4639,7 +4970,7 @@ async fn drain_one_clear(state: &AppState, team_id: &str, task: &StoredTeamTask)
         Ok(_) => {
             let _ = state
                 .db
-                .mark_task_delivered(task.task_id, &target.session_id)
+                .mark_task_completed(task.task_id, &target.session_id)
                 .await;
             // Re-inject roster so the cleared session retains team context.
             handle_team_status(state, &target.session_id, team_id).await;
@@ -4652,11 +4983,6 @@ async fn drain_one_clear(state: &AppState, team_id: &str, task: &StoredTeamTask)
             let is_lead = target.role.as_deref() == Some("Team Lead");
             let briefing = build_post_clear_briefing(state, team_id, &target, reason, is_lead).await;
             let _ = state.containers.send(&target.session_id, &briefing).await;
-
-            // ACK back to the originator (might be the Lead, might be the
-            // session itself for [CLEAR:Self], might be the system for
-            // auto-clear at 90% — sender_session_id covers all three).
-            send_clear_ack(state, task, target_role_label, "ok", "").await;
 
             // Mattermost mirror so the human reader sees the clear.
             let mm_msg = if is_self {
@@ -4684,41 +5010,11 @@ async fn drain_one_clear(state: &AppState, team_id: &str, task: &StoredTeamTask)
             tracing::warn!(error = %e, session_id = %target.session_id, target_role = target_role_label,
                 "Drain: clear RPC failed");
             let _ = state.db.mark_task_failed(task.task_id, "clear_failed").await;
-            send_clear_ack(state, task, target_role_label, "failed", "clear_failed").await;
             false
         }
     }
 }
 
-/// Send an [ACK:CLEAR ...] line back to the originating session. Mirrors
-/// `send_drain_ack` but emits the CLEAR-shaped marker.
-async fn send_clear_ack(
-    state: &AppState,
-    task: &StoredTeamTask,
-    target_label: &str,
-    status: &str,
-    reason: &str,
-) {
-    let Ok(Some(sender)) = state
-        .db
-        .get_session_by_id_prefix(&task.sender_session_id[..8.min(task.sender_session_id.len())])
-        .await
-    else {
-        return;
-    };
-    let ack = if reason.is_empty() {
-        format!(
-            "[ACK:CLEAR target=\"{}\" status={} queue_id={}]",
-            target_label, status, task.task_id,
-        )
-    } else {
-        format!(
-            "[ACK:CLEAR target=\"{}\" status={} reason={} queue_id={}]",
-            target_label, status, reason, task.task_id,
-        )
-    };
-    let _ = state.containers.send(&sender.session_id, &ack).await;
-}
 
 /// Build the [POST_CLEAR_BRIEFING] payload injected into a freshly-cleared
 /// session. Reconstructs in-flight working state from durable DB sources so
@@ -4838,634 +5134,7 @@ fn breakpoint_next_hint(reason: &str) -> &'static str {
     "Next: continue normally."
 }
 
-/// Send a drain-side ACK to the original sender. Status values:
-///  - "delivered" with empty `reason` → `[ACK:TO ... status=delivered queue_id=N]`
-///  - "failed" with reason → `[ACK:TO ... status=failed reason=... queue_id=N]`
-async fn send_drain_ack(
-    state: &AppState,
-    task: &StoredTeamTask,
-    delivered_role: &str,
-    status: &str,
-    reason: &str,
-) {
-    let Ok(Some(sender)) = state
-        .db
-        .get_session_by_id_prefix(&task.sender_session_id[..8.min(task.sender_session_id.len())])
-        .await
-    else {
-        return;
-    };
-    let ack = if reason.is_empty() {
-        format!(
-            "[ACK:TO target=\"{}\" status={} queue_id={}]",
-            delivered_role, status, task.task_id,
-        )
-    } else {
-        format!(
-            "[ACK:TO target=\"{}\" status={} reason={} queue_id={}]",
-            delivered_role, status, reason, task.task_id,
-        )
-    };
-    let body = if status == "delivered" {
-        format!(
-            "{}\nDelivery receipt: queued task {} delivered to {}.",
-            ack, task.task_id, delivered_role,
-        )
-    } else if reason == "delivery_unreachable" {
-        format!(
-            "{}\n:x: Queued task {} could not be delivered to {} — their session may have died.\nUse [TEAM_STATUS] to check the roster; you may need to re-spawn the role.",
-            ack, task.task_id, delivered_role,
-        )
-    } else {
-        format!(
-            "{}\nQueued task {} could not be delivered to {} (reason={}).",
-            ack, task.task_id, delivered_role, reason,
-        )
-    };
-    let _ = state.containers.send(&sender.session_id, &body).await;
 
-    // Mattermost mirror for delivered tasks (failures are already noisy in logs)
-    if status == "delivered" {
-        let _ = state
-            .mm
-            .post_in_thread(
-                &sender.channel_id,
-                &sender.thread_id,
-                &format!(
-                    ":arrow_right: **Delivered to {}** (queue_id={}):\n{}",
-                    delivered_role,
-                    task.task_id,
-                    truncate_preview(&task.message, 4000),
-                ),
-            )
-            .await;
-    }
-}
-
-/// Handle [INTERRUPT:Role] — Lead aborts the in-flight turn(s) of a member.
-///
-/// Reuses the existing `containers.interrupt()` → gRPC `Interrupt` RPC path.
-/// Does NOT manually clear `pending_task_from`; the natural `ResponseComplete`
-/// event that follows the interrupt handles that (and triggers any drain).
-///
-/// Prefix matches (e.g. `[INTERRUPT:Developer]`) interrupt every matching
-/// member. Use the exact role to target one.
-async fn handle_team_interrupt(
-    state: &AppState,
-    sender_session_id: &str,
-    sender_role: &str,
-    target_role: &str,
-    team_id: &str,
-) {
-    // Lead-only: stopping a member's work mid-turn is a control-plane action.
-    if sender_role != "Team Lead" {
-        if let Ok(Some(sender)) = state
-            .db
-            .get_session_by_id_prefix(&sender_session_id[..8.min(sender_session_id.len())])
-            .await
-        {
-            let ack = format!(
-                "[ACK:INTERRUPT target=\"{}\" status=rejected reason=not_lead]",
-                target_role,
-            );
-            let _ = state
-                .containers
-                .send(
-                    &sender.session_id,
-                    &format!(
-                        "{}\n[INTERRUPT:Role] is reserved for the Team Lead.",
-                        ack
-                    ),
-                )
-                .await;
-        }
-        return;
-    }
-
-    let targets = match state.db.get_sessions_by_role(team_id, target_role).await {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::error!(error = %e, team_id, target_role, "Failed to look up interrupt targets");
-            return;
-        }
-    };
-
-    if targets.is_empty() {
-        if let Ok(Some(sender)) = state
-            .db
-            .get_session_by_id_prefix(&sender_session_id[..8.min(sender_session_id.len())])
-            .await
-        {
-            let ack = format!(
-                "[ACK:INTERRUPT target=\"{}\" status=failed reason=target_not_found]",
-                target_role,
-            );
-            let _ = state
-                .containers
-                .send(
-                    &sender.session_id,
-                    &format!(
-                        "{}\nNo active team member matches role {}.",
-                        ack, target_role
-                    ),
-                )
-                .await;
-        }
-        return;
-    }
-
-    let mut ok_roles: Vec<String> = Vec::new();
-    let mut failed_roles: Vec<String> = Vec::new();
-    for t in &targets {
-        let role = t.role.as_deref().unwrap_or(target_role);
-        match state.containers.interrupt(&t.session_id).await {
-            Ok(true) => {
-                ok_roles.push(role.to_string());
-                let _ = state
-                    .mm
-                    .post_in_thread(
-                        &t.channel_id,
-                        &t.thread_id,
-                        ":octagonal_sign: **Interrupted by Team Lead** — current turn aborted.",
-                    )
-                    .await;
-            }
-            Ok(false) => {
-                failed_roles.push(role.to_string());
-                tracing::warn!(
-                    session_id = %t.session_id, role,
-                    "Interrupt RPC returned success=false (no in-flight turn?)"
-                );
-            }
-            Err(e) => {
-                failed_roles.push(role.to_string());
-                tracing::warn!(error = %e, session_id = %t.session_id, role,
-                    "Interrupt RPC failed");
-            }
-        }
-    }
-
-    if let Ok(Some(sender)) = state
-        .db
-        .get_session_by_id_prefix(&sender_session_id[..8.min(sender_session_id.len())])
-        .await
-    {
-        let ack = if failed_roles.is_empty() {
-            format!(
-                "[ACK:INTERRUPT target=\"{}\" status=ok count={}]",
-                target_role,
-                ok_roles.len(),
-            )
-        } else if ok_roles.is_empty() {
-            format!(
-                "[ACK:INTERRUPT target=\"{}\" status=failed reason=rpc_failed count={}]",
-                target_role,
-                failed_roles.len(),
-            )
-        } else {
-            format!(
-                "[ACK:INTERRUPT target=\"{}\" status=ok count={} failed={}]",
-                target_role,
-                ok_roles.len(),
-                failed_roles.len(),
-            )
-        };
-        let body = if failed_roles.is_empty() {
-            format!(
-                "{}\nInterrupted: {}. Their next ResponseComplete will free the slot for new tasks.",
-                ack,
-                ok_roles.join(", ")
-            )
-        } else {
-            format!(
-                "{}\nInterrupted: {}. Failed: {}. Check [TEAM_STATUS] — failed targets may already be idle.",
-                ack,
-                ok_roles.join(", "),
-                failed_roles.join(", "),
-            )
-        };
-        let _ = state.containers.send(&sender.session_id, &body).await;
-    }
-
-    post_to_coordination_log(
-        state,
-        team_id,
-        &format!(
-            ":octagonal_sign: **{} interrupted {}** — ok: [{}] failed: [{}]",
-            sender_role,
-            target_role,
-            ok_roles.join(", "),
-            failed_roles.join(", "),
-        ),
-    )
-    .await;
-}
-
-/// Handle [CLEAR:Role] — Lead clears context on a member's session, OR
-/// `[CLEAR:Self]` — Lead pre-emptively clears its OWN session at a workflow
-/// boundary (between specs/plans/PR-merges). Both flow through the queue:
-/// each resolved target gets one queued clear row, drained by `drain_one_clear`
-/// when the target reaches end-of-turn. The drain side wipes the SDK client,
-/// re-injects [TEAM_STATUS], and ACKs back. Cooldown is enforced at enqueue
-/// time by `enqueue_team_clear` (SQL MAX(delivered_at) lookup), so manual +
-/// auto + self can't ping-pong.
-async fn handle_team_clear(
-    state: &Arc<AppState>,
-    sender_session_id: &str,
-    sender_role: &str,
-    target_role: &str,
-    team_id: &str,
-) {
-    if sender_role != "Team Lead" {
-        if let Ok(Some(sender)) = state
-            .db
-            .get_session_by_id_prefix(&sender_session_id[..8.min(sender_session_id.len())])
-            .await
-        {
-            let ack = format!(
-                "[ACK:CLEAR target=\"{}\" status=rejected reason=not_lead]",
-                target_role,
-            );
-            let _ = state
-                .containers
-                .send(
-                    &sender.session_id,
-                    &format!(
-                        "{}\n[CLEAR:Role] is reserved for the Team Lead.",
-                        ack
-                    ),
-                )
-                .await;
-        }
-        return;
-    }
-
-    // Resolve targets. [CLEAR:Self] resolves to the Lead's own session;
-    // [CLEAR:Role] resolves to every matching member.
-    let targets: Vec<StoredSession> = if target_role.eq_ignore_ascii_case("self") {
-        match state
-            .db
-            .get_session_by_id_prefix(&sender_session_id[..8.min(sender_session_id.len())])
-            .await
-        {
-            Ok(Some(s)) => vec![s],
-            _ => vec![],
-        }
-    } else {
-        state
-            .db
-            .get_sessions_by_role(team_id, target_role)
-            .await
-            .unwrap_or_default()
-    };
-
-    if targets.is_empty() {
-        if let Ok(Some(sender)) = state
-            .db
-            .get_session_by_id_prefix(&sender_session_id[..8.min(sender_session_id.len())])
-            .await
-        {
-            let ack = format!(
-                "[ACK:CLEAR target=\"{}\" status=failed reason=target_not_found]",
-                target_role,
-            );
-            let _ = state
-                .containers
-                .send(
-                    &sender.session_id,
-                    &format!(
-                        "{}\nNo active team member matches role {}.",
-                        ack, target_role
-                    ),
-                )
-                .await;
-        }
-        return;
-    }
-
-    let mut queued_ids: Vec<i64> = Vec::new();
-    let mut cooldown_targets: Vec<(String, i64)> = Vec::new(); // (label, secs_remaining)
-    let mut failed_targets: Vec<String> = Vec::new();
-    let reason_label = if target_role.eq_ignore_ascii_case("self") {
-        "self"
-    } else {
-        "manual"
-    };
-    for t in &targets {
-        let label = t.role.as_deref().unwrap_or(target_role).to_string();
-        match state
-            .db
-            .enqueue_team_clear(
-                team_id,
-                &label,
-                &t.session_id,
-                sender_session_id,
-                sender_role,
-                reason_label,
-                AUTO_CLEAR_COOLDOWN_SECS as i64,
-            )
-            .await
-        {
-            Ok(EnqueueClearResult::Enqueued(id)) | Ok(EnqueueClearResult::AlreadyQueued(id)) => {
-                queued_ids.push(id);
-            }
-            Ok(EnqueueClearResult::Cooldown { remaining_secs }) => {
-                cooldown_targets.push((label, remaining_secs));
-            }
-            Err(e) => {
-                tracing::error!(error = %e, session_id = %t.session_id, "Failed to enqueue clear task");
-                failed_targets.push(label);
-            }
-        }
-    }
-
-    // ACK summary back to the Lead with queue_ids so it can [CANCEL_QUEUED] if needed.
-    if let Ok(Some(sender)) = state
-        .db
-        .get_session_by_id_prefix(&sender_session_id[..8.min(sender_session_id.len())])
-        .await
-    {
-        let status = if !queued_ids.is_empty() {
-            "queued"
-        } else if !cooldown_targets.is_empty() && failed_targets.is_empty() {
-            "rejected"
-        } else {
-            "failed"
-        };
-        let reason_field = if status == "rejected" {
-            " reason=cooldown"
-        } else if status == "failed" {
-            " reason=enqueue_failed"
-        } else {
-            ""
-        };
-        let ids_field = if queued_ids.is_empty() {
-            String::new()
-        } else {
-            format!(
-                " queue_ids=[{}]",
-                queued_ids.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(",")
-            )
-        };
-        let ack = format!(
-            "[ACK:CLEAR target=\"{}\" status={}{} count={}{}]",
-            target_role,
-            status,
-            reason_field,
-            queued_ids.len(),
-            ids_field,
-        );
-        let cooldown_summary = if cooldown_targets.is_empty() {
-            String::new()
-        } else {
-            format!(
-                "\nCooldown-suppressed: [{}]. Try again in ~{}s.",
-                cooldown_targets
-                    .iter()
-                    .map(|(l, _)| l.clone())
-                    .collect::<Vec<_>>()
-                    .join(", "),
-                cooldown_targets.iter().map(|(_, s)| *s).max().unwrap_or(0),
-            )
-        };
-        let body = format!(
-            "{}\nClear enqueued for: [{}]. The drain will deliver an [ACK:CLEAR ... status=ok queue_id=N] for each as their turns complete.{}",
-            ack,
-            queued_ids.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(", "),
-            cooldown_summary,
-        );
-        let _ = state.containers.send(&sender.session_id, &body).await;
-    }
-
-    // Trigger drain so eligible clears fire immediately (most member targets
-    // are between turns when a Lead-driven clear arrives; only mid-turn ones
-    // wait for ResponseComplete).
-    drain_team_queue(state, team_id).await;
-}
-
-/// Handle [CANCEL_QUEUED:Role(:N)?] — Lead drops still-queued tasks before
-/// they hit a member. Already-delivered tasks can't be cancelled this way;
-/// the Lead must use [INTERRUPT:Role] for those.
-async fn handle_cancel_queued(
-    state: &AppState,
-    sender_session_id: &str,
-    sender_role: &str,
-    target_role: &str,
-    task_id: Option<i64>,
-    team_id: &str,
-) {
-    if sender_role != "Team Lead" {
-        if let Ok(Some(sender)) = state
-            .db
-            .get_session_by_id_prefix(&sender_session_id[..8.min(sender_session_id.len())])
-            .await
-        {
-            let ack = format!(
-                "[ACK:CANCEL_QUEUED target=\"{}\" status=rejected reason=not_lead]",
-                target_role,
-            );
-            let _ = state
-                .containers
-                .send(
-                    &sender.session_id,
-                    &format!(
-                        "{}\n[CANCEL_QUEUED:Role] is reserved for the Team Lead.",
-                        ack
-                    ),
-                )
-                .await;
-        }
-        return;
-    }
-
-    let (count, single) = match task_id {
-        Some(id) => {
-            match state
-                .db
-                .cancel_queued_task_by_id(id, sender_session_id)
-                .await
-            {
-                Ok(true) => (1u64, true),
-                Ok(false) => (0, true),
-                Err(e) => {
-                    tracing::error!(error = %e, task_id = id, "Cancel-by-id failed");
-                    (0, true)
-                }
-            }
-        }
-        None => match state
-            .db
-            .cancel_queued_from_sender(team_id, sender_session_id, target_role)
-            .await
-        {
-            Ok(n) => (n, false),
-            Err(e) => {
-                tracing::error!(error = %e, target_role, "Bulk cancel failed");
-                (0, false)
-            }
-        },
-    };
-
-    if let Ok(Some(sender)) = state
-        .db
-        .get_session_by_id_prefix(&sender_session_id[..8.min(sender_session_id.len())])
-        .await
-    {
-        let id_field = match task_id {
-            Some(id) => format!(" queue_id={}", id),
-            None => String::new(),
-        };
-        let ack = format!(
-            "[ACK:CANCEL_QUEUED target=\"{}\" status=ok count={}{}]",
-            target_role, count, id_field,
-        );
-        let body = if count == 0 && single {
-            format!(
-                "{}\nQueue task {} was not in 'queued' state — either already delivered (use [INTERRUPT:{}]) or never existed.",
-                ack, task_id.unwrap_or(0), target_role,
-            )
-        } else if count == 0 {
-            format!(
-                "{}\nNo queued tasks from you to {} — nothing to cancel.",
-                ack, target_role,
-            )
-        } else {
-            format!(
-                "{}\nCancelled {} queued task(s) for {}. Already-delivered tasks are unaffected — use [INTERRUPT:{}] if needed.",
-                ack, count, target_role, target_role,
-            )
-        };
-        let _ = state.containers.send(&sender.session_id, &body).await;
-    }
-
-    if count > 0 {
-        post_to_coordination_log(
-            state,
-            team_id,
-            &format!(
-                ":wastebasket: **{} cancelled {} queued task(s) for {}**",
-                sender_role, count, target_role,
-            ),
-        )
-        .await;
-    }
-}
-
-/// Broadcast a message to all team members except the sender.
-async fn broadcast_team_message(
-    state: &AppState,
-    sender_session_id: &str,
-    sender_role: &str,
-    message: &str,
-    team_id: &str,
-    _channel_id: &str,
-) {
-    // Burst throttle: collapse repeat broadcasts from the same sender within
-    // BURST_THROTTLE_TTL. A second broadcast within 10s is almost certainly
-    // an LLM-stutter — the team has not had time to read the first one.
-    let throttle_key = format!("{}|{}|BROADCAST", team_id, sender_session_id);
-    if seen_within(&state.to_throttle, throttle_key, BURST_THROTTLE_TTL) {
-        tracing::info!(
-            team_id,
-            "Throttled [BROADCAST] burst within {}s window",
-            BURST_THROTTLE_TTL.as_secs()
-        );
-        if let Ok(Some(sender)) = state
-            .db
-            .get_session_by_id_prefix(&sender_session_id[..8.min(sender_session_id.len())])
-            .await
-        {
-            let ack = "[ACK:BROADCAST status=rejected reason=burst_throttle]".to_string();
-            let _ = state.containers.send(&sender.session_id, &format!(
-                "{}\nBurst throttle: another [BROADCAST] from you fired within the last {}s. Wait before retrying — the team has not had time to read the first one.",
-                ack, BURST_THROTTLE_TTL.as_secs(),
-            )).await;
-        }
-        return;
-    }
-
-    let members = match state.db.get_team_members(team_id).await {
-        Ok(m) => m,
-        Err(e) => {
-            tracing::error!(error = %e, "Failed to get team members for broadcast");
-            return;
-        }
-    };
-
-    let mut sent_count = 0;
-    for member in &members {
-        if member.session_id == sender_session_id {
-            continue;
-        }
-        let target_role = member.role.as_deref().unwrap_or("Unknown");
-        let header = format_team_context_header(&members, target_role);
-        let formatted = format!(
-            "{}\n**From {} (broadcast)**: {}",
-            header, sender_role, message
-        );
-        if state
-            .containers
-            .send(&member.session_id, &formatted)
-            .await
-            .is_ok()
-        {
-            sent_count += 1;
-            // Post incoming broadcast in receiver's Mattermost thread for visibility
-            let _ = state
-                .mm
-                .post_in_thread(
-                    &member.channel_id,
-                    &member.thread_id,
-                    &format!(
-                        ":arrow_left: **From {} (broadcast):**\n{}",
-                        sender_role,
-                        truncate_preview(message, 4000)
-                    ),
-                )
-                .await;
-        }
-    }
-
-    // Post delivery note in sender's thread + coordination log
-    if let Ok(Some(sender)) = state
-        .db
-        .get_session_by_id_prefix(&sender_session_id[..8.min(sender_session_id.len())])
-        .await
-    {
-        // Show the broadcast content so the user has full visibility
-        let _ = state
-            .mm
-            .post_in_thread(
-                &sender.channel_id,
-                &sender.thread_id,
-                &format!(
-                    ":loudspeaker: **Broadcast to {} member(s):**\n{}",
-                    sent_count,
-                    truncate_preview(message, 4000)
-                ),
-            )
-            .await;
-
-        // Inject delivery receipt into sender's Claude session
-        let header = format_team_context_header(&members, sender_role);
-        let _ = state.containers.send(&sender.session_id, &format!(
-            "{}\nDelivery receipt: broadcast delivered to {} member(s). Wait for responses before sending follow-up tasks.",
-            header, sent_count,
-        )).await;
-    }
-
-    // Post to coordination log
-    post_to_coordination_log(
-        state,
-        team_id,
-        &format!(
-            ":loudspeaker: **{} (broadcast):** {}",
-            sender_role,
-            truncate_preview(message, 4000),
-        ),
-    )
-    .await;
-}
 
 /// Spawn outcome reported back to the drain. The drain uses this to decide
 /// whether to mark the queue row delivered, cancelled, or failed.

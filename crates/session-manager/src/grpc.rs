@@ -156,6 +156,30 @@ impl GrpcStream {
             .map_err(|_| anyhow!("Session request channel closed"))
     }
 
+    /// Send a CliResponse back to agent-worker. The bidi `Session` stream
+    /// matches `cli_id` to the in-container CLI handler that's blocked
+    /// awaiting the reply.
+    pub async fn send_cli_response(
+        &mut self,
+        cli_id: &str,
+        exit_code: i32,
+        stdout: &str,
+        stderr: &str,
+    ) -> Result<()> {
+        let input = proto::SessionInput {
+            input: Some(proto::session_input::Input::CliResponse(proto::CliResponse {
+                cli_id: cli_id.to_string(),
+                exit_code,
+                stdout: stdout.to_string(),
+                stderr: stderr.to_string(),
+            })),
+        };
+        self.request_tx
+            .send(input)
+            .await
+            .map_err(|_| anyhow!("Session request channel closed"))
+    }
+
     /// Read events from the response stream until SessionResult.
     /// Returns captured session_id. Stream stays open for next turn.
     #[allow(dead_code)]
@@ -284,6 +308,11 @@ impl GrpcStream {
                                     .send(OutputEvent::ProcessDied {
                                         exit_code: Some(1),
                                         signal: None,
+                                        raw_json: if result.result_text.is_empty() {
+                                            None
+                                        } else {
+                                            Some(result.result_text.clone())
+                                        },
                                     })
                                     .await;
                             } else {
@@ -304,16 +333,56 @@ impl GrpcStream {
                                 event_count,
                                 error_type = %err.error_type,
                                 message = %err.message,
+                                raw_json_len = err.raw_json.len(),
                                 "gRPC: Agent error"
                             );
                             let _ = output_tx
                                 .send(OutputEvent::ProcessDied {
                                     exit_code: Some(1),
                                     signal: Some(format!("{}: {}", err.error_type, err.message)),
+                                    raw_json: if err.raw_json.is_empty() {
+                                        None
+                                    } else {
+                                        Some(err.raw_json.clone())
+                                    },
                                 })
                                 .await;
                             // Error terminates the turn
                             return Ok(session_id);
+                        }
+                        agent_event::Event::RateLimit(rl) => {
+                            tracing::info!(
+                                event_count,
+                                status = %rl.status,
+                                limit_type = %rl.limit_type,
+                                resets_at = rl.resets_at,
+                                utilization = rl.utilization,
+                                "gRPC: RateLimit event (legacy path)"
+                            );
+                            let _ = output_tx
+                                .send(OutputEvent::RateLimit {
+                                    status: rl.status.clone(),
+                                    resets_at: rl.resets_at,
+                                    limit_type: rl.limit_type.clone(),
+                                    utilization: rl.utilization,
+                                    raw_json: rl.raw_json.clone(),
+                                })
+                                .await;
+                            // Informational — keep waiting for the Result
+                            // event to actually finalise the turn.
+                        }
+                        agent_event::Event::CliCommand(_) => {
+                            // The legacy `process_turn_events` path doesn't
+                            // own a per-session reply channel. CliCommand is
+                            // only emitted when the in-container `team` CLI
+                            // is wired up, which happens via the modern
+                            // `message_processor` path in container.rs.
+                            // Defensive: if we somehow see one here, drop it
+                            // and log so we notice the misroute.
+                            tracing::warn!(
+                                event_count,
+                                "gRPC: CliCommand on legacy turn-event path; ignored"
+                            );
                         }
                     }
                 }

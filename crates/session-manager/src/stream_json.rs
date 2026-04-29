@@ -14,14 +14,42 @@ pub enum OutputEvent {
     ResponseComplete { input_tokens: u64, output_tokens: u64, context_tokens: u64 },
     /// Generated thread title (from `title` command)
     TitleGenerated(String),
-    /// Process died unexpectedly (non-zero exit, not user-initiated)
-    ProcessDied { exit_code: Option<i32>, signal: Option<String> },
+    /// Process died unexpectedly (non-zero exit, not user-initiated).
+    /// `raw_json` carries the SDK payload when we couldn't parse it cleanly,
+    /// so unmodeled signals still surface upstream.
+    ProcessDied {
+        exit_code: Option<i32>,
+        signal: Option<String>,
+        raw_json: Option<String>,
+    },
     /// Worker disconnected (gRPC stream failed) — session stays alive for auto-reconnect
     WorkerDisconnected { reason: String },
     /// Worker reconnected after disconnection
     WorkerReconnected,
     /// Claude SDK session ID captured — persist to DB for resume
     SessionIdCaptured(String),
+    /// Rate-limit transition emitted by the CLI (allowed / allowed_warning /
+    /// rejected). When `status == "rejected"`, session-manager pauses the
+    /// team task queue until `resets_at`. `raw_json` is forwarded for
+    /// debugging and any fields we don't model yet.
+    RateLimit {
+        status: String,
+        resets_at: i64,
+        limit_type: String,
+        utilization: f64,
+        raw_json: String,
+    },
+    /// `team` CLI command forwarded from the in-container binary. The
+    /// stream_output dispatcher resolves the verb against AppState (queue,
+    /// roster, etc.) and writes the reply onto the per-session
+    /// `cli_response_tx` channel, where message_processor sends it back
+    /// through the bidi gRPC stream.
+    CliCommand {
+        cli_id: String,
+        verb: String,
+        args: Vec<String>,
+        flags: std::collections::HashMap<String, String>,
+    },
 }
 
 /// Map common fatal exit codes to human-readable signal names.

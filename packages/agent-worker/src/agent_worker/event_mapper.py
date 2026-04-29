@@ -11,6 +11,7 @@ from . import agent_pb2
 if TYPE_CHECKING:
     from claude_agent_sdk.types import (
         AssistantMessage,
+        RateLimitEvent,
         ResultMessage,
         StreamEvent,
         SystemMessage,
@@ -191,10 +192,69 @@ def extract_context_tokens_from_stream(event: StreamEvent) -> int | None:
     return _total_input_tokens(usage)
 
 
-def error_event(message: str, error_type: str = "internal") -> agent_pb2.AgentEvent:
-    """Create an AgentError event."""
+def error_event(
+    message: str,
+    error_type: str = "internal",
+    raw_json: str = "",
+) -> agent_pb2.AgentEvent:
+    """Create an AgentError event.
+
+    `raw_json` carries the original SDK payload when we couldn't parse it —
+    session-manager logs it so we can iterate on unmodeled signals.
+    """
     return agent_pb2.AgentEvent(
-        error=agent_pb2.AgentError(message=message, error_type=error_type)
+        error=agent_pb2.AgentError(
+            message=message,
+            error_type=error_type,
+            raw_json=raw_json,
+        )
+    )
+
+
+def raw_error_event(
+    raw_data: object,
+    reason: str,
+    error_type: str = "unparseable",
+) -> agent_pb2.AgentEvent:
+    """Wrap an unrecognised / unparseable SDK payload as an AgentError.
+
+    We never silently drop a message: even if we don't know what to do with
+    it, we forward the raw bytes upstream so it shows up in logs / Mattermost
+    cards and we can decide whether to bake in a typed handler later.
+    """
+    try:
+        raw_json = json.dumps(raw_data, default=str)
+    except (TypeError, ValueError):
+        raw_json = repr(raw_data)
+    return agent_pb2.AgentEvent(
+        error=agent_pb2.AgentError(
+            message=reason,
+            error_type=error_type,
+            raw_json=raw_json,
+        )
+    )
+
+
+def map_rate_limit_event(event: RateLimitEvent) -> agent_pb2.AgentEvent:
+    """Map a RateLimitEvent to a RateLimit AgentEvent.
+
+    The SDK emits these whenever the rate-limit status transitions. We forward
+    everything (including the raw dict) so session-manager can pause / resume
+    the team task queue.
+    """
+    info = event.rate_limit_info
+    try:
+        raw_json = json.dumps(info.raw, default=str)
+    except (TypeError, ValueError):
+        raw_json = "{}"
+    return agent_pb2.AgentEvent(
+        rate_limit=agent_pb2.RateLimit(
+            status=info.status or "",
+            resets_at=info.resets_at or 0,
+            limit_type=info.rate_limit_type or "",
+            utilization=info.utilization if info.utilization is not None else -1.0,
+            raw_json=raw_json,
+        )
     )
 
 
