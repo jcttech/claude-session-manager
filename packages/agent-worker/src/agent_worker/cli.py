@@ -19,7 +19,6 @@ import socket
 import sys
 from typing import NoReturn
 
-
 SOCKET_ENV_VAR = "CSM_CLI_SOCKET"
 SOCKET_TIMEOUT_SECS = 35  # session-manager itself caps at 30s; give socket a little headroom
 
