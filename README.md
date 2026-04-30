@@ -271,6 +271,31 @@ If no devcontainer.json is found, a default one is auto-generated using `SM_CONT
 | `/health` | GET | Health check (verifies DB connectivity) |
 | `/metrics` | GET | Prometheus metrics (sessions, tokens, approvals) |
 | `/callback` | POST | Mattermost interactive message callback (HMAC-verified) |
+| `/admin/profile` | GET | Read the active Claude OAuth profile (`CLAUDE_CONFIG_DIR`) override. Bearer-auth. |
+| `/admin/profile` | POST | Set the active Claude OAuth profile override. Bearer-auth. |
+
+### Claude profile switching
+
+The session manager supports runtime rotation of the Claude OAuth account used by every agent-worker spawn, mirroring the membank `/api/admin/profile` contract so an external profile-manager (e.g. claude-usage-monitor) can POST identical payloads to either service.
+
+```
+POST /admin/profile
+Authorization: Bearer $ADMIN_BEARER_TOKEN
+Content-Type: application/json
+
+{
+  "claude_config_dir": "/path/to/profile",   // null/"" clears the override
+  "event_id":   "<uuid>",                    // optional, audit-only pass-through
+  "swapped_at": "<rfc3339>",                 // optional, audit-only pass-through
+  "updated_by": "claude-usage-monitor"
+}
+```
+
+The dir is validated server-side (must contain `.credentials.json`); a missing file returns `400 INVALID_CONFIG_DIR`. The choice is persisted in the singleton `claude_profile_state` table and held in an in-process `Arc<RwLock<Option<String>>>` read at every `CreateSession` spawn — flips take effect on the next user message without restarting agent-worker. In-flight sessions on the previous account complete naturally.
+
+When a flip arrives while a team is in `rejected` rate-limit state, the session manager additionally clears each member session (drops the worker-side `ClaudeSDKClient`, resets local resume state) and drains the team's task queue so paused work resumes on the new profile.
+
+If `ADMIN_BEARER_TOKEN` is unset the route is fail-closed (503).
 
 ## Configuration Reference
 
@@ -346,6 +371,12 @@ All settings use the `SM_` environment variable prefix.
 | `SM_RATE_LIMIT_RPS` | `10` | Requests per second per IP |
 | `SM_RATE_LIMIT_BURST` | `20` | Rate limit burst size |
 | `SM_SESSION_LIVENESS_TIMEOUT_SECS` | `120` | Idle time before posting stale session warning |
+
+### Optional — Admin
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `ADMIN_BEARER_TOKEN` | _(unset → 503)_ | Bearer token gating `/admin/*` endpoints. Note: not `SM_`-prefixed since it mirrors membank's contract. |
 
 ## Security
 
