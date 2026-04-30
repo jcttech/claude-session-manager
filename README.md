@@ -291,9 +291,13 @@ Content-Type: application/json
 }
 ```
 
-The dir is validated server-side (must contain `.credentials.json`); a missing file returns `400 INVALID_CONFIG_DIR`. The choice is persisted in the singleton `claude_profile_state` table and held in an in-process `Arc<RwLock<Option<String>>>` read at every `CreateSession` spawn — flips take effect on the next user message without restarting agent-worker. In-flight sessions on the previous account complete naturally.
+The dir is validated server-side (must contain `.credentials.json`); a missing file returns `400 INVALID_CONFIG_DIR`. The choice is persisted in the singleton `claude_profile_state` table and held in an in-process `Arc<RwLock<Option<String>>>` read at every `CreateSession` spawn.
 
-When a flip arrives while a team is in `rejected` rate-limit state, the session manager additionally clears each member session (drops the worker-side `ClaudeSDKClient`, resets local resume state) and drains the team's task queue so paused work resumes on the new profile.
+After persisting the swap, the handler enqueues a `CLEAR` row in `team_task_queue` for every active member of every active team. Drain delivers each CLEAR only when the target session is idle — mid-turn members defer until their next `ResponseComplete`, then their queued CLEAR fires. The next user message after a CLEAR triggers a fresh `CreateSession`, which reads the now-current `CLAUDE_CONFIG_DIR` from the in-process handle. So a flip never aborts a streaming response.
+
+Teams currently in `rejected` rate-limit state additionally have their rate-limit row flipped back to `allowed` so drain isn't paused on the previous account's reset window.
+
+Standalone (non-team) sessions have no queue and stay on the old account until the user runs `@claude clear` or restarts the session.
 
 If `ADMIN_BEARER_TOKEN` is unset the route is fail-closed (503).
 

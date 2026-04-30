@@ -125,10 +125,13 @@ pub async fn post_profile(
     let new_value = if dir.is_empty() { None } else { Some(dir) };
     *state.active_config_dir.write().await = new_value;
 
-    // 2. Reactive: kick teams currently stuck on the previous account.
-    //    Best-effort — log on failure but still return success for the swap.
-    if let Err(e) = crate::rotate_rate_limited_teams(&state).await {
-        tracing::warn!(error = %e, "profile swap: reactive rotation failed");
+    // 2. Enqueue CLEAR for every active team member so they pick up the new
+    //    profile on their next turn. Drain handles the timing: idle members
+    //    clear immediately, mid-turn members wait until ResponseComplete
+    //    (see drain_one_clear's pending_task_from skip). Best-effort — log
+    //    on failure but still return success for the swap.
+    if let Err(e) = crate::rotate_active_team_sessions(&state).await {
+        tracing::warn!(error = %e, "profile swap: rotation enqueue failed");
     }
 
     Ok(Json(row.into()))

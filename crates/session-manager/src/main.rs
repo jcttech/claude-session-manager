@@ -4329,23 +4329,39 @@ async fn clear_rate_limit_notice_and_drain(state: &Arc<AppState>, team_id: &str)
     drain_team_queue(state, team_id).await;
 }
 
-/// Reactive profile-rotation handler invoked from POST /admin/profile after
-/// the active CLAUDE_CONFIG_DIR has been swapped. For every team currently in
-/// `rejected` rate-limit state (i.e. stuck on the previous account):
-///   1. `clear` each member session — resets `is_first_message` + clears
-///      `claude_session_id` locally, and tells agent-worker to drop its
-///      ClaudeSDKClient. The next user message takes the CreateSession path
-///      and picks up the new env via `build_session_env`.
-///   2. flip the team rate-limit row back to `allowed` and drain the queue.
-pub(crate) async fn rotate_rate_limited_teams(state: &Arc<AppState>) -> anyhow::Result<()> {
-    let teams = state.db.teams_in_rejected_state().await?;
+/// Profile-rotation handler invoked from POST /admin/profile after the active
+/// CLAUDE_CONFIG_DIR has been swapped. Enqueues a CLEAR row in
+/// `team_task_queue` for every active member of every active team, then
+/// drains. The drain layer's existing `pending_task_from.is_some()` skip
+/// (see `drain_one_clear`) leaves mid-turn members queued — their next
+/// `ResponseComplete` re-fires the drain and the CLEAR delivers cleanly.
+/// Idle members get cleared immediately. `enqueue_team_clear`'s coalescing
+/// + cooldown gates make repeated flips safe.
+///
+/// Teams currently in `rejected` rate-limit state additionally have their
+/// rate-limit row flipped back to `allowed` so drain isn't paused.
+///
+/// Standalone (non-team) sessions are out of scope: they have no queue and
+/// will pick up the new profile when the user manually clears or restarts.
+pub(crate) async fn rotate_active_team_sessions(state: &Arc<AppState>) -> anyhow::Result<()> {
+    let rejected: std::collections::HashSet<String> = state
+        .db
+        .teams_in_rejected_state()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+
+    let teams = state.db.teams_with_active_sessions().await?;
     if teams.is_empty() {
         return Ok(());
     }
     tracing::info!(
-        count = teams.len(),
-        "Profile rotation: clearing rate-limited teams onto new active profile"
+        teams = teams.len(),
+        rejected = rejected.len(),
+        "Profile rotation: enqueueing CLEAR for every active team member"
     );
+
     for team_id in teams {
         let members = match state.db.get_team_members(&team_id).await {
             Ok(m) => m,
@@ -4355,17 +4371,39 @@ pub(crate) async fn rotate_rate_limited_teams(state: &Arc<AppState>) -> anyhow::
             }
         };
         for m in members {
-            if let Err(e) = state.containers.clear(&m.session_id).await {
-                // `clear` returns Err when the session isn't in the in-memory
-                // map (e.g. process-restart left a stale DB row). Log and
-                // move on — the local-side reset path is best-effort.
-                tracing::debug!(
-                    error = %e, session_id = %m.session_id, %team_id,
-                    "rotate: clear_session skipped"
+            let role = match m.role.as_deref() {
+                Some(r) if !r.is_empty() => r,
+                _ => continue,
+            };
+            // sender_session_id == target_session_id makes drain treat this
+            // as a self-clear, which is the right semantic: the session is
+            // being asked to wipe its own context, not at a Lead's behest.
+            let result = state
+                .db
+                .enqueue_team_clear(
+                    &team_id,
+                    role,
+                    &m.session_id,
+                    &m.session_id,
+                    "ProfileRotation",
+                    "profile-rotation",
+                    AUTO_CLEAR_COOLDOWN_SECS as i64,
+                )
+                .await;
+            if let Err(e) = result {
+                tracing::warn!(
+                    error = %e, session_id = %m.session_id,
+                    "rotate: enqueue_team_clear failed"
                 );
             }
         }
-        clear_rate_limit_notice_and_drain(state, &team_id).await;
+
+        if rejected.contains(&team_id) {
+            // Updates the existing rate-limit notice in place + drains.
+            clear_rate_limit_notice_and_drain(state, &team_id).await;
+        } else {
+            drain_team_queue(state, &team_id).await;
+        }
     }
     Ok(())
 }

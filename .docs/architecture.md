@@ -336,22 +336,31 @@ admin::post_profile (admin.rs)
     ├── Validate `<dir>/.credentials.json` exists  ─► 400 INVALID_CONFIG_DIR
     ├── Database::set_claude_profile_state()      ─► UPDATE singleton row
     ├── Atomically swap state.active_config_dir   ─► RwLock::write
-    └── rotate_rate_limited_teams() (best-effort)
+    └── rotate_active_team_sessions() (best-effort)
             │
             ▼
-        For each team in `rejected` rate-limit state:
-            ├── ContainerManager::clear(session_id) per member
-            │     (resets is_first_message=true, claude_session_id=None
-            │      worker-side: drops ClaudeSDKClient via Sessions.remove)
-            └── clear_rate_limit_notice_and_drain(team_id)
-                    └── flip team_rate_limits → 'allowed' + drain_team_queue
+        For each team with at least one active session:
+            ├── For each member: enqueue_team_clear (sender == target;
+            │     reason="profile-rotation"; cooldown + coalesce)
+            ├── If team is in `rejected` state:
+            │     clear_rate_limit_notice_and_drain (flip → 'allowed' + drain)
+            └── Otherwise: drain_team_queue
+                    │
+                    ▼
+            drain_one_clear delivers each CLEAR only when the target is idle
+            (`pending_task_from.is_none()`). Mid-turn members stay queued;
+            their next ResponseComplete re-fires drain and the CLEAR delivers.
 ```
 
-The active CLAUDE_CONFIG_DIR override is a single in-process `Arc<RwLock<Option<String>>>` (see `profile.rs::ActiveConfigDir`) seeded from `claude_profile_state` at boot and read by `container::build_session_env` on every CreateSession spawn. Flips therefore take effect on the next user message without restarting agent-worker; in-flight sessions on the previous account finish naturally because their Claude CLI subprocess env was fixed at spawn.
+**Why the queue.** Calling `containers.clear()` directly aborts in-flight turns (drops the worker's `ClaudeSDKClient` mid-stream). Enqueueing a CLEAR row in `team_task_queue` reuses the existing drain layer, which already implements deferred delivery for mid-turn targets, plus cooldown + coalescing so repeated profile flips don't pile up duplicate CLEARs.
 
-When a profile override is set, `CLAUDE_CODE_OAUTH_TOKEN` is deliberately suppressed in the per-CreateSession env map so the file-based credentials at `$CLAUDE_CONFIG_DIR/.credentials.json` win — mirroring membank's auth precedence (override > inherited token > `~/.claude` default).
+**What CLEAR does.** Resets `is_first_message=true` + clears `claude_session_id` locally and tells agent-worker to drop the ClaudeSDKClient via `ClearSession` RPC. The next user message after a CLEAR takes the `CreateSession` path, where `container::build_session_env` reads the current `active_config_dir` and injects `CLAUDE_CONFIG_DIR` into the SDK subprocess env. The Claude CLI then loads `$CLAUDE_CONFIG_DIR/.credentials.json` for the new account.
 
-The contract is identical to membank's `/api/admin/profile`: the profile-manager treats both services as interchangeable sinks and POSTs the same payload to each.
+**Auth precedence.** When a profile override is set, `CLAUDE_CODE_OAUTH_TOKEN` is deliberately suppressed in the per-CreateSession env map so the file-based credentials win — mirroring membank's order (override > inherited token > `~/.claude` default).
+
+**Standalone sessions.** Non-team sessions (`@claude start <repo>`) have no `team_task_queue` row, so they're not auto-rotated. They stay on the old account until the user runs `@claude clear` or restarts the session. This is acceptable because standalones are interactive and short-lived; the heavyweight automated workload runs in teams.
+
+**Contract.** Identical to membank's `/api/admin/profile` — the external profile-manager treats both services as interchangeable sinks and POSTs the same payload to each.
 
 ### Network Approval Workflow
 

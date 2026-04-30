@@ -2126,12 +2126,27 @@ impl Database {
     }
 
     /// Team_ids currently in `rejected` state, regardless of resets_at. Used
-    /// by the reactive profile-rotation path: when the active profile flips,
-    /// every team stuck on the previous account gets cleared so the next
-    /// message takes the CreateSession path (which picks up the new env).
+    /// by the profile-rotation path: when the active profile flips, every
+    /// team stuck on the previous account needs its rate-limit row flipped
+    /// back to `allowed` so the queue isn't paused.
     pub async fn teams_in_rejected_state(&self) -> Result<Vec<String>> {
         let rows: Vec<(String,)> = sqlx::query_as(&format!(
             "SELECT team_id FROM {}.team_rate_limits WHERE status = 'rejected'",
+            SCHEMA
+        ))
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(|(t,)| t).collect())
+    }
+
+    /// Distinct team_ids that have at least one currently-active session.
+    /// Used by profile rotation to enumerate every team whose members need
+    /// a CLEAR enqueued so they pick up the new profile on their next turn.
+    pub async fn teams_with_active_sessions(&self) -> Result<Vec<String>> {
+        let rows: Vec<(String,)> = sqlx::query_as(&format!(
+            "SELECT DISTINCT team_id FROM {}.sessions \
+             WHERE team_id IS NOT NULL \
+               AND status IN ('active', 'disconnected', 'stuck')",
             SCHEMA
         ))
         .fetch_all(&self.pool)
