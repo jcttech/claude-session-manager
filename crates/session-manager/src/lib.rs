@@ -8,6 +8,7 @@ pub mod grpc;
 pub mod idle_monitor;
 pub mod liveness;
 pub mod opnsense;
+pub mod profile;
 pub mod ssh;
 pub mod stream_json;
 

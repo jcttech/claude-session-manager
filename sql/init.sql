@@ -43,6 +43,22 @@ CREATE TABLE IF NOT EXISTS session_manager.containers (
 CREATE INDEX IF NOT EXISTS idx_containers_repo_branch
     ON session_manager.containers(repo, branch);
 
+-- Active Claude OAuth profile (CLAUDE_CONFIG_DIR override).
+-- Singleton row, updated by the external profile-manager via POST /admin/profile.
+-- Mirrors membank's claude_profile_state shape so the same payload works on both.
+-- Empty string = no override (CLI uses ~/.claude or inherited token).
+CREATE TABLE IF NOT EXISTS session_manager.claude_profile_state (
+    id                INT PRIMARY KEY CHECK (id = 1),
+    claude_config_dir TEXT NOT NULL DEFAULT '',
+    event_id          UUID,
+    swapped_at        TIMESTAMPTZ,
+    updated_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_by        TEXT
+);
+
+INSERT INTO session_manager.claude_profile_state (id)
+VALUES (1) ON CONFLICT (id) DO NOTHING;
+
 -- Migration: add container_id to sessions table
 -- ALTER TABLE session_manager.sessions ADD COLUMN IF NOT EXISTS container_id BIGINT;
 -- CREATE INDEX IF NOT EXISTS idx_sessions_container_id ON session_manager.sessions(container_id);

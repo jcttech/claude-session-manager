@@ -22,6 +22,9 @@ use session_manager::crypto::{sign_request, verify_signature};
 use session_manager::database::{
     self, Database, EnqueueClearResult, StoredSession, StoredTeamRole, StoredTeamTask,
 };
+use session_manager::profile::{self, ActiveConfigDir};
+
+mod admin;
 use session_manager::git::{GitManager, RepoRef};
 use session_manager::liveness::{LivenessState, format_duration_short};
 use session_manager::opnsense::OPNsense;
@@ -43,23 +46,26 @@ fn network_request_regex() -> &'static Regex {
     })
 }
 
-struct AppState {
-    mm: Mattermost,
-    containers: ContainerManager,
-    git: GitManager,
-    opnsense: OPNsense,
-    db: Database,
-    liveness: LivenessState,
+pub struct AppState {
+    pub mm: Mattermost,
+    pub containers: ContainerManager,
+    pub git: GitManager,
+    pub opnsense: OPNsense,
+    pub db: Database,
+    pub liveness: LivenessState,
     /// Shared coordination channel ID for team coordination logs
-    coordination_channel_id: tokio::sync::RwLock<Option<String>>,
+    pub coordination_channel_id: tokio::sync::RwLock<Option<String>>,
     /// PRs that have passed the [PR_REVIEWED] gate, keyed by "team_id:pr_number".
     /// Only PRs in this set should be merged by the Team Lead.
-    reviewed_prs: DashMap<String, ()>,
+    pub reviewed_prs: DashMap<String, ()>,
     /// Per-team mutex to serialize `team_task_queue` drain passes. Without
     /// this, two concurrent ResponseComplete events on members of the same
     /// team could both walk the queue and double-deliver the same task_id
     /// to two different idle targets.
-    drain_locks: DashMap<String, Arc<tokio::sync::Mutex<()>>>,
+    pub drain_locks: DashMap<String, Arc<tokio::sync::Mutex<()>>>,
+    /// Currently-active CLAUDE_CONFIG_DIR override. Read by container env
+    /// builder on every CreateSession; written by POST /admin/profile.
+    pub active_config_dir: ActiveConfigDir,
 }
 
 // `spawn_locks` was removed in v2.5.4 — its serialization role is subsumed by
@@ -126,9 +132,30 @@ async fn main() -> Result<()> {
     let s = config::settings();
     let mm = Mattermost::new(&s.mattermost_url, &s.mattermost_token).await?;
     let opnsense = OPNsense::new()?;
-    let containers = ContainerManager::new();
     let git = GitManager::new();
     let db = Database::new().await?;
+
+    // Seed the active CLAUDE_CONFIG_DIR override from DB. The singleton row
+    // is created in `create_schema`, so this never misses. Sanity-check that
+    // the persisted dir still has a credentials file — warn (don't fail) if
+    // it's gone, since operators can recover by POSTing a fresh path.
+    let initial_state = db.get_claude_profile_state().await?;
+    let initial_dir = profile::from_db_value(&initial_state.claude_config_dir);
+    if let Some(ref dir) = initial_dir {
+        let creds = std::path::Path::new(dir).join(".credentials.json");
+        if !creds.is_file() {
+            tracing::warn!(
+                dir = %dir,
+                "Persisted CLAUDE_CONFIG_DIR has no .credentials.json — \
+                 spawns will fail until the file is restored or POST /admin/profile \
+                 supplies a new path",
+            );
+        }
+    }
+    let active_config_dir: ActiveConfigDir =
+        Arc::new(tokio::sync::RwLock::new(initial_dir));
+
+    let containers = ContainerManager::new(active_config_dir.clone());
 
     let liveness = LivenessState::new();
 
@@ -143,6 +170,7 @@ async fn main() -> Result<()> {
         coordination_channel_id: tokio::sync::RwLock::new(coordination_channel_id),
         reviewed_prs: DashMap::new(),
         drain_locks: DashMap::new(),
+        active_config_dir,
     });
 
     // Sync container registry from database
@@ -459,6 +487,15 @@ async fn main() -> Result<()> {
     let cancel_clone = cancel_token.clone();
     let rate_limit_handle = rate_limit::spawn_cleanup_task(rate_limiter.clone(), cancel_clone);
 
+    // Admin routes — separate sub-router so the bearer-token middleware only
+    // gates these paths (callback, health, metrics keep their existing access).
+    let admin_routes = Router::new()
+        .route(
+            "/admin/profile",
+            get(admin::get_profile).post(admin::post_profile),
+        )
+        .layer(axum::middleware::from_fn(admin::require_admin_token));
+
     // Build router with rate limiting middleware
     let app = Router::new()
         .route("/callback", post(handle_callback))
@@ -470,6 +507,7 @@ async fn main() -> Result<()> {
                 async move { handle.render() }
             }),
         )
+        .merge(admin_routes)
         .layer(rate_limiter)
         .with_state(state);
 
@@ -4289,6 +4327,47 @@ async fn clear_rate_limit_notice_and_drain(state: &Arc<AppState>, team_id: &str)
         let _ = state.mm.post_in_thread(&coord_channel_id, &thread_id, &body).await;
     }
     drain_team_queue(state, team_id).await;
+}
+
+/// Reactive profile-rotation handler invoked from POST /admin/profile after
+/// the active CLAUDE_CONFIG_DIR has been swapped. For every team currently in
+/// `rejected` rate-limit state (i.e. stuck on the previous account):
+///   1. `clear` each member session — resets `is_first_message` + clears
+///      `claude_session_id` locally, and tells agent-worker to drop its
+///      ClaudeSDKClient. The next user message takes the CreateSession path
+///      and picks up the new env via `build_session_env`.
+///   2. flip the team rate-limit row back to `allowed` and drain the queue.
+pub(crate) async fn rotate_rate_limited_teams(state: &Arc<AppState>) -> anyhow::Result<()> {
+    let teams = state.db.teams_in_rejected_state().await?;
+    if teams.is_empty() {
+        return Ok(());
+    }
+    tracing::info!(
+        count = teams.len(),
+        "Profile rotation: clearing rate-limited teams onto new active profile"
+    );
+    for team_id in teams {
+        let members = match state.db.get_team_members(&team_id).await {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!(error = %e, %team_id, "rotate: get_team_members failed");
+                continue;
+            }
+        };
+        for m in members {
+            if let Err(e) = state.containers.clear(&m.session_id).await {
+                // `clear` returns Err when the session isn't in the in-memory
+                // map (e.g. process-restart left a stale DB row). Log and
+                // move on — the local-side reset path is best-effort.
+                tracing::debug!(
+                    error = %e, session_id = %m.session_id, %team_id,
+                    "rotate: clear_session skipped"
+                );
+            }
+        }
+        clear_rate_limit_notice_and_drain(state, &team_id).await;
+    }
+    Ok(())
 }
 
 /// Build the team context header prepended to every message delivered to a team member.

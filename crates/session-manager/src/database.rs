@@ -152,6 +152,20 @@ pub struct TeamRateLimit {
     pub notice_post_id: Option<String>,
 }
 
+/// Active Claude OAuth profile override. Singleton row keyed by `id = 1`.
+/// `claude_config_dir == ""` means no override (CLI falls back to ~/.claude
+/// or inherited CLAUDE_CODE_OAUTH_TOKEN). Mirrors membank's shape so the
+/// external profile-manager can POST identical payloads to either service.
+#[derive(Debug, Clone, FromRow)]
+#[allow(dead_code)]
+pub struct ClaudeProfileState {
+    pub claude_config_dir: String,
+    pub event_id: Option<uuid::Uuid>,
+    pub swapped_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+    pub updated_by: Option<String>,
+}
+
 #[derive(Debug, FromRow)]
 #[allow(dead_code)]
 pub struct AuditLogEntry {
@@ -741,6 +755,35 @@ pub async fn create_schema(pool: &PgPool, schema: &str) -> Result<()> {
         "CREATE INDEX IF NOT EXISTS idx_team_rate_limits_resets_at \
          ON {}.team_rate_limits (resets_at) \
          WHERE status = 'rejected'",
+        schema
+    ))
+    .execute(pool)
+    .await?;
+
+    // Active Claude OAuth profile (CLAUDE_CONFIG_DIR override). Singleton row
+    // updated by the external profile-manager via POST /admin/profile. Mirrors
+    // membank's claude_profile_state shape so the same payload works on both.
+    // Empty string = no override (CLI falls back to ~/.claude or inherited
+    // CLAUDE_CODE_OAUTH_TOKEN).
+    sqlx::query(&format!(
+        r#"
+        CREATE TABLE IF NOT EXISTS {}.claude_profile_state (
+            id                INT PRIMARY KEY CHECK (id = 1),
+            claude_config_dir TEXT NOT NULL DEFAULT '',
+            event_id          UUID,
+            swapped_at        TIMESTAMPTZ,
+            updated_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_by        TEXT
+        )
+        "#,
+        schema
+    ))
+    .execute(pool)
+    .await?;
+
+    // Seed the singleton so reads at startup never miss.
+    sqlx::query(&format!(
+        "INSERT INTO {}.claude_profile_state (id) VALUES (1) ON CONFLICT (id) DO NOTHING",
         schema
     ))
     .execute(pool)
@@ -2082,6 +2125,20 @@ impl Database {
         Ok(row.is_some())
     }
 
+    /// Team_ids currently in `rejected` state, regardless of resets_at. Used
+    /// by the reactive profile-rotation path: when the active profile flips,
+    /// every team stuck on the previous account gets cleared so the next
+    /// message takes the CreateSession path (which picks up the new env).
+    pub async fn teams_in_rejected_state(&self) -> Result<Vec<String>> {
+        let rows: Vec<(String,)> = sqlx::query_as(&format!(
+            "SELECT team_id FROM {}.team_rate_limits WHERE status = 'rejected'",
+            SCHEMA
+        ))
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(|(t,)| t).collect())
+    }
+
     /// Team_ids whose `rejected` window has passed; the scheduled-drain
     /// ticker walks these to flip them back to `allowed` and trigger a drain.
     pub async fn teams_with_expired_rate_limits(&self) -> Result<Vec<String>> {
@@ -2109,6 +2166,50 @@ impl Database {
         .fetch_optional(&self.pool)
         .await?;
         Ok(row.and_then(|(p,)| p))
+    }
+
+    // ---- claude_profile_state ---------------------------------------------
+
+    /// Read the singleton row. Always returns a row — the seed runs in
+    /// create_schema.
+    pub async fn get_claude_profile_state(&self) -> Result<ClaudeProfileState> {
+        let row = sqlx::query_as::<_, ClaudeProfileState>(&format!(
+            "SELECT claude_config_dir, event_id, swapped_at, updated_at, updated_by \
+             FROM {}.claude_profile_state WHERE id = 1",
+            SCHEMA
+        ))
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
+    /// Update the singleton. `claude_config_dir == ""` clears the override.
+    /// Returns the row as written for echoing in the admin response.
+    pub async fn set_claude_profile_state(
+        &self,
+        claude_config_dir: &str,
+        event_id: Option<uuid::Uuid>,
+        swapped_at: Option<chrono::DateTime<chrono::Utc>>,
+        updated_by: Option<&str>,
+    ) -> Result<ClaudeProfileState> {
+        let row = sqlx::query_as::<_, ClaudeProfileState>(&format!(
+            "UPDATE {}.claude_profile_state \
+                SET claude_config_dir = $1, \
+                    event_id          = $2, \
+                    swapped_at        = $3, \
+                    updated_at        = NOW(), \
+                    updated_by        = $4 \
+              WHERE id = 1 \
+              RETURNING claude_config_dir, event_id, swapped_at, updated_at, updated_by",
+            SCHEMA
+        ))
+        .bind(claude_config_dir)
+        .bind(event_id)
+        .bind(swapped_at)
+        .bind(updated_by)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row)
     }
 
     /// Mark a queued task as failed (e.g. delivery_unreachable). Used by drain

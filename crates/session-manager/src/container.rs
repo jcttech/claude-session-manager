@@ -24,6 +24,10 @@ fn shell_escape(s: &str) -> Cow<'_, str> {
 pub struct ContainerManager {
     sessions: DashMap<String, Session>,
     pub registry: ContainerRegistry,
+    /// Currently-active CLAUDE_CONFIG_DIR override. Read on every CreateSession
+    /// spawn so a profile flip via POST /admin/profile takes effect on the
+    /// next user message without restarting the worker. See `profile.rs`.
+    active_config_dir: crate::profile::ActiveConfigDir,
 }
 
 /// Result of attempting to claim a session for cleanup.
@@ -88,11 +92,12 @@ struct Session {
     grpc_addr: String,
 }
 
-impl Default for ContainerManager {
-    fn default() -> Self {
+impl ContainerManager {
+    pub fn new(active_config_dir: crate::profile::ActiveConfigDir) -> Self {
         Self {
             sessions: DashMap::new(),
             registry: ContainerRegistry::new(),
+            active_config_dir,
         }
     }
 }
@@ -107,10 +112,6 @@ pub struct StartResult {
 }
 
 impl ContainerManager {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
     /// Start a session, reusing an existing container for the same (repo, branch) if available.
     /// Falls back to `devcontainer up` for cold start.
     #[allow(clippy::too_many_arguments)]
@@ -546,6 +547,7 @@ impl ContainerManager {
         let container_name_owned = container_name.to_string();
         let grpc_addr_owned = grpc_addr.clone();
         let system_prompt_owned = system_prompt_append.unwrap_or("").to_string();
+        let active_config_dir = self.active_config_dir.clone();
         tokio::spawn(async move {
             message_processor(
                 message_rx,
@@ -561,6 +563,7 @@ impl ContainerManager {
                 container_name_owned,
                 grpc_addr_owned,
                 system_prompt_owned,
+                active_config_dir,
             )
             .await;
         });
@@ -1169,6 +1172,28 @@ async fn reconnect_stream(container_name: &str, grpc_addr: &str) -> Result<GrpcS
 /// When the gRPC stream fails, instead of exiting, the processor enters a
 /// "disconnected" state and waits for the next user message to attempt
 /// reconnection. This enables auto-recovery from agent-worker crashes.
+/// Build the per-session env passed into the SDK subprocess on every
+/// CreateSession. Carries:
+///   - `CSM_CLI_SOCKET` so the in-container `team` CLI knows where to dial.
+///     Path is deterministic on session_id so reconnects reuse it.
+///   - `CLAUDE_CONFIG_DIR` if a profile override is currently active.
+///     Read fresh on every send so a profile flip via POST /admin/profile
+///     is picked up by the next CreateSession without restarting the worker.
+///     Deliberately NOT forwarding `CLAUDE_CODE_OAUTH_TOKEN` when an override
+///     is set — it would override the file-based credentials and defeat the
+///     swap (mirrors membank's auth precedence).
+async fn build_session_env(
+    cli_socket_path: &str,
+    active_config_dir: &crate::profile::ActiveConfigDir,
+) -> std::collections::HashMap<String, String> {
+    let mut env = std::collections::HashMap::new();
+    env.insert("CSM_CLI_SOCKET".to_string(), cli_socket_path.to_string());
+    if let Some(dir) = active_config_dir.read().await.clone() {
+        env.insert("CLAUDE_CONFIG_DIR".to_string(), dir);
+    }
+    env
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn message_processor(
     mut message_rx: mpsc::Receiver<String>,
@@ -1184,24 +1209,14 @@ async fn message_processor(
     container_name: String,
     grpc_addr: String,
     system_prompt_append: String,
+    active_config_dir: crate::profile::ActiveConfigDir,
 ) {
     use grpc::proto::agent_event;
 
-    // Build the per-session env passed into the SDK subprocess on every
-    // CreateSession. Right now it carries CSM_CLI_SOCKET so the in-container
-    // `team` CLI knows where to dial. Path is deterministic on session_id so
-    // reconnects (which open a fresh bidi stream) reuse the same socket
-    // path — the SDK subprocess env is fixed at spawn, so any tool calls
-    // inside the still-running container keep working after a reconnect.
     let cli_socket_path = format!(
         "/tmp/csm-cli-{}.sock",
         &session_id[..8.min(session_id.len())],
     );
-    let build_session_env = || {
-        let mut env = std::collections::HashMap::new();
-        env.insert("CSM_CLI_SOCKET".to_string(), cli_socket_path.clone());
-        env
-    };
 
     let mut in_turn = false;
     let mut in_background = false;
@@ -1248,7 +1263,7 @@ async fn message_processor(
                         .create(
                             &message,
                             permission_mode,
-                            build_session_env(),
+                            build_session_env(&cli_socket_path, &active_config_dir).await,
                             &system_prompt_append,
                             thinking_tokens,
                             resume_sid.as_deref(),
@@ -1350,7 +1365,7 @@ async fn message_processor(
                     active_stream.create(
                         &message,
                         permission_mode,
-                        build_session_env(),
+                        build_session_env(&cli_socket_path, &active_config_dir).await,
                         &system_prompt_append,
                         thinking_tokens,
                         stored_sid.as_deref(),
