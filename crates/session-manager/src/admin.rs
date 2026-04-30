@@ -100,7 +100,13 @@ pub async fn post_profile(
     State(state): State<Arc<crate::AppState>>,
     Json(req): Json<SetProfileRequest>,
 ) -> Result<Json<ProfileResponse>, (StatusCode, &'static str)> {
-    let dir = req.claude_config_dir.unwrap_or_default();
+    // Expand `~`, `~/...`, `$HOME`, `${HOME}` so callers can POST shell-style
+    // paths. Resolving here means the DB and in-process handle store the
+    // canonical absolute form, and the credentials check below sees the
+    // real path on disk.
+    let dir = crate::profile::resolve_config_dir(
+        req.claude_config_dir.as_deref().unwrap_or_default(),
+    );
 
     if !dir.is_empty() {
         let creds = std::path::Path::new(&dir).join(".credentials.json");

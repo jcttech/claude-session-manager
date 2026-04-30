@@ -38,12 +38,13 @@
     "mounts": [
         "source=devcontainer-bashhistory-${devcontainerId},target=/commandhistory,type=volume",
         "source=claude-config-shared,target=/home/vscode/.claude,type=volume",
+        "source=claude-2-config-shared,target=/home/vscode/.claude2,type=volume",
         "source=claude-mem-shared,target=/home/vscode/.claude-mem,type=volume",
         "source=devcontainer-cargo-${devcontainerId},target=/home/vscode/.cargo/registry,type=volume"
     ],
     "containerEnv": {
-        "CLAUDE_CONFIG_DIR": "/home/vscode/.claude",
-        "POWERLEVEL9K_DISABLE_GITSTATUS": "true"
+        "POWERLEVEL9K_DISABLE_GITSTATUS": "true",
+        "CARGO_TARGET_DIR": "/home/vscode/target"
     },
     "remoteEnv": {
         "ANTHROPIC_API_KEY": "${localEnv:ANTHROPIC_API_KEY}",
