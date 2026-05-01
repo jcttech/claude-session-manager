@@ -1455,6 +1455,7 @@ async fn handle_messages(
                     }
                     if cmd == "clear" {
                         let _ = state.containers.clear(&session.session_id).await;
+                        let _ = state.db.clear_claude_session_id(&session.session_id).await;
                         let _ = state
                             .mm
                             .post_in_thread(channel_id, root_id, "Context cleared.")
@@ -1468,6 +1469,7 @@ async fn handle_messages(
                             .await;
                         match state.containers.restart_session(&session.session_id).await {
                             Ok(()) => {
+                                let _ = state.db.clear_claude_session_id(&session.session_id).await;
                                 let _ = state
                                     .mm
                                     .post_in_thread(
@@ -5102,6 +5104,7 @@ async fn drain_one_clear(state: &AppState, team_id: &str, task: &StoredTeamTask)
 
     match state.containers.clear(&target.session_id).await {
         Ok(_) => {
+            let _ = state.db.clear_claude_session_id(&target.session_id).await;
             let _ = state
                 .db
                 .mark_task_completed(task.task_id, &target.session_id)

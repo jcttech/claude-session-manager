@@ -1040,6 +1040,20 @@ impl Database {
         Ok(())
     }
 
+    /// Null out the stored Claude SDK session ID. Used after /clear or /restart
+    /// so the next session-manager restart doesn't reseed a dead conversation
+    /// ID that the claude CLI no longer has on disk.
+    pub async fn clear_claude_session_id(&self, session_id: &str) -> Result<()> {
+        sqlx::query(&format!(
+            "UPDATE {}.sessions SET claude_session_id = NULL WHERE session_id = $1",
+            SCHEMA
+        ))
+        .bind(session_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     /// Update the container name stored on a session (used when a cold-start recovery
     /// creates a new container for an existing session).
     pub async fn update_session_container_name(
