@@ -22,7 +22,7 @@ use session_manager::crypto::{sign_request, verify_signature};
 use session_manager::database::{
     self, Database, EnqueueClearResult, StoredSession, StoredTeamRole, StoredTeamTask,
 };
-use session_manager::profile::{self, ActiveConfigDir};
+use session_manager::profile::{self, ActiveProfile};
 
 mod admin;
 use session_manager::git::{GitManager, RepoRef};
@@ -63,9 +63,10 @@ pub struct AppState {
     /// team could both walk the queue and double-deliver the same task_id
     /// to two different idle targets.
     pub drain_locks: DashMap<String, Arc<tokio::sync::Mutex<()>>>,
-    /// Currently-active CLAUDE_CONFIG_DIR override. Read by container env
-    /// builder on every CreateSession; written by POST /admin/profile.
-    pub active_config_dir: ActiveConfigDir,
+    /// Currently-active Claude profile (name + optional CLAUDE_CONFIG_DIR
+    /// override). Read by the container env builder on every CreateSession;
+    /// written by POST /admin/profile.
+    pub active_profile: ActiveProfile,
 }
 
 // `spawn_locks` was removed in v2.5.4 — its serialization role is subsumed by
@@ -135,27 +136,39 @@ async fn main() -> Result<()> {
     let git = GitManager::new();
     let db = Database::new().await?;
 
-    // Seed the active CLAUDE_CONFIG_DIR override from DB. The singleton row
-    // is created in `create_schema`, so this never misses. Sanity-check that
-    // the persisted dir still has a credentials file — warn (don't fail) if
-    // it's gone, since operators can recover by POSTing a fresh path.
-    let initial_state = db.get_claude_profile_state().await?;
-    let initial_dir = profile::from_db_value(&initial_state.claude_config_dir);
-    if let Some(ref dir) = initial_dir {
-        let creds = std::path::Path::new(dir).join(".credentials.json");
-        if !creds.is_file() {
-            tracing::warn!(
-                dir = %dir,
-                "Persisted CLAUDE_CONFIG_DIR has no .credentials.json — \
-                 spawns will fail until the file is restored or POST /admin/profile \
-                 supplies a new path",
-            );
+    // Seed the profile catalog from CSM_PROFILES (format: name1:path1,name2:path2).
+    // `default` is reserved (always seeded by the migration with empty path)
+    // and any entry trying to redefine it is dropped with a warning. Other
+    // names are upserted; their paths are tilde/$HOME-expanded against the
+    // session-manager process's HOME for operator convenience.
+    if let Ok(raw) = std::env::var("CSM_PROFILES") {
+        for (name, path) in profile::parse_profiles_env(&raw) {
+            if name == "default" {
+                tracing::warn!(
+                    "CSM_PROFILES: ignoring entry named 'default' — \
+                     it is reserved as the no-override sentinel"
+                );
+                continue;
+            }
+            let resolved = profile::resolve_config_dir(&path);
+            if let Err(e) = db.upsert_claude_profile(&name, &resolved).await {
+                tracing::warn!(error = %e, profile = %name, "CSM_PROFILES: upsert failed");
+            } else {
+                tracing::info!(profile = %name, dir = %resolved, "CSM_PROFILES: seeded");
+            }
         }
     }
-    let active_config_dir: ActiveConfigDir =
-        Arc::new(tokio::sync::RwLock::new(initial_dir));
 
-    let containers = ContainerManager::new(active_config_dir.clone());
+    // Read the active profile from DB. The migration + seed contract guarantees
+    // exactly one row has is_active = TRUE, so this never misses. We can't
+    // validate the path here — it lives inside the agent-worker container on
+    // the VM, not in session-manager's filesystem.
+    let initial = db.get_active_claude_profile().await?;
+    let active_profile: ActiveProfile = Arc::new(tokio::sync::RwLock::new(
+        profile::snapshot_from_db(&initial.profile_name, &initial.claude_config_dir),
+    ));
+
+    let containers = ContainerManager::new(active_profile.clone());
 
     let liveness = LivenessState::new();
 
@@ -170,7 +183,7 @@ async fn main() -> Result<()> {
         coordination_channel_id: tokio::sync::RwLock::new(coordination_channel_id),
         reviewed_prs: DashMap::new(),
         drain_locks: DashMap::new(),
-        active_config_dir,
+        active_profile,
     });
 
     // Sync container registry from database

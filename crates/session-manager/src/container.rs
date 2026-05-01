@@ -24,10 +24,11 @@ fn shell_escape(s: &str) -> Cow<'_, str> {
 pub struct ContainerManager {
     sessions: DashMap<String, Session>,
     pub registry: ContainerRegistry,
-    /// Currently-active CLAUDE_CONFIG_DIR override. Read on every CreateSession
-    /// spawn so a profile flip via POST /admin/profile takes effect on the
-    /// next user message without restarting the worker. See `profile.rs`.
-    active_config_dir: crate::profile::ActiveConfigDir,
+    /// Currently-active Claude profile (name + optional CLAUDE_CONFIG_DIR
+    /// override). Read on every CreateSession spawn so a profile flip via
+    /// POST /admin/profile takes effect on the next user message without
+    /// restarting the worker. See `profile.rs`.
+    active_profile: crate::profile::ActiveProfile,
 }
 
 /// Result of attempting to claim a session for cleanup.
@@ -93,11 +94,11 @@ struct Session {
 }
 
 impl ContainerManager {
-    pub fn new(active_config_dir: crate::profile::ActiveConfigDir) -> Self {
+    pub fn new(active_profile: crate::profile::ActiveProfile) -> Self {
         Self {
             sessions: DashMap::new(),
             registry: ContainerRegistry::new(),
-            active_config_dir,
+            active_profile,
         }
     }
 }
@@ -547,7 +548,7 @@ impl ContainerManager {
         let container_name_owned = container_name.to_string();
         let grpc_addr_owned = grpc_addr.clone();
         let system_prompt_owned = system_prompt_append.unwrap_or("").to_string();
-        let active_config_dir = self.active_config_dir.clone();
+        let active_profile = self.active_profile.clone();
         tokio::spawn(async move {
             message_processor(
                 message_rx,
@@ -563,7 +564,7 @@ impl ContainerManager {
                 container_name_owned,
                 grpc_addr_owned,
                 system_prompt_owned,
-                active_config_dir,
+                active_profile,
             )
             .await;
         });
@@ -1176,21 +1177,42 @@ async fn reconnect_stream(container_name: &str, grpc_addr: &str) -> Result<GrpcS
 /// CreateSession. Carries:
 ///   - `CSM_CLI_SOCKET` so the in-container `team` CLI knows where to dial.
 ///     Path is deterministic on session_id so reconnects reuse it.
-///   - `CLAUDE_CONFIG_DIR` if a profile override is currently active.
-///     Read fresh on every send so a profile flip via POST /admin/profile
-///     is picked up by the next CreateSession without restarting the worker.
-///     Deliberately NOT forwarding `CLAUDE_CODE_OAUTH_TOKEN` when an override
-///     is set — it would override the file-based credentials and defeat the
-///     swap (mirrors membank's auth precedence).
+///   - `CSM_PROFILE_NAME` (always, for observability) — the name of the
+///     profile that was active when this env was built.
+///   - **Env-auth bypass:** if session-manager itself has a non-empty
+///     `CLAUDE_CODE_OAUTH_TOKEN` or `ANTHROPIC_API_KEY`, that token is
+///     forwarded and `CLAUDE_CONFIG_DIR` is NOT injected — the profile
+///     catalog goes dormant. Useful for CI / dev / one-off API-key setups.
+///   - Otherwise, `CLAUDE_CONFIG_DIR` from the active profile (if non-empty;
+///     the `default` sentinel has empty path → no override, CLI uses
+///     ~/.claude). Read fresh on every send so a profile flip via
+///     POST /admin/profile is picked up by the next CreateSession without
+///     restarting the worker.
 async fn build_session_env(
     cli_socket_path: &str,
-    active_config_dir: &crate::profile::ActiveConfigDir,
+    active_profile: &crate::profile::ActiveProfile,
 ) -> std::collections::HashMap<String, String> {
     let mut env = std::collections::HashMap::new();
     env.insert("CSM_CLI_SOCKET".to_string(), cli_socket_path.to_string());
-    if let Some(dir) = active_config_dir.read().await.clone() {
+
+    let snapshot = active_profile.read().await.clone();
+    env.insert("CSM_PROFILE_NAME".to_string(), snapshot.name.clone());
+
+    let oauth = std::env::var("CLAUDE_CODE_OAUTH_TOKEN")
+        .ok()
+        .filter(|v| !v.is_empty());
+    let api_key = std::env::var("ANTHROPIC_API_KEY")
+        .ok()
+        .filter(|v| !v.is_empty());
+
+    if let Some(token) = oauth {
+        env.insert("CLAUDE_CODE_OAUTH_TOKEN".to_string(), token);
+    } else if let Some(key) = api_key {
+        env.insert("ANTHROPIC_API_KEY".to_string(), key);
+    } else if let Some(dir) = snapshot.claude_config_dir {
         env.insert("CLAUDE_CONFIG_DIR".to_string(), dir);
     }
+
     env
 }
 
@@ -1209,7 +1231,7 @@ async fn message_processor(
     container_name: String,
     grpc_addr: String,
     system_prompt_append: String,
-    active_config_dir: crate::profile::ActiveConfigDir,
+    active_profile: crate::profile::ActiveProfile,
 ) {
     use grpc::proto::agent_event;
 
@@ -1263,7 +1285,7 @@ async fn message_processor(
                         .create(
                             &message,
                             permission_mode,
-                            build_session_env(&cli_socket_path, &active_config_dir).await,
+                            build_session_env(&cli_socket_path, &active_profile).await,
                             &system_prompt_append,
                             thinking_tokens,
                             resume_sid.as_deref(),
@@ -1365,7 +1387,7 @@ async fn message_processor(
                     active_stream.create(
                         &message,
                         permission_mode,
-                        build_session_env(&cli_socket_path, &active_config_dir).await,
+                        build_session_env(&cli_socket_path, &active_profile).await,
                         &system_prompt_append,
                         thinking_tokens,
                         stored_sid.as_deref(),

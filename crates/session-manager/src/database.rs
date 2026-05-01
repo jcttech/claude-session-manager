@@ -152,14 +152,18 @@ pub struct TeamRateLimit {
     pub notice_post_id: Option<String>,
 }
 
-/// Active Claude OAuth profile override. Singleton row keyed by `id = 1`.
-/// `claude_config_dir == ""` means no override (CLI falls back to ~/.claude
-/// or inherited CLAUDE_CODE_OAUTH_TOKEN). Mirrors membank's shape so the
-/// external profile-manager can POST identical payloads to either service.
+/// Catalog row in `claude_profiles`. Each row is one Claude OAuth profile the
+/// consumer may switch between, keyed by logical name (matches the external
+/// profile-manager's `profiles.name`). Exactly one row has `is_active = TRUE`
+/// at any time, enforced by a partial unique index. `claude_config_dir == ""`
+/// is the sentinel for "no override" — the CLI falls back to ~/.claude or
+/// inherited env auth.
 #[derive(Debug, Clone, FromRow)]
 #[allow(dead_code)]
-pub struct ClaudeProfileState {
+pub struct ClaudeProfile {
+    pub profile_name: String,
     pub claude_config_dir: String,
+    pub is_active: bool,
     pub event_id: Option<uuid::Uuid>,
     pub swapped_at: Option<chrono::DateTime<chrono::Utc>>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
@@ -760,31 +764,72 @@ pub async fn create_schema(pool: &PgPool, schema: &str) -> Result<()> {
     .execute(pool)
     .await?;
 
-    // Active Claude OAuth profile (CLAUDE_CONFIG_DIR override). Singleton row
-    // updated by the external profile-manager via POST /admin/profile. Mirrors
-    // membank's claude_profile_state shape so the same payload works on both.
-    // Empty string = no override (CLI falls back to ~/.claude or inherited
-    // CLAUDE_CODE_OAUTH_TOKEN).
+    // Catalog of Claude OAuth profiles the consumer may switch between.
+    // External profile-manager activates a profile by name via
+    // POST /admin/profile; pre-population is via the CSM_PROFILES env var.
+    // Empty `claude_config_dir` = no override (CLI falls back to ~/.claude
+    // or inherited env auth). The `default` row is always present.
     sqlx::query(&format!(
         r#"
-        CREATE TABLE IF NOT EXISTS {}.claude_profile_state (
-            id                INT PRIMARY KEY CHECK (id = 1),
+        CREATE TABLE IF NOT EXISTS {schema}.claude_profiles (
+            profile_name      TEXT PRIMARY KEY,
             claude_config_dir TEXT NOT NULL DEFAULT '',
+            is_active         BOOLEAN NOT NULL DEFAULT FALSE,
             event_id          UUID,
             swapped_at        TIMESTAMPTZ,
             updated_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
             updated_by        TEXT
         )
-        "#,
-        schema
+        "#
     ))
     .execute(pool)
     .await?;
 
-    // Seed the singleton so reads at startup never miss.
+    // Idempotent in-place migration from the legacy singleton table.
+    // Safe to run repeatedly; no-ops once the table is in the new shape.
     sqlx::query(&format!(
-        "INSERT INTO {}.claude_profile_state (id) VALUES (1) ON CONFLICT (id) DO NOTHING",
-        schema
+        r#"
+        DO $migrate$
+        BEGIN
+            -- Migrate from legacy claude_profile_state if it still exists.
+            IF EXISTS (
+                SELECT 1 FROM information_schema.tables
+                 WHERE table_schema = '{schema}'
+                   AND table_name   = 'claude_profile_state'
+            ) THEN
+                INSERT INTO {schema}.claude_profiles
+                    (profile_name, claude_config_dir, is_active,
+                     event_id, swapped_at, updated_at, updated_by)
+                SELECT 'default', claude_config_dir, TRUE,
+                       event_id, swapped_at, updated_at, updated_by
+                  FROM {schema}.claude_profile_state
+                 WHERE id = 1
+                ON CONFLICT (profile_name) DO NOTHING;
+
+                DROP TABLE {schema}.claude_profile_state;
+            END IF;
+        END
+        $migrate$;
+        "#
+    ))
+    .execute(pool)
+    .await?;
+
+    // Partial unique index: at most one row may have is_active = TRUE.
+    sqlx::query(&format!(
+        "CREATE UNIQUE INDEX IF NOT EXISTS claude_profiles_one_active \
+         ON {schema}.claude_profiles (is_active) WHERE is_active = TRUE"
+    ))
+    .execute(pool)
+    .await?;
+
+    // Seed the always-present 'default' profile (empty path = no override).
+    // If we just migrated a legacy row to 'default', this is a no-op.
+    // Otherwise it ensures fresh DBs always have an active profile.
+    sqlx::query(&format!(
+        "INSERT INTO {schema}.claude_profiles (profile_name, claude_config_dir, is_active) \
+         VALUES ('default', '', TRUE) \
+         ON CONFLICT (profile_name) DO NOTHING"
     ))
     .execute(pool)
     .await?;
@@ -2183,48 +2228,117 @@ impl Database {
         Ok(row.and_then(|(p,)| p))
     }
 
-    // ---- claude_profile_state ---------------------------------------------
+    // ---- claude_profiles --------------------------------------------------
 
-    /// Read the singleton row. Always returns a row — the seed runs in
-    /// create_schema.
-    pub async fn get_claude_profile_state(&self) -> Result<ClaudeProfileState> {
-        let row = sqlx::query_as::<_, ClaudeProfileState>(&format!(
-            "SELECT claude_config_dir, event_id, swapped_at, updated_at, updated_by \
-             FROM {}.claude_profile_state WHERE id = 1",
-            SCHEMA
+    /// List every registered profile, ordered by name. Used by GET /admin/profile
+    /// to expose the catalog to operators.
+    pub async fn list_claude_profiles(&self) -> Result<Vec<ClaudeProfile>> {
+        let rows = sqlx::query_as::<_, ClaudeProfile>(&format!(
+            "SELECT profile_name, claude_config_dir, is_active, \
+                    event_id, swapped_at, updated_at, updated_by \
+             FROM {SCHEMA}.claude_profiles \
+             ORDER BY profile_name"
+        ))
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    /// Read the active row. The partial unique index + seeding contract guarantee
+    /// exactly one row has `is_active = TRUE` at any time, so this never misses.
+    pub async fn get_active_claude_profile(&self) -> Result<ClaudeProfile> {
+        let row = sqlx::query_as::<_, ClaudeProfile>(&format!(
+            "SELECT profile_name, claude_config_dir, is_active, \
+                    event_id, swapped_at, updated_at, updated_by \
+             FROM {SCHEMA}.claude_profiles \
+             WHERE is_active = TRUE"
         ))
         .fetch_one(&self.pool)
         .await?;
         Ok(row)
     }
 
-    /// Update the singleton. `claude_config_dir == ""` clears the override.
-    /// Returns the row as written for echoing in the admin response.
-    pub async fn set_claude_profile_state(
+    /// Upsert a profile catalog row. Used at startup to seed entries from the
+    /// `CSM_PROFILES` env var. Does not touch `is_active`; activation is a
+    /// separate operation via `set_active_claude_profile`.
+    pub async fn upsert_claude_profile(
         &self,
+        profile_name: &str,
         claude_config_dir: &str,
+    ) -> Result<()> {
+        sqlx::query(&format!(
+            "INSERT INTO {SCHEMA}.claude_profiles \
+                (profile_name, claude_config_dir, is_active) \
+             VALUES ($1, $2, FALSE) \
+             ON CONFLICT (profile_name) DO UPDATE \
+                SET claude_config_dir = EXCLUDED.claude_config_dir, \
+                    updated_at        = NOW()"
+        ))
+        .bind(profile_name)
+        .bind(claude_config_dir)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Atomically flip the active profile. In one transaction, clears the
+    /// currently-active row then sets `is_active = TRUE` on the named row,
+    /// stamping audit fields. Returns the activated row, or `Ok(None)` if
+    /// the named profile does not exist (caller maps to 404).
+    pub async fn set_active_claude_profile(
+        &self,
+        profile_name: &str,
         event_id: Option<uuid::Uuid>,
         swapped_at: Option<chrono::DateTime<chrono::Utc>>,
         updated_by: Option<&str>,
-    ) -> Result<ClaudeProfileState> {
-        let row = sqlx::query_as::<_, ClaudeProfileState>(&format!(
-            "UPDATE {}.claude_profile_state \
-                SET claude_config_dir = $1, \
-                    event_id          = $2, \
-                    swapped_at        = $3, \
-                    updated_at        = NOW(), \
-                    updated_by        = $4 \
-              WHERE id = 1 \
-              RETURNING claude_config_dir, event_id, swapped_at, updated_at, updated_by",
-            SCHEMA
+    ) -> Result<Option<ClaudeProfile>> {
+        let mut tx = self.pool.begin().await?;
+
+        // Existence check first so 404 is reliable. We could combine the
+        // existence check with the UPDATE, but pulling it apart keeps the
+        // not-found path cheap and the activation path obviously atomic.
+        let exists: Option<(String,)> = sqlx::query_as(&format!(
+            "SELECT profile_name FROM {SCHEMA}.claude_profiles \
+             WHERE profile_name = $1 FOR UPDATE"
         ))
-        .bind(claude_config_dir)
+        .bind(profile_name)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if exists.is_none() {
+            return Ok(None);
+        }
+
+        // Clear current active. The partial unique index forbids two true rows
+        // simultaneously, so this MUST happen before the SET TRUE below.
+        sqlx::query(&format!(
+            "UPDATE {SCHEMA}.claude_profiles \
+                SET is_active = FALSE \
+              WHERE is_active = TRUE AND profile_name <> $1"
+        ))
+        .bind(profile_name)
+        .execute(&mut *tx)
+        .await?;
+
+        let row = sqlx::query_as::<_, ClaudeProfile>(&format!(
+            "UPDATE {SCHEMA}.claude_profiles \
+                SET is_active  = TRUE, \
+                    event_id   = $2, \
+                    swapped_at = $3, \
+                    updated_at = NOW(), \
+                    updated_by = $4 \
+              WHERE profile_name = $1 \
+              RETURNING profile_name, claude_config_dir, is_active, \
+                        event_id, swapped_at, updated_at, updated_by"
+        ))
+        .bind(profile_name)
         .bind(event_id)
         .bind(swapped_at)
         .bind(updated_by)
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *tx)
         .await?;
-        Ok(row)
+
+        tx.commit().await?;
+        Ok(Some(row))
     }
 
     /// Mark a queued task as failed (e.g. delivery_unreachable). Used by drain

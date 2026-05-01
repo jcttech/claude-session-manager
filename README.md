@@ -276,7 +276,15 @@ If no devcontainer.json is found, a default one is auto-generated using `SM_CONT
 
 ### Claude profile switching
 
-The session manager supports runtime rotation of the Claude OAuth account used by every agent-worker spawn, mirroring the membank `/api/admin/profile` contract so an external profile-manager (e.g. claude-usage-monitor) can POST identical payloads to either service.
+The session manager supports runtime rotation of the Claude OAuth account used by every agent-worker spawn. Profiles are a named catalog (`claude_profiles` table) — pre-seeded at startup from the `CSM_PROFILES` env var — and the external profile-manager activates one by name.
+
+**Pre-population at startup.** Set `CSM_PROFILES` to a comma-separated list of `name:path` pairs. Paths support `~`, `~/...`, `$HOME`, and `${HOME}` expansion. The `default` profile is always present (empty path = no override) and is reserved — entries trying to redefine it are dropped with a warning.
+
+```
+CSM_PROFILES=personal-max:/home/vscode/.claude,team-pro:/home/vscode/.claude2
+```
+
+**Webhook contract:**
 
 ```
 POST /admin/profile
@@ -284,16 +292,20 @@ Authorization: Bearer $ADMIN_BEARER_TOKEN
 Content-Type: application/json
 
 {
-  "claude_config_dir": "/path/to/profile",   // null/"" clears the override
+  "profile_name": "personal-max",            // must exist in catalog (404 otherwise)
   "event_id":   "<uuid>",                    // optional, audit-only pass-through
   "swapped_at": "<rfc3339>",                 // optional, audit-only pass-through
   "updated_by": "claude-usage-monitor"
 }
 ```
 
-The dir is validated server-side (must contain `.credentials.json`); a missing file returns `400 INVALID_CONFIG_DIR`. The choice is persisted in the singleton `claude_profile_state` table and held in an in-process `Arc<RwLock<Option<String>>>` read at every `CreateSession` spawn.
+`GET /admin/profile` returns the active row plus the full catalog so ops can see which profiles are registered.
 
-After persisting the swap, the handler enqueues a `CLEAR` row in `team_task_queue` for every active member of every active team. Drain delivers each CLEAR only when the target session is idle — mid-turn members defer until their next `ResponseComplete`, then their queued CLEAR fires. The next user message after a CLEAR triggers a fresh `CreateSession`, which reads the now-current `CLAUDE_CONFIG_DIR` from the in-process handle. So a flip never aborts a streaming response.
+**Atomic flip.** The handler runs `is_active = FALSE` on the current row and `is_active = TRUE` on the named row in one transaction (a partial unique index forbids two active rows simultaneously). It then hot-swaps an in-process `Arc<RwLock<ActiveProfileSnapshot>>` so the next `CreateSession` spawn sees the new value without a restart. The path is **not** validated — it's interpreted inside the agent-worker container on the VM, not in session-manager's filesystem, so a local check would be meaningless. A bad path surfaces as a session spawn failure on the next `CreateSession`.
+
+**Env-auth bypass.** If session-manager's own process env has a non-empty `CLAUDE_CODE_OAUTH_TOKEN` or `ANTHROPIC_API_KEY`, the env builder forwards that token to agent-worker and **omits** `CLAUDE_CONFIG_DIR` entirely — the catalog goes dormant. Useful for CI / dev / one-off API-key setups where you don't want profile rotation to fight the explicit credentials.
+
+After persisting the swap, the handler enqueues a `CLEAR` row in `team_task_queue` for every active member of every active team. Drain delivers each CLEAR only when the target session is idle — mid-turn members defer until their next `ResponseComplete`, then their queued CLEAR fires. The next user message after a CLEAR triggers a fresh `CreateSession`, which reads the now-current active profile and injects `CLAUDE_CONFIG_DIR` (plus `CSM_PROFILE_NAME` for observability) into the SDK subprocess env. So a flip never aborts a streaming response.
 
 Teams currently in `rejected` rate-limit state additionally have their rate-limit row flipped back to `allowed` so drain isn't paused on the previous account's reset window.
 
@@ -380,7 +392,8 @@ All settings use the `SM_` environment variable prefix.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `ADMIN_BEARER_TOKEN` | _(unset → 503)_ | Bearer token gating `/admin/*` endpoints. Note: not `SM_`-prefixed since it mirrors membank's contract. |
+| `ADMIN_BEARER_TOKEN` | _(unset → 503)_ | Bearer token gating `/admin/*` endpoints. Not `SM_`-prefixed since it mirrors membank's contract. |
+| `CSM_PROFILES` | _(empty)_ | Comma-separated `name:path` pairs upserted into the profile catalog at startup. Paths support `~`/`$HOME` expansion. `default` is reserved. |
 
 ## Security
 

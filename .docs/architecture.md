@@ -327,16 +327,18 @@ ContainerRegistry::lookup(repo, branch)
 External profile-manager (e.g. claude-usage-monitor)
     │
     │  POST /admin/profile  (Bearer ADMIN_BEARER_TOKEN)
-    │  { "claude_config_dir": "/path/...", "event_id", "swapped_at", "updated_by" }
+    │  { "profile_name": "personal-max", "event_id", "swapped_at", "updated_by" }
     ▼
 admin::require_admin_token  ──► 401 if mismatch / 503 if unset
     │
     ▼
 admin::post_profile (admin.rs)
-    ├── Validate `<dir>/.credentials.json` exists  ─► 400 INVALID_CONFIG_DIR
-    ├── Database::set_claude_profile_state()      ─► UPDATE singleton row
-    ├── Atomically swap state.active_config_dir   ─► RwLock::write
+    ├── Database::set_active_claude_profile()    ─► tx: clear current active,
+    │     SET is_active=TRUE on named row, stamp audit. 404 if name unknown.
+    ├── Atomically swap state.active_profile     ─► RwLock::write
     └── rotate_active_team_sessions() (best-effort)
+    (no path validation — the dir is consumed inside the agent-worker
+     container on the VM; a bad path surfaces as a spawn failure)
             │
             ▼
         For each team with at least one active session:
@@ -354,9 +356,16 @@ admin::post_profile (admin.rs)
 
 **Why the queue.** Calling `containers.clear()` directly aborts in-flight turns (drops the worker's `ClaudeSDKClient` mid-stream). Enqueueing a CLEAR row in `team_task_queue` reuses the existing drain layer, which already implements deferred delivery for mid-turn targets, plus cooldown + coalescing so repeated profile flips don't pile up duplicate CLEARs.
 
-**What CLEAR does.** Resets `is_first_message=true` + clears `claude_session_id` locally and tells agent-worker to drop the ClaudeSDKClient via `ClearSession` RPC. The next user message after a CLEAR takes the `CreateSession` path, where `container::build_session_env` reads the current `active_config_dir` and injects `CLAUDE_CONFIG_DIR` into the SDK subprocess env. The Claude CLI then loads `$CLAUDE_CONFIG_DIR/.credentials.json` for the new account.
+**What CLEAR does.** Resets `is_first_message=true` + clears `claude_session_id` locally and tells agent-worker to drop the ClaudeSDKClient via `ClearSession` RPC. The next user message after a CLEAR takes the `CreateSession` path, where `container::build_session_env` reads the current `active_profile` and injects `CLAUDE_CONFIG_DIR` (plus `CSM_PROFILE_NAME` for observability) into the SDK subprocess env. The Claude CLI then loads `$CLAUDE_CONFIG_DIR/.credentials.json` for the new account.
 
-**Auth precedence.** When a profile override is set, `CLAUDE_CODE_OAUTH_TOKEN` is deliberately suppressed in the per-CreateSession env map so the file-based credentials win — mirroring membank's order (override > inherited token > `~/.claude` default).
+**Auth precedence (env-auth bypass).** Checked in `build_session_env` per-spawn against session-manager's own process env:
+1. `CLAUDE_CODE_OAUTH_TOKEN` non-empty → forward it, omit `CLAUDE_CONFIG_DIR`.
+2. `ANTHROPIC_API_KEY` non-empty → forward it, omit `CLAUDE_CONFIG_DIR`.
+3. Otherwise → look up the active profile. Empty path (the `default` sentinel) → inject nothing, CLI uses `~/.claude`. Non-empty → inject `CLAUDE_CONFIG_DIR=<dir>`.
+
+Session-manager is the single auth controller — operators set env tokens at the SM level, never on per-team agent-worker containers. With env auth configured, the profile catalog goes dormant; the rotation flow still updates the DB but injects no override.
+
+**Catalog pre-population.** The `claude_profiles` catalog is seeded at session-manager startup from the `CSM_PROFILES` env var (`name1:path1,name2:path2`). The migration always seeds a `default` row with empty path (no-override sentinel); it is reserved and cannot be redefined. `POST /admin/profile` returns 404 for any name not in the catalog — pre-population is operator config, not webhook data.
 
 **Standalone sessions.** Non-team sessions (`@claude start <repo>`) have no `team_task_queue` row, so they're not auto-rotated. They stay on the old account until the user runs `@claude clear` or restarts the session. This is acceptable because standalones are interactive and short-lived; the heavyweight automated workload runs in teams.
 
@@ -435,7 +444,7 @@ Tables managed via `database.rs` with auto-initialization. Bootstrap with `sql/i
 | **pending_requests** | Network approval queue | `request_id`, `session_id`, `domain`, `post_id` |
 | **audit_logs** | Approval/denial audit trail | `request_id`, `domain`, `action`, `approved_by` |
 | **team_rate_limits** | Per-team Claude rate-limit pause; consulted by `drain_team_queue` and the reactive profile-rotation path | `team_id` (PK), `status`, `resets_at`, `notice_post_id` |
-| **claude_profile_state** | Singleton row holding the active `CLAUDE_CONFIG_DIR` override; mirrors membank's shape | `id=1` (CHECK), `claude_config_dir`, `event_id`, `swapped_at`, `updated_by` |
+| **claude_profiles** | Catalog of OAuth profiles available for switching; exactly one row has `is_active=TRUE` (partial unique index). Seeded from `CSM_PROFILES` at startup, plus the always-present `default` (empty path = no override). | `profile_name` (PK), `claude_config_dir`, `is_active`, `event_id`, `swapped_at`, `updated_by` |
 
 ## Session Types
 

@@ -1,30 +1,47 @@
-//! Active Claude OAuth profile (CLAUDE_CONFIG_DIR override).
+//! Active Claude OAuth profile selection.
 //!
-//! Mirrors the membank `claude_profile_state` design: a single in-process
-//! handle is read at every CreateSession spawn and atomically swapped when
-//! POST /admin/profile arrives. DB is the source of truth on restart; the
-//! handle is the hot-path cache.
+//! The `claude_profiles` table holds the catalog (name → claude_config_dir)
+//! with exactly one row marked active at a time. The DB is the source of
+//! truth on restart; an in-process `ActiveProfile` handle is the hot-path
+//! cache, swapped atomically by the admin POST handler.
 
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-/// Currently-active CLAUDE_CONFIG_DIR override. `None` = no override.
-/// Read by `container::message_processor`'s env builder on every send;
-/// written by the admin POST handler.
-pub type ActiveConfigDir = Arc<RwLock<Option<String>>>;
+/// Snapshot of the currently-active profile, read by the env builder on every
+/// CreateSession spawn and replaced by POST /admin/profile.
+///
+/// `claude_config_dir == None` means the active profile is the no-override
+/// sentinel (e.g. `default` with empty path) — the env builder injects no
+/// `CLAUDE_CONFIG_DIR` and the CLI falls back to `~/.claude` or inherited
+/// env auth.
+#[derive(Debug, Clone)]
+pub struct ActiveProfileSnapshot {
+    pub name: String,
+    pub claude_config_dir: Option<String>,
+}
 
-/// Convert the DB string ("" = no override) into the in-process Option form.
-pub fn from_db_value(s: &str) -> Option<String> {
-    if s.is_empty() {
-        None
-    } else {
-        Some(s.to_string())
+/// In-process handle to the active profile. `Arc<RwLock<...>>` so the env
+/// builder can read on every spawn without copying and the admin handler
+/// can swap atomically.
+pub type ActiveProfile = Arc<RwLock<ActiveProfileSnapshot>>;
+
+/// Build a snapshot from a DB row. The "" sentinel for `claude_config_dir`
+/// becomes `None` so the env builder treats it as "no override".
+pub fn snapshot_from_db(name: &str, claude_config_dir: &str) -> ActiveProfileSnapshot {
+    ActiveProfileSnapshot {
+        name: name.to_string(),
+        claude_config_dir: if claude_config_dir.is_empty() {
+            None
+        } else {
+            Some(claude_config_dir.to_string())
+        },
     }
 }
 
 /// Expand `~`, `~/...`, `$HOME`, and `${HOME}` in an incoming
-/// `claude_config_dir` so callers can POST shell-style paths instead of
-/// having to know the absolute home dir of the session-manager process.
+/// `claude_config_dir` so callers can POST or seed shell-style paths instead
+/// of having to know the absolute home dir of the session-manager process.
 /// Falls back to leaving the literal in place when `HOME` is unset, so we
 /// never paper over a misconfigured environment.
 pub fn resolve_config_dir(input: &str) -> String {
@@ -48,6 +65,33 @@ fn resolve_with_home(input: &str, home: Option<&str>) -> String {
     tilde_expanded
         .replace("${HOME}", home)
         .replace("$HOME", home)
+}
+
+/// Parse the `CSM_PROFILES` env var into `(name, claude_config_dir)` pairs.
+/// Format: `name1:path1,name2:path2`. Whitespace around names/paths is
+/// trimmed; entries with empty names are skipped (silently — the operator
+/// pasted a stray comma).
+///
+/// The `default` profile is reserved: it's seeded by the migration with an
+/// empty path, and `CSM_PROFILES` cannot redefine it (an entry named
+/// `default` is dropped with a warning logged by the caller).
+pub fn parse_profiles_env(input: &str) -> Vec<(String, String)> {
+    input
+        .split(',')
+        .filter_map(|entry| {
+            let entry = entry.trim();
+            if entry.is_empty() {
+                return None;
+            }
+            let (name, path) = entry.split_once(':')?;
+            let name = name.trim();
+            let path = path.trim();
+            if name.is_empty() {
+                return None;
+            }
+            Some((name.to_string(), path.to_string()))
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -88,16 +132,80 @@ mod tests {
 
     #[test]
     fn does_not_expand_mid_path_tilde() {
-        // Only a leading `~` (or `~/`) is expanded; embedded tildes are literal.
-        assert_eq!(
-            resolve_with_home("/foo/~/bar", Some(HOME)),
-            "/foo/~/bar"
-        );
+        assert_eq!(resolve_with_home("/foo/~/bar", Some(HOME)), "/foo/~/bar");
     }
 
     #[test]
     fn no_home_returns_input_unchanged() {
         assert_eq!(resolve_with_home("~/.claude", None), "~/.claude");
         assert_eq!(resolve_with_home("$HOME/.claude", None), "$HOME/.claude");
+    }
+
+    #[test]
+    fn snapshot_empty_path_is_none() {
+        let s = snapshot_from_db("default", "");
+        assert_eq!(s.name, "default");
+        assert_eq!(s.claude_config_dir, None);
+    }
+
+    #[test]
+    fn snapshot_nonempty_path_is_some() {
+        let s = snapshot_from_db("alpha", "/home/alice/.claude2");
+        assert_eq!(s.name, "alpha");
+        assert_eq!(s.claude_config_dir, Some("/home/alice/.claude2".into()));
+    }
+
+    #[test]
+    fn parses_simple_profiles() {
+        let v = parse_profiles_env("personal:/home/x/.claude,team:/home/x/.claude2");
+        assert_eq!(
+            v,
+            vec![
+                ("personal".to_string(), "/home/x/.claude".to_string()),
+                ("team".to_string(), "/home/x/.claude2".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn trims_whitespace_around_entries() {
+        let v = parse_profiles_env(" personal : /home/x/.claude , team : /home/x/.claude2 ");
+        assert_eq!(
+            v,
+            vec![
+                ("personal".to_string(), "/home/x/.claude".to_string()),
+                ("team".to_string(), "/home/x/.claude2".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn skips_empty_entries() {
+        let v = parse_profiles_env(",,personal:/p,,team:/t,");
+        assert_eq!(
+            v,
+            vec![
+                ("personal".to_string(), "/p".to_string()),
+                ("team".to_string(), "/t".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn skips_entries_without_colon() {
+        let v = parse_profiles_env("good:/p,no-colon-here,also:/q");
+        assert_eq!(
+            v,
+            vec![
+                ("good".to_string(), "/p".to_string()),
+                ("also".to_string(), "/q".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn empty_input_is_empty() {
+        assert!(parse_profiles_env("").is_empty());
+        assert!(parse_profiles_env("   ").is_empty());
     }
 }
