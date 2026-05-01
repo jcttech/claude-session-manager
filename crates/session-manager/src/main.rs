@@ -241,8 +241,12 @@ async fn main() -> Result<()> {
             .iter()
             .map(|(_, e)| e.container_name.clone())
             .collect();
+        // --no-trunc is required: container_name in the registry is the full
+        // SHA256 (from `devcontainer up`'s containerId field), but podman's
+        // default {{.ID}} formatter truncates to 12 chars. Without --no-trunc
+        // every managed container looks orphaned and gets removed on startup.
         let list_cmd = format!(
-            "{runtime} ps -a --filter label=csm.managed=true --format '{{{{.ID}}}} {{{{.Names}}}}'"
+            "{runtime} ps -a --no-trunc --filter label=csm.managed=true --format '{{{{.ID}}}} {{{{.Names}}}}'"
         );
         if let Ok(output) = session_manager::ssh::run_command(&list_cmd).await {
             for line in output.lines() {
